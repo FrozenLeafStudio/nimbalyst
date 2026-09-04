@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Bug fixes go here -->
 - Antigravity's Gemini picker now offers the current Flash generations instead of retired ones, so new sessions no longer fail with "Gemini 3.5 Flash is no longer available".
 - Prevent unexpected errors during Git history reads and voice cleanup.
+- On Linux the taskbar and window switcher show the Nimbalyst icon instead of a generic one, because the window now reports the same identity as its desktop entry (#697).
 
 ### Removed
 <!-- Removed features go here -->
