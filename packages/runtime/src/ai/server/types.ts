@@ -362,6 +362,26 @@ export interface AIModel {
   unavailable?: boolean;
 }
 
+/**
+ * Whether a provider's model catalog can be trusted as complete.
+ *
+ * A per-model `unavailable` flag cannot express "this whole list is short",
+ * so consumers need this to tell "gone" from "we could not look properly".
+ */
+export interface ProviderCatalogHealth {
+  state: 'ok' | 'degraded';
+  reason?:
+    | 'not-installed'
+    | 'not-signed-in'
+    | 'not-running'
+    | 'version-gated'
+    | 'seed-fallback';
+  /** Human-readable cause, authored by the provider that knows it. */
+  detail?: string;
+  /** True when simply re-running discovery could plausibly fix it. */
+  retryable?: boolean;
+}
+
 export interface AIModelCost {
   input: number;
   output: number;
@@ -587,6 +607,11 @@ export interface StreamChunk {
      * OpenAICodexProvider; for Claude Code this is the SDK's tool_use_id.
      */
     toolUseId?: string;
+    /**
+     * Model-supplied title for this call, when the provider asks for one.
+     * Falls back to the tool name where absent.
+     */
+    description?: string;
   };
   toolError?: {
     name: string;

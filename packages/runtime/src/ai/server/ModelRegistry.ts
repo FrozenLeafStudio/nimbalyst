@@ -9,6 +9,7 @@ import {
   ModelIdentifier,
   assertExhaustiveProvider,
 } from './types';
+import { catalogIsCacheable } from './providers/catalogHealthRegistry';
 
 interface ModelCatalogCacheEntry {
   provider: AIProviderType;
@@ -129,13 +130,17 @@ export class ModelRegistry {
         // A settings change or explicit clear may supersede this refresh while
         // the network/CLI request is in flight. Never let the old answer win.
         if (this.latestRequestIds.get(cacheScope) === requestId) {
-          this.catalogCache.set(cacheScope, {
-            provider,
-            apiKey,
-            models,
-            refreshedAt: Date.now(),
-          });
-          this.cachedModels.set(provider, models);
+          // Only cache a catalog the provider vouches for. Providers that
+          // report nothing are treated as healthy.
+          if (catalogIsCacheable(provider)) {
+            this.catalogCache.set(cacheScope, {
+              provider,
+              apiKey,
+              models,
+              refreshedAt: Date.now(),
+            });
+            this.cachedModels.set(provider, models);
+          }
         }
         return models;
       })
