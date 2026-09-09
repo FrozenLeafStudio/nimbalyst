@@ -214,6 +214,8 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     const [dragActive, setDragActive] = useState(false);
     const [isFocused, setIsFocused] = useState(false);
     const [modelPickerOpenRequest, setModelPickerOpenRequest] = useState(0);
+    const [modelUnavailable, setModelUnavailable] =
+      useState<'hidden' | 'withdrawn' | null>(null);
 
     // Command pills: caret position (to suppress the token being typed) and the
     // inspect popover opened when a pill is clicked.
@@ -1311,12 +1313,20 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     }, [value, onChange, onAttachmentRemove, pushSnapshot, captureSnapshot]);
 
     const handleSend = () => {
+      if (modelUnavailable) {
+        setModelPickerOpenRequest((n) => n + 1);
+        return;
+      }
       if (value.trim() && !disabled && processingAttachments.length === 0) {
         onSend(value);
       }
     };
 
     const handleQueue = () => {
+      if (modelUnavailable) {
+        setModelPickerOpenRequest((n) => n + 1);
+        return;
+      }
       if (value.trim() && !disabled && onQueue) {
         onQueue(value);
       }
@@ -1359,6 +1369,27 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
 
     return (
       <div className={`ai-chat-input flex flex-col gap-1.5 px-3 py-1.5 border-t border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] shrink-0 relative ${isMemoryMode ? 'memory-mode' : ''}`}>
+        {modelUnavailable && (
+          <div
+            className="ai-chat-model-unavailable flex items-center gap-2 px-2 py-1.5 rounded text-[11px] leading-snug text-[var(--nim-warning,#b45309)] bg-[var(--nim-bg-hover)] border border-[var(--nim-warning,#b45309)]"
+            role="alert"
+            data-testid="model-unavailable-banner"
+          >
+            <span className="flex-1">
+              {modelUnavailable === 'hidden'
+                ? 'You hid this session\u2019s model in Settings, so it cannot send. Choose another model, or unhide it.'
+                : 'This session\u2019s model is no longer offered by its provider, so it cannot send. Choose another model to continue.'}
+            </span>
+            <button
+              type="button"
+              className="shrink-0 underline cursor-pointer bg-transparent border-none p-0 text-[11px] text-[var(--nim-warning,#b45309)]"
+              onClick={() => setModelPickerOpenRequest((n) => n + 1)}
+              data-testid="model-unavailable-choose"
+            >
+              Choose a model
+            </button>
+          </div>
+        )}
         {/* Vertical resize handle at top of input area */}
         <div
           className={`ai-chat-input-resize-handle absolute -top-[3px] left-0 right-0 h-1.5 cursor-row-resize z-10 before:content-[''] before:absolute before:top-0.5 before:left-0 before:right-0 before:h-0.5 before:transition-colors before:duration-150 ${isResizing ? 'before:bg-[var(--nim-primary)]' : ''} hover:before:bg-[var(--nim-primary)]`}
@@ -1420,6 +1451,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
                   readOnlyTitle={readOnlyModelTitle}
                   openRequest={modelPickerOpenRequest}
                   onKeyboardDismiss={() => textareaRef.current?.focus()}
+                  onAvailabilityChange={setModelUnavailable}
                 />
               </span>
             )}
@@ -1570,8 +1602,16 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
             <button
               className="ai-chat-send-button w-9 h-9 flex items-center justify-center bg-[var(--nim-primary)] border-none rounded-md text-white cursor-pointer transition-all duration-200 shrink-0 hover:enabled:bg-[var(--nim-primary-hover)] hover:enabled:scale-105 disabled:opacity-40 disabled:cursor-not-allowed"
               onClick={handleSend}
-              disabled={disabled || !value.trim() || processingAttachments.length > 0}
-              title={processingAttachments.length > 0 ? "Processing attachments..." : "Send message (Enter)"}
+              disabled={!!modelUnavailable || disabled || !value.trim() || processingAttachments.length > 0}
+              title={
+                modelUnavailable
+                  ? modelUnavailable === 'hidden'
+                    ? 'You hid this model in Settings. Choose another model, or unhide it.'
+                    : 'This model is no longer offered by its provider. Choose another model.'
+                  : processingAttachments.length > 0
+                    ? 'Processing attachments...'
+                    : 'Send message (Enter)'
+              }
               aria-label="Send message"
             >
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">

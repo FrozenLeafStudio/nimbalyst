@@ -31,6 +31,15 @@ interface Model {
   id: string;
   name: string;
   provider: string;
+  /** Kept only because something still refers to it; discovery did not return it. */
+  unavailable?: boolean;
+}
+
+interface ProviderHealth {
+  state: 'ok' | 'degraded';
+  reason?: string;
+  detail?: string;
+  retryable?: boolean;
 }
 
 type ProviderType = 'agent' | 'model';
@@ -55,6 +64,11 @@ interface ModelSelectorProps {
   openRequest?: number;
   /** Restore focus to the AI input when Escape dismisses the menu. */
   onKeyboardDismiss?: () => void;
+  /**
+   * Why the selection cannot be used, or null when it can. `hidden` is the
+   * user's own doing and needs different wording from a withdrawn model.
+   */
+  onAvailabilityChange?: (reason: 'hidden' | 'withdrawn' | null) => void;
 }
 
 export function ModelSelector({
@@ -66,12 +80,15 @@ export function ModelSelector({
   readOnlyTitle,
   openRequest,
   onKeyboardDismiss,
+  onAvailabilityChange,
 }: ModelSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [models, setModels] = useState<Record<string, Model[]>>({});
   const [providerLabels, setProviderLabels] = useState<Record<string, string>>({});
   const [providerIcons, setProviderIcons] = useState<Record<string, string>>({});
+  const [providerHealth, setProviderHealth] = useState<Record<string, ProviderHealth>>({});
   const [loading, setLoading] = useState(false);
+  const [catalogSettled, setCatalogSettled] = useState(false);
   const aiProviderSettings = useAtomValue(aiProviderSettingsAtom);
   const advancedSettings = useAtomValue(advancedSettingsAtom);
   const { providers } = aiProviderSettings;
@@ -111,9 +128,12 @@ export function ModelSelector({
         const meta = response as {
           providerLabels?: Record<string, string>;
           providerIcons?: Record<string, string>;
+          providerHealth?: Record<string, ProviderHealth>;
         };
         if (meta.providerLabels) setProviderLabels(meta.providerLabels);
         if (meta.providerIcons) setProviderIcons(meta.providerIcons);
+        setProviderHealth(meta.providerHealth ?? {});
+        setCatalogSettled(true);
       }
     } catch (error) {
       console.error('Failed to load models:', error);
@@ -134,6 +154,7 @@ export function ModelSelector({
   // network/CLI discovery boundary.
   useEffect(() => {
     setModels({});
+    setCatalogSettled(false);
     void loadModels();
   }, [providers, loadModels]);
 
@@ -302,6 +323,82 @@ export function ModelSelector({
     return modelParts.join(':') || currentModel;
   };
 
+  /** True when the user hid this exact model in Settings. */
+  const currentModelHidden = React.useMemo(() => {
+    if (!currentModel) return false;
+    const owning = currentModel.split(':')[0];
+    return providers?.[owning]?.hiddenModels?.includes(currentModel) === true;
+  }, [currentModel, providers]);
+
+  /**
+   * Each guard prevents a specific false positive:
+   * - unsettled catalog: would fire on every mount, before the first fetch
+   * - degraded provider: a partial outage would read as total loss
+   * - empty catalog: we learned nothing, rather than everything vanishing
+   */
+  const currentModelMissing = React.useMemo(() => {
+    if (!currentModel || !catalogSettled) return false;
+    const groups = Object.values(models);
+    if (groups.length === 0 || groups.every(g => g.length === 0)) return false;
+    const owningProvider = currentModel.split(':')[0];
+    if (providerHealth[owningProvider]?.state === 'degraded') return false;
+    return !groups.some(providerModels => providerModels.some(m => m.id === currentModel));
+  }, [currentModel, catalogSettled, models, providerHealth]);
+
+  /** Non-blocking: the models we did find stay listed and selectable. */
+  const renderProviderHealthNotice = (provider: string) => {
+    const health = providerHealth[provider];
+    if (!health || health.state !== 'degraded') return null;
+    return (
+      <div
+        className="model-selector-health-notice mx-2 mb-1 px-2 py-1.5 rounded text-[10px] leading-snug text-[var(--nim-warning,#b45309)] bg-[var(--nim-bg-secondary)]"
+        role="status"
+        data-testid={`model-health-${provider}`}
+      >
+        <div className="flex items-start gap-1.5">
+          <MaterialSymbol icon="warning" size={12} className="shrink-0 mt-[1px]" />
+          <span className="flex-1">
+            {health.detail ?? 'This model list may be incomplete.'}
+          </span>
+        </div>
+        {health.retryable && (
+          <button
+            type="button"
+            className="model-selector-health-retry mt-1 ml-[18px] underline cursor-pointer bg-transparent border-none p-0 text-[10px] text-[var(--nim-warning,#b45309)]"
+            onClick={(e) => {
+              e.stopPropagation();
+              void loadModels();
+            }}
+          >
+            Retry
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  /**
+   * A provider that auto-disables when its backend is missing contributes no
+   * group, so its notice has nowhere to render. Surfaced only when the current
+   * selection belongs to it, so other users are not nagged.
+   */
+  const orphanedHealthProviders = React.useMemo(() => {
+    const owning = currentModel ? currentModel.split(':')[0] : null;
+    if (!owning) return [] as string[];
+    return Object.entries(providerHealth)
+      .filter(([provider, health]) => health?.state === 'degraded' && provider === owning)
+      .filter(([provider]) => (models[provider]?.length ?? 0) === 0)
+      .map(([provider]) => provider);
+  }, [providerHealth, models, currentModel]);
+
+  useEffect(() => {
+    // A read-only chip has no menu to open, so reporting would disable sending
+    // with no way to choose another model.
+    if (readOnly) return onAvailabilityChange?.(null);
+    if (currentModelHidden) return onAvailabilityChange?.('hidden');
+    onAvailabilityChange?.(currentModelMissing ? 'withdrawn' : null);
+  }, [currentModelMissing, currentModelHidden, onAvailabilityChange, readOnly]);
+
   const getProviderLabel = (provider: string) => {
     // Extension-contributed providers carry their manifest displayName from
     // ai:getModels; prefer it over the prettified-id fallback below.
@@ -392,15 +489,29 @@ export function ModelSelector({
   // Read-only chip: show the running provider/model without a dropdown. Used by
   // committed claude-code-cli sessions where the model is fixed at spawn, and
   // by voice sessions (openai-realtime) whose model isn't user-selectable.
+  const readOnlyFlagged = currentModelMissing || currentModelHidden;
   if (readOnly || currentProvider === 'openai-realtime') {
     return (
       <div className="model-selector inline-block">
         <span
-          className="model-selector-button model-selector-readonly flex items-center gap-1 px-2 py-[3px] rounded-xl text-[11px] font-medium whitespace-nowrap max-w-[200px] bg-[var(--nim-bg-secondary)] text-[var(--nim-text-muted)] border border-[var(--nim-border)] cursor-default"
-          aria-label={`Current model: ${getCurrentModelName()}`}
+          className={`model-selector-button model-selector-readonly flex items-center gap-1 px-2 py-[3px] rounded-xl text-[11px] font-medium whitespace-nowrap max-w-[200px] bg-[var(--nim-bg-secondary)] border cursor-default ${readOnlyFlagged ? 'model-selector-button-unavailable text-[var(--nim-warning,#b45309)] border-[var(--nim-warning,#b45309)]' : 'text-[var(--nim-text-muted)] border-[var(--nim-border)]'}`}
+          aria-label={
+            readOnlyFlagged
+              ? `Current model unavailable: ${getCurrentModelName()}`
+              : `Current model: ${getCurrentModelName()}`
+          }
           data-testid="model-picker"
-          title={readOnlyTitle}
+          title={
+            currentModelHidden
+              ? 'You hid this model in Settings.'
+              : currentModelMissing
+                ? `"${currentModel}" is no longer offered by its provider.`
+                : readOnlyTitle
+          }
         >
+          {readOnlyFlagged && (
+            <MaterialSymbol icon="warning" size={12} className="shrink-0" data-testid="model-picker-unavailable-icon" />
+          )}
           <span className="model-selector-label overflow-hidden text-ellipsis">{getCurrentModelName()}</span>
         </span>
       </div>
@@ -411,13 +522,35 @@ export function ModelSelector({
     <div className="model-selector inline-block">
       <button
         ref={refs.setReference}
-        className="model-selector-button flex items-center gap-1 px-2 py-[3px] rounded-xl text-[11px] font-medium cursor-pointer transition-all duration-200 outline-none whitespace-nowrap max-w-[200px] bg-[var(--nim-bg-secondary)] text-[var(--nim-text-muted)] border border-[var(--nim-border)] hover:bg-[var(--nim-bg-hover)] hover:border-[var(--nim-primary)]"
-        aria-label={`Current model: ${getCurrentModelName()}`}
+        className={`model-selector-button flex items-center gap-1 px-2 py-[3px] rounded-xl text-[11px] font-medium cursor-pointer transition-all duration-200 outline-none whitespace-nowrap max-w-[200px] bg-[var(--nim-bg-secondary)] border hover:bg-[var(--nim-bg-hover)] ${currentModelMissing ? 'model-selector-button-unavailable text-[var(--nim-warning,#b45309)] border-[var(--nim-warning,#b45309)]' : 'text-[var(--nim-text-muted)] border-[var(--nim-border)] hover:border-[var(--nim-primary)]'}`}
+        aria-label={
+          currentModelMissing
+            ? `Current model unavailable: ${getCurrentModelName()}`
+            : `Current model: ${getCurrentModelName()}`
+        }
+        title={
+          currentModelMissing
+            ? `"${currentModel}" is no longer offered by its provider. Pick another model — sending will fail until you do.`
+            : currentModelHidden
+              ? `You hid this model in Settings. Pick another model, or unhide it, to keep sending.`
+              : undefined
+        }
         data-testid="model-picker"
         {...getReferenceProps({
-          onClick: () => setIsOpen(open => !open),
+          onClick: () =>
+            setIsOpen(open => {
+              const next = !open;
+              // Refetch on open: the preload effect only reruns when
+              // `providers` changes, but a locally-discovered catalog
+              // (Antigravity) can become reachable while the window stays up.
+              if (next) void loadModels();
+              return next;
+            }),
         })}
       >
+        {(currentModelMissing || currentModelHidden) && (
+          <MaterialSymbol icon="warning" size={12} className="shrink-0" data-testid="model-picker-unavailable-icon" />
+        )}
         <span className="model-selector-label overflow-hidden text-ellipsis">{getCurrentModelName()}</span>
         <MaterialSymbol icon="expand_more" size={14} className={`model-selector-arrow transition-transform duration-200 shrink-0 ${isOpen ? 'rotate-180' : ''}`} />
       </button>
@@ -446,6 +579,15 @@ export function ModelSelector({
                       Start a new session to use agents
                     </div>
                   )}
+                  {orphanedHealthProviders.map(provider => (
+                    <div key={`orphan-${provider}`} className="model-selector-provider-group mb-1">
+                      <div className="model-selector-provider-header flex items-center gap-1.5 px-2 py-1 text-[11px] font-medium text-[var(--nim-text-muted)]">
+                        {renderProviderIcon(provider, 12)}
+                        {getProviderLabel(provider)}
+                      </div>
+                      {renderProviderHealthNotice(provider)}
+                    </div>
+                  ))}
                   {Object.entries(groupedProviders.agents).map(([provider, providerModels]) => (
                     <div key={provider} className="model-selector-provider-group mb-1">
                       {/* Hover help (NIM-825): providers with a
@@ -462,22 +604,33 @@ export function ModelSelector({
                           {ALPHA_PROVIDERS.has(provider) && <AlphaBadge size="xs" />}
                         </div>
                       </HelpTooltip>
+                      {renderProviderHealthNotice(provider)}
                       {providerModels.map(model => {
                         const isCurrent = model.id === currentModel;
                         const isDisabled = isProviderSwitchDisabled(provider);
                         const disabledTooltip = 'Start a new session to switch providers after the session has started';
+                        // Separate from isDisabled, which is the unrelated
+                        // mid-session provider lock. This stays selectable.
+                        const isUnavailable = model.unavailable === true;
+                        const unavailableTooltip =
+                          'Not currently offered by this provider. It is listed because it is still selected somewhere.';
                         return (
                           <button
                             key={model.id}
                             className={`model-selector-option flex items-center justify-between gap-2 pl-6 pr-2 py-1.5 w-full border-none rounded text-xs cursor-pointer transition-[background] duration-150 text-left text-[var(--nim-text)] ${isCurrent ? 'selected bg-[var(--nim-bg-secondary)] text-[var(--nim-primary)]' : ''} ${isDisabled ? 'disabled opacity-50 cursor-not-allowed' : 'hover:bg-[var(--nim-bg-hover)]'}`}
                             onClick={() => !isDisabled && handleModelSelect(model.id)}
                             onKeyDown={handleOptionKeyDown}
-                            title={isDisabled ? disabledTooltip : undefined}
+                            title={isDisabled ? disabledTooltip : isUnavailable ? unavailableTooltip : undefined}
                             aria-disabled={isDisabled}
                             data-model-id={model.id}
                             data-model-name={model.name}
                           >
-                            <span className={`model-selector-option-name flex-1 overflow-hidden text-ellipsis whitespace-nowrap ${isDisabled ? 'text-[var(--nim-text-faint)]' : ''}`}>{model.name}</span>
+                            <span className={`model-selector-option-name flex-1 overflow-hidden text-ellipsis whitespace-nowrap ${isDisabled || isUnavailable ? 'text-[var(--nim-text-faint)]' : ''}`}>
+                              {model.name}
+                              {isUnavailable && (
+                                <span className="model-selector-option-unavailable ml-1 text-[10px] italic">(unavailable)</span>
+                              )}
+                            </span>
                             {isDisabled ? (
                               <MaterialSymbol icon="block" size={14} className="disabled-icon text-[var(--nim-text-faint)]" />
                             ) : isCurrent ? (
@@ -509,22 +662,31 @@ export function ModelSelector({
                         {renderProviderIcon(provider, 12)}
                         {getProviderLabel(provider)}
                       </div>
+                      {renderProviderHealthNotice(provider)}
                       {providerModels.map(model => {
                         const isCurrent = model.id === currentModel;
                         const isDisabled = isProviderSwitchDisabled(provider);
                         const disabledTooltip = 'Start a new session to switch providers after the session has started';
+                        const isUnavailable = model.unavailable === true;
+                        const unavailableTooltip =
+                          'Not currently offered by this provider. It is listed because it is still selected somewhere.';
                         return (
                           <button
                             key={model.id}
                             className={`model-selector-option flex items-center justify-between gap-2 pl-6 pr-2 py-1.5 w-full border-none rounded text-xs cursor-pointer transition-[background] duration-150 text-left text-[var(--nim-text)] ${isCurrent ? 'selected bg-[var(--nim-bg-secondary)] text-[var(--nim-primary)]' : ''} ${isDisabled ? 'disabled opacity-50 cursor-not-allowed' : 'hover:bg-[var(--nim-bg-hover)]'}`}
                             onClick={() => !isDisabled && handleModelSelect(model.id)}
                             onKeyDown={handleOptionKeyDown}
-                            title={isDisabled ? disabledTooltip : undefined}
+                            title={isDisabled ? disabledTooltip : isUnavailable ? unavailableTooltip : undefined}
                             aria-disabled={isDisabled}
                             data-model-id={model.id}
                             data-model-name={model.name}
                           >
-                            <span className={`model-selector-option-name flex-1 overflow-hidden text-ellipsis whitespace-nowrap ${isDisabled ? 'text-[var(--nim-text-faint)]' : ''}`}>{model.name}</span>
+                            <span className={`model-selector-option-name flex-1 overflow-hidden text-ellipsis whitespace-nowrap ${isDisabled || isUnavailable ? 'text-[var(--nim-text-faint)]' : ''}`}>
+                              {model.name}
+                              {isUnavailable && (
+                                <span className="model-selector-option-unavailable ml-1 text-[10px] italic">(unavailable)</span>
+                              )}
+                            </span>
                             {isDisabled ? (
                               <MaterialSymbol icon="block" size={14} className="disabled-icon text-[var(--nim-text-faint)]" />
                             ) : isCurrent ? (
