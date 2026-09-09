@@ -45,9 +45,11 @@ import { AntigravityToolLoopProtocol } from './geminiAntigravity/AntigravityTool
 import {
   DEFAULT_GEMINI_MODEL_KEY,
   bareGeminiModelKey,
-  discoverGeminiModels,
+  discoverGeminiCatalog,
 } from './geminiAntigravity/geminiAntigravityModels';
 import type { ProviderSessionData } from './ProviderSessionManager';
+import type { ProviderCatalogHealth } from '../types';
+import { reportCatalogHealth } from './catalogHealthRegistry';
 import type {
   AgentToolDefinition,
   AIModel,
@@ -93,6 +95,8 @@ export type GeminiToolExecutor = (args: GeminiToolExecutorArgs) => Promise<Gemin
 export interface GeminiServerConfig {
   overrideIdeVersion?: string;
   spawnPortCandidates?: number[];
+  /** Per-call ceiling for one GetModelResponse round trip, in ms. */
+  modelResponseTimeoutMs?: number;
 }
 
 interface SessionState {
@@ -103,11 +107,37 @@ interface SessionState {
   abortController: AbortController | null;
 }
 
+// The call is buffered, so a timeout throws away completed work rather than
+// truncating it. Overridable per install via `modelResponseTimeoutMs`.
+const MODEL_RESPONSE_TIMEOUT_MS = 600_000;
+
 // run_command tuning. The command runs in this process with the session's
 // workspace as cwd, bounded by a hard timeout and output caps.
 const RUN_COMMAND_TIMEOUT_MS = 120_000;
 const RUN_COMMAND_MAX_BUFFER = 4 * 1024 * 1024;
 const RUN_COMMAND_MAX_OUTPUT = 48_000;
+
+/**
+ * Node's `exec` defaults to cmd.exe on Windows, which does not treat `;` as a
+ * separator, so `;`-joined commands fail confusingly rather than loudly.
+ * Prefer PowerShell 7, fall back to the OS-bundled powershell.exe.
+ */
+let cachedWindowsShell: string | null = null;
+function windowsCommandShell(): string {
+  if (cachedWindowsShell !== null) return cachedWindowsShell;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { execFileSync } = require('child_process') as typeof import('child_process');
+    execFileSync('pwsh.exe', ['-NoLogo', '-NoProfile', '-Command', 'exit 0'], {
+      stdio: 'ignore',
+      timeout: 5_000,
+    });
+    cachedWindowsShell = 'pwsh.exe';
+  } catch {
+    cachedWindowsShell = 'powershell.exe';
+  }
+  return cachedWindowsShell;
+}
 
 function clampCommandOutput(text: string): string {
   return text.length <= RUN_COMMAND_MAX_OUTPUT
@@ -133,12 +163,25 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
 
   async initialize(config: ProviderConfig): Promise<void> {
     this.config = config;
-    // Apply configuration but do NOT start the server: spawning is deferred to
-    // the first real turn, so opening settings or a model picker never fires up
-    // a ~120MB language server.
-    const serverConfig = GeminiAntigravityProvider.serverConfigLoader?.();
-    if (serverConfig) this.server.configure(serverConfig);
+    GeminiAntigravityProvider.applyServerConfig(this.server);
   }
+
+  /**
+   * Must run before anything that can spawn: `configure()` does not re-version
+   * a running server, so the first spawn decides it for the whole app session.
+   */
+  private static applyServerConfig(server: AntigravityServerManager): void {
+    const serverConfig = GeminiAntigravityProvider.serverConfigLoader?.();
+    if (serverConfig) {
+      server.configure(serverConfig);
+      const t = serverConfig.modelResponseTimeoutMs;
+      if (typeof t === 'number' && Number.isFinite(t) && t > 0) {
+        GeminiAntigravityProvider.modelResponseTimeoutMs = t;
+      }
+    }
+  }
+
+  private static modelResponseTimeoutMs: number = MODEL_RESPONSE_TIMEOUT_MS;
 
   /**
    * Nothing to return: the language server holds no session state, so there is
@@ -217,7 +260,10 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     // only by tool name, so the id minted on the call is held here until the
     // matching result arrives. It becomes the chunk's `toolUseId`, which is
     // what file attribution and pre-edit history tags correlate on.
-    const pendingCalls = new Map<string, { id: string; name: string; args: Record<string, unknown> }>();
+    const pendingCalls = new Map<
+      string,
+      { id: string; name: string; args: Record<string, unknown>; description?: string }
+    >();
 
     try {
       for await (const step of state.toolLoop.run(
@@ -225,15 +271,28 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
         systemPrompt ?? '',
         (tools ?? []) as Array<{ type: 'function'; function: { name: string } }>,
         (name, args) => this.executeTool(state, name, args),
-        undefined,
+        GeminiAntigravityProvider.modelResponseTimeoutMs,
         abortController.signal,
       )) {
         if (abortController.signal.aborted) break;
 
         if (step.type === 'tool_call') {
           const id = `agy-${Date.now()}-${toolCallSeq++}`;
-          pendingCalls.set(step.name, { id, name: step.name, args: step.args });
-          yield { type: 'tool_call', toolCall: { id, name: step.name, arguments: step.args } };
+          pendingCalls.set(step.name, {
+            id,
+            name: step.name,
+            args: step.args,
+            description: step.description,
+          });
+          yield {
+            type: 'tool_call',
+            toolCall: {
+              id,
+              name: step.name,
+              arguments: step.args,
+              description: step.description,
+            },
+          };
         } else if (step.type === 'tool_result') {
           const pending = pendingCalls.get(step.name);
           if (!pending) {
@@ -254,7 +313,12 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
           await this.logAgentMessageBestEffort(
             sessionId,
             'output',
-            JSON.stringify({ name: step.name, result: step.result, args: pending.args }),
+            JSON.stringify({
+              name: step.name,
+              result: step.result,
+              args: pending.args,
+              description: pending.description,
+            }),
             // `toolUseId` is what makes a reloaded transcript agree with the
             // live one: without it the parser has to mint a synthetic id, and
             // the reloaded tool card is a different event from the streamed
@@ -269,6 +333,7 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
               name: pending.name,
               arguments: pending.args,
               result: step.result,
+              description: pending.description,
             },
           };
           pendingCalls.delete(step.name);
@@ -424,6 +489,7 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
         timeout: RUN_COMMAND_TIMEOUT_MS,
         maxBuffer: RUN_COMMAND_MAX_BUFFER,
         windowsHide: true,
+        ...(process.platform === 'win32' ? { shell: windowsCommandShell() } : {}),
       });
       const body =
         [stdout ? `stdout:\n${stdout}` : '', stderr ? `stderr:\n${stderr}` : '']
@@ -520,16 +586,20 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
   }
 
   /**
-   * The model catalog, discovered from the language server when it is already
-   * running and falling back to a short seed list otherwise. See
-   * `geminiAntigravityModels.ts` for why discovery never spawns the server.
+   * The model catalog, discovered from the language server and starting it if
+   * needed. Config is applied here as well as in `initialize()`: this static
+   * serves the picker, which has no provider instance behind it.
    */
   static async getModels(): Promise<AIModel[]> {
-    const models = await discoverGeminiModels(AntigravityServerManager.shared());
+    const server = AntigravityServerManager.shared();
+    GeminiAntigravityProvider.applyServerConfig(server);
+    const { models, health } = await discoverGeminiCatalog(server);
+    reportCatalogHealth(GEMINI_ANTIGRAVITY_PROVIDER, health);
     return models.map((m) => ({
       id: `${GEMINI_ANTIGRAVITY_PROVIDER}:${m.key}`,
       name: m.displayName,
       provider: GEMINI_ANTIGRAVITY_PROVIDER,
     }));
   }
+
 }

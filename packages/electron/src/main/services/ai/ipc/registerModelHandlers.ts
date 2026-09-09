@@ -7,8 +7,9 @@ import { safeSend } from '.././aiServiceUtils';
 import { claudeCliSessionSupportsPlugins } from '.././claudeCliLauncherSingleton';
 import { isModelEnabled, resolveProviderEnabled } from '.././modelEnablementFilter';
 import { type AIServiceContext } from './AIServiceContext';
-import { ModelRegistry, ProviderFactory } from '@nimbalyst/runtime/ai/server';
-import { type AIProviderType } from '@nimbalyst/runtime/ai/server/types';
+import { GeminiAntigravityProvider, ModelRegistry, ProviderFactory } from '@nimbalyst/runtime/ai/server';
+import { lastCatalogHealth } from '@nimbalyst/runtime/ai/server/providers/catalogHealthRegistry';
+import { type AIProviderType, type ProviderCatalogHealth } from '@nimbalyst/runtime/ai/server/types';
 import { BrowserWindow } from 'electron';
 
 /**
@@ -300,6 +301,24 @@ export function registerModelHandlers(ctx: AIServiceContext): void {
       }
     }
 
+    // Read after getAllModels so it reflects the fetch that just happened.
+    const providerHealth: Record<string, ProviderCatalogHealth> = {};
+    if (enabledProviderSet.has('antigravity-gemini-agent')) {
+      const geminiHealth = lastCatalogHealth('antigravity-gemini-agent');
+      if (geminiHealth && geminiHealth.state !== 'ok') {
+        providerHealth['antigravity-gemini-agent'] = geminiHealth;
+      }
+    } else if (!GeminiAntigravityProvider.isInstalled()) {
+      // The provider auto-disables when Antigravity is missing, so it has no
+      // group to carry the notice. Report anyway; the picker decides.
+      providerHealth['antigravity-gemini-agent'] = {
+        state: 'degraded',
+        reason: 'not-installed',
+        detail: GeminiAntigravityProvider.NOT_INSTALLED_MESSAGE,
+        retryable: false,
+      };
+    }
+
     // Group ENABLED models by provider (not all models)
     const grouped: Record<string, any[]> = {};
     for (const model of enabledModels) {
@@ -330,7 +349,9 @@ export function registerModelHandlers(ctx: AIServiceContext): void {
       // the picker labels extension agent groups (e.g. "Gemini" + auto_awesome)
       // instead of prettifying the raw contribution id.
       providerLabels,
-      providerIcons
+      providerIcons,
+      // Present only for providers whose catalog is degraded; absent means ok.
+      providerHealth
     };
   });
 

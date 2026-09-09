@@ -2410,11 +2410,18 @@ app.whenReady().then(async () => {
       const settings = (getAiSettingsStore().get('providerSettings', {}) as Record<string, {
         overrideIdeVersion?: unknown;
         spawnPortCandidates?: unknown;
+        modelResponseTimeoutMs?: unknown;
       }>)['antigravity-gemini-agent'] ?? {};
       return {
         overrideIdeVersion: typeof settings.overrideIdeVersion === 'string'
           ? settings.overrideIdeVersion
           : undefined,
+        modelResponseTimeoutMs:
+          typeof settings.modelResponseTimeoutMs === 'number'
+            && Number.isFinite(settings.modelResponseTimeoutMs)
+            && settings.modelResponseTimeoutMs > 0
+            ? settings.modelResponseTimeoutMs
+            : undefined,
         spawnPortCandidates: Array.isArray(settings.spawnPortCandidates)
           ? settings.spawnPortCandidates.filter(
             (port): port is number => typeof port === 'number' && Number.isFinite(port) && port > 0,

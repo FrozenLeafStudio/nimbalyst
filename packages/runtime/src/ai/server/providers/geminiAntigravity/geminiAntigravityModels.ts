@@ -10,12 +10,12 @@
  * NIM-1486, so discovery is the primary source and the seed list below is only
  * a fallback.
  *
- * Discovery never spawns the server. Enumerating models is a passive act (the
- * user opened a picker), and starting a ~120MB language server for it would be
- * a surprising side effect -- so when no endpoint is live the seed list is
- * returned and discovery fills in after the first real turn. Same posture as
- * `GrokBuildProvider.listModelIds()`, which falls back to its default when the
- * CLI cannot be reached.
+ * Discovery starts the language server if it is not already up, at the cost of
+ * a ~120MB process on opening a picker.
+ *
+ * Callers MUST apply the server config first
+ * (`GeminiAntigravityProvider.applyServerConfig`): `configure()` does not
+ * re-version a running server, so whoever spawns first decides it.
  *
  * The catalog spans several vendors (Antigravity also fronts Anthropic and
  * OpenAI models). This is the *Gemini* provider, so only Google-served entries
@@ -23,7 +23,9 @@
  * unrelated Nimbalyst providers with different billing stories.
  */
 
-import type { AntigravityModelInfo, AntigravityServerManager } from './AntigravityServerManager';
+import type { AntigravityModelInfo } from './AntigravityServerManager';
+import { AntigravityServerManager, AntigravityVersionGateError } from './AntigravityServerManager';
+import type { ProviderCatalogHealth } from '../../types';
 
 /** `apiProvider` value the language server reports for Google-served models. */
 const GOOGLE_API_PROVIDER = 'API_PROVIDER_GOOGLE_GEMINI';
@@ -98,23 +100,109 @@ export function entitledModelEnums(userStatus: unknown): Set<string> {
   return enums;
 }
 
+export interface GeminiCatalogResult {
+  models: Array<{ key: string; displayName: string }>;
+  health: ProviderCatalogHealth;
+}
+
+/** Classify a discovery failure into something the UI can explain. */
+function classifyDiscoveryFailure(err: unknown): ProviderCatalogHealth {
+  const message = err instanceof Error ? err.message : String(err);
+
+  if (err instanceof AntigravityVersionGateError || /version gate/i.test(message)) {
+    return {
+      state: 'degraded',
+      reason: 'version-gated',
+      detail:
+        'Antigravity rejected this build as out of date, so the model list is '
+        + 'incomplete. Update Antigravity, or set overrideIdeVersion for the '
+        + 'Gemini provider in ai-settings.',
+      retryable: false,
+    };
+  }
+  if (!AntigravityServerManager.isInstalled()) {
+    return {
+      state: 'degraded',
+      reason: 'not-installed',
+      detail:
+        'Antigravity is not installed, so no models could be discovered. '
+        + 'Install it from https://antigravity.google and sign in once.',
+      retryable: false,
+    };
+  }
+  if (/HTTP 401|HTTP 403|sign|auth/i.test(message)) {
+    return {
+      state: 'degraded',
+      reason: 'not-signed-in',
+      detail:
+        'Antigravity is installed but not signed in, so the model list is '
+        + 'unavailable. Open Antigravity and sign in to your Google account.',
+      retryable: true,
+    };
+  }
+  return {
+    state: 'degraded',
+    reason: 'not-running',
+    detail: `Could not reach the Antigravity language server: ${message}`,
+    retryable: true,
+  };
+}
+
 /**
- * Discover the model list, falling back to the seed when the server is not
- * already running or either RPC fails.
+ * A short catalog is still a well-formed one, so nothing inside a response
+ * reveals it. The claim does: a server we spawned below the installed version
+ * is under-reporting entitlements. Only ours -- Antigravity's is authoritative.
  */
-export async function discoverGeminiModels(
+async function versionSkewHealth(
   server: AntigravityServerManager,
-): Promise<Array<{ key: string; displayName: string }>> {
-  const endpoint = server.currentEndpoint();
-  if (!endpoint) return [...SEED_GEMINI_MODELS];
+): Promise<ProviderCatalogHealth> {
+  const running = server.runningOwnedIdeVersion();
+  if (!running) return { state: 'ok' };
+  const installed = await server.installedIdeVersion();
+  if (!installed || installed === running) return { state: 'ok' };
+  return {
+    state: 'degraded',
+    reason: 'version-gated',
+    detail:
+      `This list may be incomplete. Nimbalyst is identifying as Antigravity `
+      + `${running} while the installed version is ${installed}, and the backend `
+      + `reports fewer models for older versions. Clear overrideIdeVersion for `
+      + `the Gemini provider in ai-settings to use the installed version.`,
+    retryable: false,
+  };
+}
+
+/** Discover the model list plus whether that list can be trusted. */
+export async function discoverGeminiCatalog(
+  server: AntigravityServerManager,
+): Promise<GeminiCatalogResult> {
   try {
+    const endpoint = await server.ensureRunning();
     const [catalog, userStatus] = await Promise.all([
       server.getAvailableModels(endpoint),
       server.getUserStatus(endpoint).catch(() => null),
     ]);
     const models = selectGeminiModels(catalog, entitledModelEnums(userStatus));
-    return models.length > 0 ? models : [...SEED_GEMINI_MODELS];
-  } catch {
-    return [...SEED_GEMINI_MODELS];
+    if (models.length > 0) {
+      return { models, health: await versionSkewHealth(server) };
+    }
+    // The server answered; nothing survived the entitlement filter. Not
+    // retryable -- the same query returns the same result. (A failed
+    // GetUserStatus does not land here: it yields an empty entitlement set,
+    // which leaves the catalog unfiltered rather than empty.)
+    return {
+      models: [...SEED_GEMINI_MODELS],
+      health: {
+        state: 'degraded',
+        reason: 'seed-fallback',
+        detail:
+          'Antigravity returned no Gemini models this account can use, so a '
+          + 'default list is shown and these may not be selectable. Check that '
+          + 'you are signed in to Antigravity with the right Google account.',
+        retryable: false,
+      },
+    };
+  } catch (err) {
+    return { models: [...SEED_GEMINI_MODELS], health: classifyDiscoveryFailure(err) };
   }
 }
