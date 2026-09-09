@@ -35,6 +35,15 @@ const DEFAULT_SPAWN_PORT_CANDIDATES: readonly number[] = [
   51717, 8765, 13456, 21345, 31987, 41234,
 ];
 
+const PLIST_SHORT_VERSION_RE =
+  /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/;
+
+/** Windows reports FileVersion as four parts ("2.12.2.0"); the gate wants three. */
+export function normalizeIdeVersion(raw: string | null | undefined): string | null {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec((raw ?? '').trim());
+  return m ? `${m[1]}.${m[2]}.${m[3]}` : null;
+}
+
 export interface AntigravityEndpoint {
   httpsPort: number;
   csrf: string;
@@ -84,9 +93,16 @@ export class AntigravityServerManager {
   /** Cache of key -> enum, valid for the current endpoint only. */
   private enumCache = new Map<string, string>();
 
-  // Injected configuration. Falls back to the hardcoded defaults when the
-  // host hasn't called configure() (dev harness, unit tests).
-  private overrideIdeVersion: string = DEFAULT_OVERRIDE_IDE_VERSION;
+  // Falls back to the hardcoded defaults when the host hasn't called
+  // configure() (dev harness, unit tests).
+  private explicitOverrideIdeVersion: string | null = null;
+  private detectedIdeVersion: string | null = null;
+  private detectedIdeVersionAttempted = false;
+  /** Version our server was spawned with; null when attached to Antigravity's. */
+  private spawnedIdeVersion: string | null = null;
+  // Detection reads the app's file version, which is not guaranteed to be the
+  // string the gate wants -- marketing and build versions can differ.
+  private detectedIdeVersionRejected = false;
   private spawnPortCandidates: readonly number[] = DEFAULT_SPAWN_PORT_CANDIDATES;
 
   static shared(): AntigravityServerManager {
@@ -103,12 +119,106 @@ export class AntigravityServerManager {
    */
   configure(cfg: AntigravityServerConfig): void {
     if (typeof cfg.overrideIdeVersion === 'string' && cfg.overrideIdeVersion.length > 0) {
-      this.overrideIdeVersion = cfg.overrideIdeVersion;
+      this.explicitOverrideIdeVersion = cfg.overrideIdeVersion;
+    } else {
+      this.explicitOverrideIdeVersion = null;
     }
     if (Array.isArray(cfg.spawnPortCandidates) && cfg.spawnPortCandidates.length > 0) {
       // Defensive copy so the caller can't mutate our array after handoff.
       this.spawnPortCandidates = [...cfg.spawnPortCandidates];
     }
+  }
+
+  /** Explicit setting > detected install > hardcoded default. */
+  async resolveOverrideIdeVersion(): Promise<string> {
+    if (this.explicitOverrideIdeVersion) return this.explicitOverrideIdeVersion;
+    if (this.detectedIdeVersionRejected) return DEFAULT_OVERRIDE_IDE_VERSION;
+    const detected = await this.detectInstalledIdeVersion();
+    return detected ?? DEFAULT_OVERRIDE_IDE_VERSION;
+  }
+
+  /**
+   * An explicit setting stays in force even when rejected: the user asked for
+   * it, and overriding it silently would hide that it is wrong.
+   */
+  private noteVersionGateRejection(): void {
+    if (this.explicitOverrideIdeVersion) return;
+    if (this.spawnedIdeVersion && this.spawnedIdeVersion === this.detectedIdeVersion) {
+      this.detectedIdeVersionRejected = true;
+    }
+  }
+
+  /** True when our own server is running a version we would no longer choose. */
+  private async ownedServerIsStale(): Promise<boolean> {
+    if (!this.endpoint?.owned || !this.spawnedIdeVersion) return false;
+    return this.spawnedIdeVersion !== (await this.resolveOverrideIdeVersion());
+  }
+
+  /** Version our server runs under; null when attached to Antigravity's. */
+  runningOwnedIdeVersion(): string | null {
+    return this.endpoint?.owned ? this.spawnedIdeVersion : null;
+  }
+
+  /** Version of the installed Antigravity app; null when unreadable. */
+  async installedIdeVersion(): Promise<string | null> {
+    return this.detectInstalledIdeVersion();
+  }
+
+  /** Best-effort synchronous view, for error messages raised after a spawn. */
+  private effectiveIdeVersionSync(): string {
+    return this.explicitOverrideIdeVersion
+      ?? this.detectedIdeVersion
+      ?? DEFAULT_OVERRIDE_IDE_VERSION;
+  }
+
+  /** Probed once per process; a failure is cached. */
+  private async detectInstalledIdeVersion(): Promise<string | null> {
+    if (this.detectedIdeVersionAttempted) return this.detectedIdeVersion;
+    this.detectedIdeVersionAttempted = true;
+    try {
+      this.detectedIdeVersion = await this.readInstalledIdeVersion();
+    } catch {
+      this.detectedIdeVersion = null;
+    }
+    return this.detectedIdeVersion;
+  }
+
+  private async readInstalledIdeVersion(): Promise<string | null> {
+    if (process.platform === 'win32') {
+      // The app ships no version file: resources/app has no package.json or
+      // product.json. The version lives in the exe's VersionInfo resource.
+      const exe = AntigravityServerManager.appBinaryPath();
+      if (!fs.existsSync(exe)) return null;
+      const quoted = exe.split("'").join("''");
+      const out = await this.runPowerShell(
+        "(Get-Item -LiteralPath '" + quoted + "').VersionInfo.FileVersion");
+      return normalizeIdeVersion(out);
+    }
+    if (process.platform === 'darwin') {
+      const plist = '/Applications/Antigravity.app/Contents/Info.plist';
+      if (!fs.existsSync(plist)) return null;
+      const xml = await fs.promises.readFile(plist, 'utf8');
+      const m = PLIST_SHORT_VERSION_RE.exec(xml);
+      return m ? normalizeIdeVersion(m[1]) : null;
+    }
+    // Linux ships no discoverable version marker; the caller falls back.
+    return null;
+  }
+
+  /**
+   * The Antigravity *app* binary. binaryPath() points at the bundled language
+   * server, which carries the server's version, not the IDE's.
+   */
+  static appBinaryPath(): string {
+    if (process.platform === 'win32') {
+      const local = process.env.LOCALAPPDATA
+        || path.join(os.homedir(), 'AppData', 'Local');
+      return path.join(local, 'Programs', 'Antigravity', 'Antigravity.exe');
+    }
+    if (process.platform === 'darwin') {
+      return '/Applications/Antigravity.app/Contents/MacOS/Electron';
+    }
+    return path.join(os.homedir(), '.local', 'share', 'antigravity', 'antigravity');
   }
 
   /** Resolve the language_server.exe path for the current platform. */
@@ -141,7 +251,13 @@ export class AntigravityServerManager {
    */
   async ensureRunning(): Promise<AntigravityEndpoint> {
     if (this.endpoint && (await this.isHealthy(this.endpoint))) {
-      return this.endpoint;
+      if (await this.ownedServerIsStale()) {
+        // Recycling aborts any in-flight turn in this process. That is the
+        // cost of picking up a settings change without an app restart.
+        this.stop();
+      } else {
+        return this.endpoint;
+      }
     }
     if (this.startPromise) return this.startPromise;
 
@@ -190,6 +306,7 @@ export class AntigravityServerManager {
     }
     this.child = null;
     this.endpoint = null;
+    this.spawnedIdeVersion = null;
     this.enumCache.clear();
   }
 
@@ -312,16 +429,11 @@ export class AntigravityServerManager {
     let lastErr: unknown;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       if (abortSignal?.aborted) throw new Error('Operation cancelled');
-      if (attempt > 1) {
-        // Re-discover before the retry: a crashed server is respawned, an alive
-        // one re-found. We DO retry against the same alive endpoint -- the common
-        // timeout cause is an intermittent runaway generation, and a fresh
-        // generation usually does not run away. A truly wedged server is rare and
-        // costs one extra timeout; recovering the common case is worth it.
-        this.endpoint = null;
-        await delay(RETRY_BACKOFF_MS);
-      }
+      if (attempt > 1) await delay(RETRY_BACKOFF_MS);
       const ep = await this.ensureRunning();
+      // Only worth a second attempt if the server actually changed under us --
+      // the old one died and this is a respawned replacement. Against a server
+      // that is still alive a timeout means "not finished yet".
       const enumName = modelKeyOrEnum.startsWith('MODEL_')
         ? modelKeyOrEnum
         : await this.resolveModelEnum(modelKeyOrEnum, ep);
@@ -330,9 +442,11 @@ export class AntigravityServerManager {
           'GetModelResponse', { prompt, model: enumName }, ep, timeoutMs, abortSignal);
         const text = res.response ?? '';
         if (typeof text === 'string' && text.includes('no longer supported')) {
+          this.noteVersionGateRejection();
+          this.stop();
           throw new AntigravityVersionGateError(
             `Antigravity backend rejected the build (version gate). Server must run with ` +
-            `--override_ide_version ${this.overrideIdeVersion}. Got: ${text}`);
+            `--override_ide_version ${this.effectiveIdeVersionSync()}. Got: ${text}`);
         }
         return text;
       } catch (err) {
@@ -346,7 +460,15 @@ export class AntigravityServerManager {
         const isTimeout = msg.includes('timed out');
         const isHttp4xx = /HTTP 4\d\d/.test(msg);
         if (!isTimeout || isHttp4xx || attempt >= MAX_ATTEMPTS) throw err;
-        // Timeout (likely an intermittent runaway): fall through and retry.
+        // A timeout says nothing about whether the server is alive. Ask it.
+        // Still healthy means the generation is simply not finished, and
+        // re-running it would discard the progress already made. Only a server
+        // that has actually died is worth a second attempt.
+        if (await this.isHealthy(ep)) throw err;
+        // Stop rather than forget: discovery matches any `--subclient_type hub`
+        // process, so our own child would come back as `owned: false`.
+        if (ep.owned) this.stop();
+        else this.endpoint = null;
       }
     }
     // Unreachable: the loop either returns or throws on every path.
@@ -486,6 +608,9 @@ export class AntigravityServerManager {
     }
 
     const csrf = `nimbalyst-${randomUUID()}`;
+    // Only the spawn path claims a version; attaching uses the real one.
+    const overrideIdeVersion = await this.resolveOverrideIdeVersion();
+    this.spawnedIdeVersion = overrideIdeVersion;
 
     const bindErrors: Array<{ port: number; reason: string }> = [];
     for (const port of this.spawnPortCandidates) {
@@ -493,7 +618,7 @@ export class AntigravityServerManager {
         '--standalone',
         '--subclient_type', 'hub',
         '--override_ide_name', 'antigravity',
-        '--override_ide_version', this.overrideIdeVersion,
+        '--override_ide_version', overrideIdeVersion,
         '--override_user_agent_name', 'antigravity',
         '--api_server_url', 'https://generativelanguage.googleapis.com',
         '--cloud_code_endpoint', 'https://daily-cloudcode-pa.googleapis.com',
@@ -521,6 +646,7 @@ export class AntigravityServerManager {
         if (this.child === child) {
           this.child = null;
           this.endpoint = null;
+          this.spawnedIdeVersion = null;
           this.enumCache.clear();
         }
       });
