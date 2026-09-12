@@ -1,3 +1,4 @@
+import { mergeSessionIndexMetadata, type CachedSessionIndex } from './sessionIndexMetadata';
 import { isRetainedSession, sessionActivityAt, SESSION_TRANSCRIPT_TTL_MS } from '@nimbalyst/collab-protocol';
 /**
  * CollabV3 Sync Provider
@@ -1278,69 +1279,6 @@ function isSkippableMessageSyncErrorCode(code?: string): boolean {
 export { isFatalMessageSyncErrorCode as isFatalMessageSyncErrorCodeForTest };
 export { isSkippableMessageSyncErrorCode as isSkippableMessageSyncErrorCodeForTest };
 
-// Cache of session index entries for partial update merging
-// This cache stores DECRYPTED values locally
-interface CachedSessionIndex {
-  sessionId: string;
-  projectId: string;
-  /** Decrypted title (stored locally after decryption) */
-  title: string;
-  provider: string;
-  model?: string;
-  mode?: 'agent' | 'planning';
-  /** Structural type: 'session' | 'workstream' | 'blitz' */
-  sessionType?: string;
-  /** Parent session ID for workstream/worktree hierarchy */
-  parentSessionId?: string;
-  /** Worktree ID for git worktree association */
-  worktreeId?: string;
-  /** Stable device ID of the host that owns this session. */
-  hostDeviceId?: string;
-  /** Agent role marker (e.g. 'meta-agent', 'standard'); drives mobile meta-agent grouping. */
-  agentRole?: string;
-  /** Meta-agent parent session ID for spawned children; drives mobile meta-agent grouping. */
-  createdBySessionId?: string;
-  isArchived?: boolean;
-  isPinned?: boolean;
-  branchedFromSessionId?: string;
-  branchPointMessageId?: number;
-  branchedAt?: number;
-  messageCount: number;
-  lastMessageAt: number;
-  createdAt: number;
-  updatedAt: number;
-  // Execution state fields synced via index updates to mobile
-  pendingExecution?: {
-    messageId: string;
-    sentAt: number;
-    sentBy: 'mobile' | 'desktop';
-  };
-  isExecuting?: boolean;
-  /** Decrypted queued prompts (stored locally after decryption) */
-  queuedPrompts?: PlaintextQueuedPrompt[];
-  /** Durable queue size, including explicit zero when prompt payloads are omitted. */
-  queuedPromptCount?: number;
-  /** Current context usage (from /context command for Claude Code) */
-  currentContext?: {
-    tokens: number;
-    contextWindow: number;
-  };
-  /** Whether there are pending interactive prompts (permissions or questions) waiting for response */
-  hasPendingPrompt?: boolean;
-  /** Kanban phase: backlog, planning, implementing, validating, complete */
-  phase?: string;
-  /** Arbitrary tags for categorization */
-  tags?: string[];
-  /** Unix timestamp ms when this session was last read by any device */
-  lastReadAt?: number;
-  /** Draft input text (unsent message) for cross-device sync */
-  draftInput?: string;
-  /** Epoch ms when draftInput was last updated by the sending device */
-  draftUpdatedAt?: number;
-  /** Marker that the title was AI-chosen; prevents repeated rename attempts. */
-  hasBeenNamed?: boolean;
-}
-
 // ============================================================================
 // CollabV3 Sync Provider
 // ============================================================================
@@ -1806,17 +1744,13 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     indexEntry.encryptedQueuedPrompts = await encryptQueuedPrompts(queuedPrompts, config.encryptionKey);
   }
 
-  function sendIndexUpdate(baseEntry: CachedSessionIndex): Promise<void> {
-    return indexPublishQueue.run(baseEntry.sessionId, () => doSendIndexUpdate(baseEntry));
-  }
-
-  async function doSendIndexUpdate(baseEntry: CachedSessionIndex): Promise<void> {
-    if (!isRetainedSession(sessionActivityAt(baseEntry)) || wasIndexActivityRejected(baseEntry.sessionId, sessionActivityAt(baseEntry))) return;
+  async function sendIndexUpdate(baseEntry: CachedSessionIndex): Promise<PushChangeOutcome> {
+    if (!isRetainedSession(sessionActivityAt(baseEntry)) || wasIndexActivityRejected(baseEntry.sessionId, sessionActivityAt(baseEntry))) return { published: false, reason: 'session outside index retention', retryable: false };
     if (!indexWs || !config.encryptionKey) {
       console.error('[CollabV3] Cannot send session update: index socket or encryption key missing');
-      return;
+      return { published: false, reason: 'index transport unavailable', retryable: true };
     }
-    if (withholdPersonalSyncWrite('index update')) return;
+    if (withholdPersonalSyncWrite('index update')) return { published: false, reason: 'personal-sync writes withheld', retryable: true };
     // Capture the socket and connection generation BEFORE the encryption
     // awaits. `indexWs` is module state: by the time we come back it may be a
     // different socket (reconnect), and publishing this payload on it would
@@ -1824,6 +1758,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     const socket = indexWs;
     const generation = indexConnectionGeneration;
     const publishSeq = publishSequencer.read(baseEntry.sessionId);
+    const cachedAtStart = sessionIndexCache.get(baseEntry.sessionId);
 
     const { encryptedProjectId, projectIdIv } = await encryptProjectId(baseEntry.projectId, config.encryptionKey);
 
@@ -1870,38 +1805,39 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       indexEntry.clientMetadataIv = clientMetadataIv;
     }
 
-    if (!isPublishStillCurrent(baseEntry.sessionId, socket, generation, publishSeq, 'index update')) return;
+    if (!isPublishStillCurrent(baseEntry.sessionId, socket, generation, publishSeq, 'index update') ||
+        sessionIndexCache.get(baseEntry.sessionId) !== cachedAtStart) {
+      return { published: false, reason: 'index state changed during publication', retryable: true };
+    }
 
     const publishedEntry: CachedSessionIndex = {
       ...baseEntry,
       queuedPromptCount: baseEntry.queuedPrompts?.length ?? baseEntry.queuedPromptCount,
     };
-    sessionIndexCache.set(baseEntry.sessionId, publishedEntry);
     const indexMsg: ClientMessage = { type: 'indexUpdate', session: indexEntry };
     socket.send(JSON.stringify(indexMsg));
+    sessionIndexCache.set(baseEntry.sessionId, publishedEntry);
     // A full indexUpdate carries a superset of the patch projection, so the
     // server now holds these values and a following timestamp-only patch has
     // nothing to add. Recorded only after the send actually succeeded.
     indexPublicationGate.recordPublished(baseEntry.sessionId, indexPatchSignatureForEntry(publishedEntry));
     noteSessionRowPublished(baseEntry.sessionId);
+    return { published: true };
   }
 
-  function sendIndexClientMetadataPatch(baseEntry: CachedSessionIndex): Promise<void> {
-    return indexPublishQueue.run(baseEntry.sessionId, () => doSendIndexClientMetadataPatch(baseEntry));
-  }
-
-  async function doSendIndexClientMetadataPatch(baseEntry: CachedSessionIndex): Promise<void> {
-    if (!isRetainedSession(sessionActivityAt(baseEntry)) || wasIndexActivityRejected(baseEntry.sessionId, sessionActivityAt(baseEntry))) return;
+  async function sendIndexClientMetadataPatch(baseEntry: CachedSessionIndex): Promise<PushChangeOutcome> {
+    if (!isRetainedSession(sessionActivityAt(baseEntry)) || wasIndexActivityRejected(baseEntry.sessionId, sessionActivityAt(baseEntry))) return { published: false, reason: 'session outside index retention', retryable: false };
     if (!indexWs || !config.encryptionKey) {
       console.error('[CollabV3] Cannot send index metadata patch: index socket or encryption key missing');
-      return;
+      return { published: false, reason: 'index transport unavailable', retryable: true };
     }
-    if (withholdPersonalSyncWrite('index metadata patch')) return;
-    // See doSendIndexUpdate: socket and generation are captured before the
+    if (withholdPersonalSyncWrite('index metadata patch')) return { published: false, reason: 'personal-sync writes withheld', retryable: true };
+    // See sendIndexUpdate: socket and generation are captured before the
     // encryption await so a reconnect cannot be published onto.
     const socket = indexWs;
     const generation = indexConnectionGeneration;
     const publishSeq = publishSequencer.read(baseEntry.sessionId);
+    const cachedAtStart = sessionIndexCache.get(baseEntry.sessionId);
 
     // The patch wire message carries no `updatedAt`. Caching the caller's newer
     // local timestamp anyway would tell the next bulk publish that the server
@@ -1934,9 +1870,14 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       patch.clientMetadataIv = clientMetadataIv;
     }
 
-    if (!isPublishStillCurrent(baseEntry.sessionId, socket, generation, publishSeq, 'metadata patch')) return;
-    sessionIndexCache.set(baseEntry.sessionId, publishedEntry);
-    if (!shouldSend) return;
+    if (!isPublishStillCurrent(baseEntry.sessionId, socket, generation, publishSeq, 'metadata patch') ||
+        sessionIndexCache.get(baseEntry.sessionId) !== cachedAtStart) {
+      return { published: false, reason: 'index state changed during publication', retryable: true };
+    }
+    if (!shouldSend) {
+      sessionIndexCache.set(baseEntry.sessionId, publishedEntry);
+      return { published: true };
+    }
 
     const patchMsg: ClientMessage = { type: 'indexClientMetadataPatch', patch };
     try {
@@ -1947,10 +1888,12 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       // (or the next real change) re-publishes it.
       indexPublicationGate.invalidate(baseEntry.sessionId);
       console.error('[CollabV3] Failed to send index metadata patch:', err);
-      return;
+      return { published: false, reason: 'index send failed', retryable: true };
     }
+    sessionIndexCache.set(baseEntry.sessionId, publishedEntry);
     indexPublicationGate.recordPublished(baseEntry.sessionId, signature);
     publishSequencer.bump(baseEntry.sessionId);
+    return { published: true };
   }
 
   /**
@@ -1958,59 +1901,26 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
    * This handles the case where isExecuting is pushed before the session is in the cache.
    */
   async function applyPendingMetadataUpdates(sessionId: string): Promise<void> {
-    const pending = pendingMetadataUpdates.get(sessionId);
-    if (!pending) return;
+    const generation = indexConnectionGeneration;
+    await indexPublishQueue.run(sessionId, async () => {
+      if (generation !== indexConnectionGeneration) return;
+      const pending = pendingMetadataUpdates.get(sessionId);
+      if (!pending) return;
 
-    pendingMetadataUpdates.delete(sessionId);
+      const cached = sessionIndexCache.get(sessionId);
+      if (!cached || !indexWs || !indexConnected) return;
 
-    const cached = sessionIndexCache.get(sessionId);
-    if (!cached || !indexWs || !indexConnected) return;
+      const updatedCache = mergeSessionIndexMetadata(cached, pending);
+      // Pending control updates must not invent message activity.
+      updatedCache.lastMessageAt = cached.lastMessageAt;
 
-    // console.log('[CollabV3] Applying pending metadata update for session:', sessionId, pending);
-
-    // Merge pending update with cached entry
-    // NOTE: Preserve cached.updatedAt -- pending metadata updates (isExecuting, context, etc.)
-    // should not bump the sort timestamp. Only message appends change updatedAt.
-    const updatedCache: CachedSessionIndex = {
-      sessionId: sessionId,
-      projectId: cached.projectId,
-      title: pending.title ?? cached.title,
-      provider: cached.provider,
-      model: cached.model,
-      mode: cached.mode,
-      sessionType: 'sessionType' in pending ? pending.sessionType : cached.sessionType,
-      parentSessionId: 'parentSessionId' in pending ? pending.parentSessionId : cached.parentSessionId,
-      worktreeId: 'worktreeId' in pending ? pending.worktreeId : cached.worktreeId,
-      hostDeviceId: 'hostDeviceId' in pending ? pending.hostDeviceId : cached.hostDeviceId,
-      agentRole: cached.agentRole,
-      createdBySessionId: cached.createdBySessionId,
-      isArchived: 'isArchived' in pending ? pending.isArchived : cached.isArchived,
-      isPinned: 'isPinned' in pending ? pending.isPinned : cached.isPinned,
-      messageCount: cached.messageCount,
-      lastMessageAt: cached.lastMessageAt,
-      createdAt: cached.createdAt,
-      updatedAt: pending.updatedAt ?? cached.updatedAt,
-      pendingExecution: 'pendingExecution' in pending ? pending.pendingExecution : cached.pendingExecution,
-      isExecuting: 'isExecuting' in pending ? pending.isExecuting : cached.isExecuting,
-      queuedPrompts: 'queuedPrompts' in pending ? pending.queuedPrompts : cached.queuedPrompts,
-      queuedPromptCount: 'queuedPrompts' in pending
-        ? pending.queuedPrompts?.length ?? 0
-        : cached.queuedPromptCount,
-      currentContext: 'currentContext' in pending ? pending.currentContext : cached.currentContext,
-      hasPendingPrompt: 'hasPendingPrompt' in pending ? pending.hasPendingPrompt : cached.hasPendingPrompt,
-      phase: 'phase' in pending ? (pending as any).phase : cached.phase,
-      tags: 'tags' in pending ? (pending as any).tags : cached.tags,
-      lastReadAt: 'lastReadAt' in pending ? (pending as any).lastReadAt : cached.lastReadAt,
-      draftInput: 'draftInput' in pending ? (pending as any).draftInput : cached.draftInput,
-      draftUpdatedAt: 'draftUpdatedAt' in pending ? (pending as any).draftUpdatedAt : cached.draftUpdatedAt,
-      hasBeenNamed: 'hasBeenNamed' in pending ? (pending as any).hasBeenNamed : cached.hasBeenNamed,
-    };
-
-    if (isIndexClientMetadataOnlyUpdate(pending)) {
-      await sendIndexClientMetadataPatch(updatedCache);
-    } else {
-      await sendIndexUpdate(updatedCache);
-    }
+      const outcome = isIndexClientMetadataOnlyUpdate(pending)
+        ? await sendIndexClientMetadataPatch(updatedCache)
+        : await sendIndexUpdate(updatedCache);
+      if (outcome.published && pendingMetadataUpdates.get(sessionId) === pending) {
+        pendingMetadataUpdates.delete(sessionId);
+      }
+    });
   }
 
   // Pending fetch index request (resolves when index_sync_response is received)
@@ -4055,7 +3965,319 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
   // Idle timeout before a connection can be evicted (5 minutes)
   const IDLE_EVICTION_TIMEOUT_MS = 5 * 60 * 1000;
 
-  // Create provider object
+  // Runs inside the per-session queue for metadata and deletions.
+  async function pushChange(sessionId: string, change: SessionChange): Promise<PushChangeOutcome> {
+    const generation = indexConnectionGeneration;
+    if (isMessageSyncDisabled(sessionId) && change.type === 'message_added') {
+      return { published: false, reason: 'message sync is disabled for this session', retryable: false };
+    }
+    const session = sessions.get(sessionId);
+    const sessionConnected = sessionTransportUsable(session);
+
+    // For metadata-only updates (like hasPendingPrompt, isExecuting), we can push to the
+    // index room even without a session room connection. The session room is only opened
+    // when a user enters a session to sync messages - but index metadata updates should
+    // always go through as long as the index WebSocket is connected.
+    const canPushIndexOnly = change.type === 'metadata_updated' && indexWs && indexConnected && config.encryptionKey;
+
+    if (!sessionConnected && !canPushIndexOnly) {
+      console.warn('[CollabV3] Cannot push change - not connected:', sessionId, 'sessionExists:', !!session, 'indexConnected:', indexConnected, 'hasKey:', !!config.encryptionKey);
+      return { published: false, reason: 'not connected', retryable: true };
+    }
+    // console.log('[CollabV3] pushChange:', sessionId, 'type:', change.type, 'sessionConnected:', sessionConnected, 'indexOnly:', !sessionConnected && canPushIndexOnly);
+
+    let clientMessage: ClientMessage | undefined;
+
+    switch (change.type) {
+      case 'message_added': {
+        if (!session?.encryptionKey) {
+          console.warn('[CollabV3] Cannot push message - no encryption key or session room not connected');
+          return { published: false, reason: 'session room has no encryption key', retryable: true };
+        }
+        if (!shouldSyncMessageForSessionRoom(change.message.source, change.message.metadata, change.message.content, change.message.hidden)) {
+          // Deliberately not sent. Not retryable: it would be filtered again.
+          return { published: false, reason: 'filtered from session-room sync', retryable: false };
+        }
+        try {
+          const encrypted = await encryptMessage(change.message, session.encryptionKey);
+          // console.log('[CollabV3] Encrypted message:', {
+          //   id: encrypted.id,
+          //   contentLength: encrypted.encryptedContent.length,
+          //   ivLength: encrypted.iv.length,
+          //   source: encrypted.source,
+          //   direction: encrypted.direction,
+          // });
+          clientMessage = { type: 'appendMessage', message: encrypted };
+        } catch (err) {
+          console.error('[CollabV3] Failed to encrypt message:', err);
+          // Deterministic: the same row would fail the same way.
+          return { published: false, reason: 'encryption failed', retryable: false };
+        }
+        break;
+      }
+
+      case 'metadata_updated': {
+        const metadata: Partial<SessionMetadata> = {};
+
+        // Encrypt title
+        if (change.metadata.title && config.encryptionKey) {
+          const { encryptedTitle, titleIv } = await encryptTitle(change.metadata.title, config.encryptionKey);
+          metadata.encryptedTitle = encryptedTitle;
+          metadata.titleIv = titleIv;
+        }
+
+        if (change.metadata.provider) metadata.provider = change.metadata.provider;
+        if (change.metadata.model) metadata.model = change.metadata.model;
+        if (change.metadata.mode) metadata.mode = change.metadata.mode as SessionMetadata['mode'];
+        if ('pendingExecution' in change.metadata) {
+          metadata.pendingExecution = change.metadata.pendingExecution;
+        }
+        if ('isExecuting' in change.metadata) {
+          metadata.isExecuting = change.metadata.isExecuting;
+        }
+        // Encrypt queued prompts
+        if ('queuedPrompts' in change.metadata) {
+          if (change.metadata.queuedPrompts && change.metadata.queuedPrompts.length > 0) {
+            if (!config.encryptionKey) {
+              throw new Error('[CollabV3] Cannot send queued prompts: no encryption key available');
+            }
+            metadata.encryptedQueuedPrompts = await encryptQueuedPrompts(change.metadata.queuedPrompts, config.encryptionKey);
+          } else {
+            metadata.encryptedQueuedPrompts = [];
+          }
+        }
+        // Encrypt client metadata (context usage, pending prompt state, phase, tags, draft, etc.)
+        if ('draftInput' in change.metadata) {
+          // console.log('[CollabV3] metadata_updated has draftInput:', (change.metadata as any).draftInput?.substring(0, 50));
+        }
+        const hasClientMetaFields = ('currentContext' in change.metadata && change.metadata.currentContext) ||
+          ('hasPendingPrompt' in change.metadata) ||
+          ('phase' in change.metadata) ||
+          ('tags' in change.metadata) ||
+          ('draftInput' in change.metadata) ||
+          ('hasBeenNamed' in change.metadata);
+        if (hasClientMetaFields && config.encryptionKey) {
+          const cached = sessionIndexCache.get(sessionId);
+          const clientMeta: ClientMetadata = {
+            currentContext: ('currentContext' in change.metadata ? change.metadata.currentContext : cached?.currentContext) || undefined,
+            hasPendingPrompt: 'hasPendingPrompt' in change.metadata ? change.metadata.hasPendingPrompt : cached?.hasPendingPrompt,
+            phase: 'phase' in change.metadata ? (change.metadata as any).phase : cached?.phase,
+            tags: 'tags' in change.metadata ? (change.metadata as any).tags : cached?.tags,
+            draftInput: 'draftInput' in change.metadata ? (change.metadata as any).draftInput : cached?.draftInput,
+            draftUpdatedAt: 'draftUpdatedAt' in change.metadata ? (change.metadata as any).draftUpdatedAt : cached?.draftUpdatedAt,
+            hasBeenNamed: 'hasBeenNamed' in change.metadata ? (change.metadata as any).hasBeenNamed : cached?.hasBeenNamed,
+          };
+          if (clientMeta.draftInput !== undefined) {
+            // console.log('[CollabV3] Encrypting clientMeta with draftInput, sending to index');
+          }
+          const encrypted = await encryptClientMetadata(clientMeta, config.encryptionKey);
+          metadata.encryptedClientMetadata = encrypted.encryptedClientMetadata;
+          metadata.clientMetadataIv = encrypted.clientMetadataIv;
+        }
+        // Only send to session room if connected; index-only updates skip this
+        if (sessionConnected) {
+          clientMessage = { type: 'updateMetadata', metadata };
+        }
+        break;
+      }
+
+      case 'session_deleted':
+        // Send delete to session room
+        clientMessage = { type: 'deleteSession' };
+        break;
+    }
+
+    if (change.type === 'metadata_updated' && generation !== indexConnectionGeneration) {
+      return { published: false, reason: 'index connection changed during metadata encryption', retryable: true };
+    }
+
+    // Tracks whether the session-room write actually happened, for the outcome
+    // returned at the end. Only `message_added` has nowhere else to land: a
+    // metadata update still reaches the index below.
+    let sessionRoomOutcome: PushChangeOutcome | undefined;
+
+    // Send to session room (if connected, we have a message to send, and
+    // this device is allowed to publish personal-sync ciphertext at all)
+    if (clientMessage && sessionConnected && !withholdPersonalSyncWrite('session room write')) {
+      try {
+        const json = JSON.stringify(clientMessage);
+        // console.log('[CollabV3] Sending message, length:', json.length);
+        if (clientMessage.type === 'updateMetadata') {
+          const activity = change.type === 'metadata_updated'
+            ? change.metadata.updatedAt ?? sessionActivityAt(sessionIndexCache.get(sessionId) ?? {})
+            : sessionActivityAt(sessionIndexCache.get(sessionId) ?? {});
+          if (isRetainedSession(activity, Date.now(), SESSION_TRANSCRIPT_TTL_MS)) {
+            session.ws.send(JSON.stringify({ type: 'beginSessionReplay', activityAt: activity }));
+          }
+        }
+        session.ws.send(json);
+        // Update activity timestamp on message send
+        session.lastActivity = Date.now();
+      } catch (err) {
+        console.error('[CollabV3] Failed to send message:', err);
+        sessionRoomOutcome = { published: false, reason: 'session room send failed', retryable: true };
+      }
+    } else if (change.type === 'message_added') {
+      // The only branch where a message row silently goes nowhere: either the
+      // session room is not connected or the personal-sync write gate is
+      // holding writes back. Both clear on reconnect, so this is retryable.
+      sessionRoomOutcome = {
+        published: false,
+        reason: sessionConnected
+          ? 'personal-sync writes are withheld'
+          : 'session room is not connected',
+        retryable: true,
+      };
+    }
+
+    // Handle index updates based on change type
+    if (indexWs && indexConnected && !withholdPersonalSyncWrite('index change')) {
+      if (change.type === 'session_deleted') {
+        // Delete from index and cache
+        sessionIndexCache.delete(sessionId);
+        // A delete/recreate is not an ordinary metadata merge -- the recreated
+        // row must publish in full, never be suppressed against the deleted
+        // row's projection.
+        indexPublicationGate.invalidate(sessionId);
+        const indexDeleteMsg: ClientMessage = { type: 'indexDelete', sessionId: sessionId };
+        // console.log('[CollabV3] Sending index_delete for session:', sessionId);
+        indexWs.send(JSON.stringify(indexDeleteMsg));
+      } else if (change.type === 'metadata_updated') {
+        const pending = pendingMetadataUpdates.get(sessionId);
+        const meta = pending ? { ...pending, ...change.metadata } : change.metadata;
+        const cached = sessionIndexCache.get(sessionId);
+        // Only use a fresh timestamp if the caller explicitly set updatedAt.
+        // For read-status-only updates (lastReadAt), we must NOT bump updatedAt
+        // or the session will resort to the top of the list on other devices.
+        const updatedAt = meta.updatedAt ?? undefined;
+
+        // Build index entry by merging with cached data
+        // This allows partial updates (e.g., just title) to work
+        // console.log('[CollabV3] metadata_updated index path: sessionId:', sessionId, 'hasCached:', !!cached, 'indexConnected:', indexConnected);
+        if (cached) {
+          // Merge partial update with cached entry (cache stores decrypted values).
+          // Every column / metadata key in SYNC_RELEVANT_FIELDS must be merged here
+          // or partial updates from SyncedSessionStore.updateMetadata silently drop
+          // on the floor before reaching iOS.
+          const updatedCache = mergeSessionIndexMetadata(cached, meta);
+          const outcome = isIndexClientMetadataOnlyUpdate(meta)
+            ? await sendIndexClientMetadataPatch(updatedCache)
+            : await sendIndexUpdate(updatedCache);
+          if (outcome.published && pendingMetadataUpdates.get(sessionId) === pending) {
+            pendingMetadataUpdates.delete(sessionId);
+          }
+          return outcome;
+        } else if (meta.title && meta.provider) {
+          // New session - need at least title and provider
+          const now = updatedAt;
+          if (now === undefined || !isRetainedSession(now)) {
+            // Too old to publish to the index. The session-room write above
+            // already happened (or reported why not), so the outcome stands.
+            return sessionRoomOutcome ?? { published: true };
+          }
+          const newEntry: CachedSessionIndex = {
+            sessionId: sessionId,
+            projectId: meta.workspaceId ?? 'default',
+            title: meta.title,
+            provider: meta.provider,
+            model: meta.model,
+            mode: meta.mode as CachedSessionIndex['mode'],
+            sessionType: meta.sessionType,
+            parentSessionId: meta.parentSessionId,
+            worktreeId: (meta as any).worktreeId,
+            hostDeviceId: meta.hostDeviceId,
+            // Meta-agent grouping fields (parity with bulk path's
+            // buildSyncedSessionIndexFields + sendIndexUpdate). Without these a
+            // freshly-created meta agent/child reaches the server/phone ungrouped
+            // until the next full bulk resync. createdBySessionId is normalized
+            // null -> undefined to match the helper.
+            agentRole: meta.agentRole,
+            createdBySessionId: meta.createdBySessionId ?? undefined,
+            isArchived: meta.isArchived,
+            isPinned: (meta as any).isPinned,
+            messageCount: 0,
+            lastMessageAt: now,
+            createdAt: now,
+            updatedAt: now,
+            pendingExecution: meta.pendingExecution,
+            isExecuting: meta.isExecuting,
+            queuedPrompts: meta.queuedPrompts,
+            queuedPromptCount: meta.queuedPrompts?.length,
+            currentContext: meta.currentContext,
+            hasPendingPrompt: meta.hasPendingPrompt,
+            phase: (meta as any).phase,
+            tags: (meta as any).tags,
+            lastReadAt: (meta as any).lastReadAt,
+            draftInput: (meta as any).draftInput,
+            draftUpdatedAt: (meta as any).draftUpdatedAt,
+            hasBeenNamed: (meta as any).hasBeenNamed,
+          };
+          const outcome = await sendIndexUpdate(newEntry);
+          if (outcome.published && pendingMetadataUpdates.get(sessionId) === pending) {
+            pendingMetadataUpdates.delete(sessionId);
+          }
+          return outcome;
+        } else {
+          // No cached data and missing required fields for a full update.
+          // Queue the partial update to be applied when the session is cached.
+          // This handles cases like isExecuting being set before syncSessionsToIndex runs,
+          // or title updates from session naming that arrive before the session is indexed.
+          const hasPartialUpdate =
+            'isExecuting' in meta ||
+            'pendingExecution' in meta ||
+            meta.title !== undefined ||
+            'sessionType' in meta ||
+            'parentSessionId' in meta ||
+            'worktreeId' in meta ||
+            'hostDeviceId' in meta ||
+            'isArchived' in meta ||
+            'isPinned' in meta ||
+            'queuedPrompts' in meta ||
+            'currentContext' in meta ||
+            'hasPendingPrompt' in meta ||
+            'phase' in meta ||
+            'tags' in meta ||
+            'lastReadAt' in meta ||
+            'draftInput' in meta ||
+            'draftUpdatedAt' in meta ||
+            'hasBeenNamed' in meta ||
+            'updatedAt' in meta;
+          if (hasPartialUpdate) {
+            // console.log('[CollabV3] Queueing partial metadata update for session:', sessionId, { isExecuting: meta.isExecuting, pendingExecution: meta.pendingExecution, title: meta.title });
+            const existing = pendingMetadataUpdates.get(sessionId) || {};
+            if ('isExecuting' in meta) existing.isExecuting = meta.isExecuting;
+            if ('pendingExecution' in meta) existing.pendingExecution = meta.pendingExecution;
+            if (meta.title !== undefined) existing.title = meta.title;
+            if ('sessionType' in meta) existing.sessionType = meta.sessionType;
+            if ('parentSessionId' in meta) existing.parentSessionId = meta.parentSessionId;
+            if ('worktreeId' in meta) existing.worktreeId = (meta as any).worktreeId;
+            if ('hostDeviceId' in meta) existing.hostDeviceId = meta.hostDeviceId;
+            if ('isArchived' in meta) existing.isArchived = meta.isArchived;
+            if ('isPinned' in meta) existing.isPinned = (meta as any).isPinned;
+            if ('queuedPrompts' in meta) existing.queuedPrompts = meta.queuedPrompts;
+            if ('currentContext' in meta) existing.currentContext = meta.currentContext;
+            if ('hasPendingPrompt' in meta) existing.hasPendingPrompt = meta.hasPendingPrompt;
+            if ('phase' in meta) (existing as any).phase = (meta as any).phase;
+            if ('tags' in meta) (existing as any).tags = (meta as any).tags;
+            if ('lastReadAt' in meta) (existing as any).lastReadAt = (meta as any).lastReadAt;
+            if ('draftInput' in meta) (existing as any).draftInput = (meta as any).draftInput;
+            if ('draftUpdatedAt' in meta) (existing as any).draftUpdatedAt = (meta as any).draftUpdatedAt;
+            if ('hasBeenNamed' in meta) (existing as any).hasBeenNamed = (meta as any).hasBeenNamed;
+            if ('updatedAt' in meta) existing.updatedAt = meta.updatedAt;
+            pendingMetadataUpdates.set(sessionId, existing);
+          } else {
+            // console.log('[CollabV3] Skipping index update - no cached data and missing required fields for session:', sessionId);
+          }
+        }
+      }
+    }
+
+    if (change.type === 'metadata_updated') {
+      return { published: false, reason: 'index publication deferred', retryable: true };
+    }
+    return sessionRoomOutcome ?? { published: true };
+  }
+
   const provider: SyncProvider = {
     async connect(sessionId: string): Promise<void> {
       const pending = sessionConnectionsInFlight.get(sessionId);
@@ -4310,334 +4532,31 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
      * unpublished transcript row and retries it on reconnect) reads the outcome.
      */
     async pushChange(sessionId: string, change: SessionChange): Promise<PushChangeOutcome> {
-      if (isMessageSyncDisabled(sessionId) && change.type === 'message_added') {
-        return { published: false, reason: 'message sync is disabled for this session', retryable: false };
-      }
-      const session = sessions.get(sessionId);
-      const sessionConnected = sessionTransportUsable(session);
-
-      // For metadata-only updates (like hasPendingPrompt, isExecuting), we can push to the
-      // index room even without a session room connection. The session room is only opened
-      // when a user enters a session to sync messages - but index metadata updates should
-      // always go through as long as the index WebSocket is connected.
-      const canPushIndexOnly = change.type === 'metadata_updated' && indexWs && indexConnected && config.encryptionKey;
-
-      if (!sessionConnected && !canPushIndexOnly) {
-        console.warn('[CollabV3] Cannot push change - not connected:', sessionId, 'sessionExists:', !!session, 'indexConnected:', indexConnected, 'hasKey:', !!config.encryptionKey);
-        return { published: false, reason: 'not connected', retryable: true };
-      }
-      // console.log('[CollabV3] pushChange:', sessionId, 'type:', change.type, 'sessionConnected:', sessionConnected, 'indexOnly:', !sessionConnected && canPushIndexOnly);
-
-      let clientMessage: ClientMessage | undefined;
-
-      switch (change.type) {
-        case 'message_added': {
-          if (!session?.encryptionKey) {
-            console.warn('[CollabV3] Cannot push message - no encryption key or session room not connected');
-            return { published: false, reason: 'session room has no encryption key', retryable: true };
-          }
-          if (!shouldSyncMessageForSessionRoom(change.message.source, change.message.metadata, change.message.content, change.message.hidden)) {
-            // Deliberately not sent. Not retryable: it would be filtered again.
-            return { published: false, reason: 'filtered from session-room sync', retryable: false };
-          }
-          try {
-            const encrypted = await encryptMessage(change.message, session.encryptionKey);
-            // console.log('[CollabV3] Encrypted message:', {
-            //   id: encrypted.id,
-            //   contentLength: encrypted.encryptedContent.length,
-            //   ivLength: encrypted.iv.length,
-            //   source: encrypted.source,
-            //   direction: encrypted.direction,
-            // });
-            clientMessage = { type: 'appendMessage', message: encrypted };
-          } catch (err) {
-            console.error('[CollabV3] Failed to encrypt message:', err);
-            // Deterministic: the same row would fail the same way.
-            return { published: false, reason: 'encryption failed', retryable: false };
-          }
-          break;
+      const generation = indexConnectionGeneration;
+      const publish = async (): Promise<PushChangeOutcome> => {
+        if (generation !== indexConnectionGeneration) {
+          return { published: false, reason: 'index connection changed before publication', retryable: true };
         }
-
-        case 'metadata_updated': {
-          const metadata: Partial<SessionMetadata> = {};
-
-          // Encrypt title
-          if (change.metadata.title && config.encryptionKey) {
-            const { encryptedTitle, titleIv } = await encryptTitle(change.metadata.title, config.encryptionKey);
-            metadata.encryptedTitle = encryptedTitle;
-            metadata.titleIv = titleIv;
-          }
-
-          if (change.metadata.provider) metadata.provider = change.metadata.provider;
-          if (change.metadata.model) metadata.model = change.metadata.model;
-          if (change.metadata.mode) metadata.mode = change.metadata.mode as SessionMetadata['mode'];
-          if ('pendingExecution' in change.metadata) {
-            metadata.pendingExecution = change.metadata.pendingExecution;
-          }
-          if ('isExecuting' in change.metadata) {
-            metadata.isExecuting = change.metadata.isExecuting;
-          }
-          // Encrypt queued prompts
-          if ('queuedPrompts' in change.metadata) {
-            if (change.metadata.queuedPrompts && change.metadata.queuedPrompts.length > 0) {
-              if (!config.encryptionKey) {
-                throw new Error('[CollabV3] Cannot send queued prompts: no encryption key available');
-              }
-              metadata.encryptedQueuedPrompts = await encryptQueuedPrompts(change.metadata.queuedPrompts, config.encryptionKey);
-            } else {
-              metadata.encryptedQueuedPrompts = [];
-            }
-          }
-          // Encrypt client metadata (context usage, pending prompt state, phase, tags, draft, etc.)
-          if ('draftInput' in change.metadata) {
-            // console.log('[CollabV3] metadata_updated has draftInput:', (change.metadata as any).draftInput?.substring(0, 50));
-          }
-          const hasClientMetaFields = ('currentContext' in change.metadata && change.metadata.currentContext) ||
-            ('hasPendingPrompt' in change.metadata) ||
-            ('phase' in change.metadata) ||
-            ('tags' in change.metadata) ||
-            ('draftInput' in change.metadata) ||
-            ('hasBeenNamed' in change.metadata);
-          if (hasClientMetaFields && config.encryptionKey) {
-            const cached = sessionIndexCache.get(sessionId);
-            const clientMeta: ClientMetadata = {
-              currentContext: ('currentContext' in change.metadata ? change.metadata.currentContext : cached?.currentContext) || undefined,
-              hasPendingPrompt: 'hasPendingPrompt' in change.metadata ? change.metadata.hasPendingPrompt : cached?.hasPendingPrompt,
-              phase: 'phase' in change.metadata ? (change.metadata as any).phase : cached?.phase,
-              tags: 'tags' in change.metadata ? (change.metadata as any).tags : cached?.tags,
-              draftInput: 'draftInput' in change.metadata ? (change.metadata as any).draftInput : cached?.draftInput,
-              draftUpdatedAt: 'draftUpdatedAt' in change.metadata ? (change.metadata as any).draftUpdatedAt : cached?.draftUpdatedAt,
-              hasBeenNamed: 'hasBeenNamed' in change.metadata ? (change.metadata as any).hasBeenNamed : cached?.hasBeenNamed,
-            };
-            if (clientMeta.draftInput !== undefined) {
-              // console.log('[CollabV3] Encrypting clientMeta with draftInput, sending to index');
-            }
-            const encrypted = await encryptClientMetadata(clientMeta, config.encryptionKey);
-            metadata.encryptedClientMetadata = encrypted.encryptedClientMetadata;
-            metadata.clientMetadataIv = encrypted.clientMetadataIv;
-          }
-          // Only send to session room if connected; index-only updates skip this
-          if (sessionConnected) {
-            clientMessage = { type: 'updateMetadata', metadata };
-          }
-          break;
-        }
-
-        case 'session_deleted':
-          // Send delete to session room
-          clientMessage = { type: 'deleteSession' };
-          break;
-      }
-
-      // Tracks whether the session-room write actually happened, for the outcome
-      // returned at the end. Only `message_added` has nowhere else to land: a
-      // metadata update still reaches the index below.
-      let sessionRoomOutcome: PushChangeOutcome | undefined;
-
-      // Send to session room (if connected, we have a message to send, and
-      // this device is allowed to publish personal-sync ciphertext at all)
-      if (clientMessage && sessionConnected && !withholdPersonalSyncWrite('session room write')) {
         try {
-          const json = JSON.stringify(clientMessage);
-          // console.log('[CollabV3] Sending message, length:', json.length);
-          if (clientMessage.type === 'updateMetadata') {
-            const activity = change.type === 'metadata_updated'
-              ? change.metadata.updatedAt ?? sessionActivityAt(sessionIndexCache.get(sessionId) ?? {})
-              : sessionActivityAt(sessionIndexCache.get(sessionId) ?? {});
-            if (isRetainedSession(activity, Date.now(), SESSION_TRANSCRIPT_TTL_MS)) {
-              session.ws.send(JSON.stringify({ type: 'beginSessionReplay', activityAt: activity }));
-            }
+          let outcome = await pushChange(sessionId, change);
+          while (change.type === 'metadata_updated' &&
+                 outcome.reason === 'index state changed during publication' &&
+                 generation === indexConnectionGeneration && indexConnected) {
+            // A remote or bulk update won during encryption. Re-merge intent
+            // against it instead of restoring our obsolete full snapshot.
+            outcome = await pushChange(sessionId, change);
           }
-          session.ws.send(json);
-          // Update activity timestamp on message send
-          session.lastActivity = Date.now();
-        } catch (err) {
-          console.error('[CollabV3] Failed to send message:', err);
-          sessionRoomOutcome = { published: false, reason: 'session room send failed', retryable: true };
+          return outcome;
+        } catch (error) {
+          console.error('[CollabV3] Failed to push change:', error);
+          return { published: false, reason: 'publication failed', retryable: true };
         }
-      } else if (change.type === 'message_added') {
-        // The only branch where a message row silently goes nowhere: either the
-        // session room is not connected or the personal-sync write gate is
-        // holding writes back. Both clear on reconnect, so this is retryable.
-        sessionRoomOutcome = {
-          published: false,
-          reason: sessionConnected
-            ? 'personal-sync writes are withheld'
-            : 'session room is not connected',
-          retryable: true,
-        };
-      }
-
-      // Handle index updates based on change type
-      if (indexWs && indexConnected && !withholdPersonalSyncWrite('index change')) {
-        if (change.type === 'session_deleted') {
-          // Delete from index and cache
-          sessionIndexCache.delete(sessionId);
-          // A delete/recreate is not an ordinary metadata merge -- the recreated
-          // row must publish in full, never be suppressed against the deleted
-          // row's projection.
-          indexPublicationGate.invalidate(sessionId);
-          const indexDeleteMsg: ClientMessage = { type: 'indexDelete', sessionId: sessionId };
-          // console.log('[CollabV3] Sending index_delete for session:', sessionId);
-          indexWs.send(JSON.stringify(indexDeleteMsg));
-        } else if (change.type === 'metadata_updated') {
-          const meta = change.metadata;
-          const cached = sessionIndexCache.get(sessionId);
-          // Only use a fresh timestamp if the caller explicitly set updatedAt.
-          // For read-status-only updates (lastReadAt), we must NOT bump updatedAt
-          // or the session will resort to the top of the list on other devices.
-          const updatedAt = meta.updatedAt ?? undefined;
-
-          // Build index entry by merging with cached data
-          // This allows partial updates (e.g., just title) to work
-          // console.log('[CollabV3] metadata_updated index path: sessionId:', sessionId, 'hasCached:', !!cached, 'indexConnected:', indexConnected);
-          if (cached) {
-            // Merge partial update with cached entry (cache stores decrypted values).
-            // Every column / metadata key in SYNC_RELEVANT_FIELDS must be merged here
-            // or partial updates from SyncedSessionStore.updateMetadata silently drop
-            // on the floor before reaching iOS.
-            const updatedCache: CachedSessionIndex = {
-              ...cached,
-              projectId: meta.workspaceId ?? cached.projectId,
-              title: meta.title ?? cached.title,
-              provider: meta.provider ?? cached.provider,
-              model: meta.model ?? cached.model,
-              mode: (meta.mode ?? cached.mode) as CachedSessionIndex['mode'],
-              sessionType: 'sessionType' in meta ? (meta as any).sessionType : cached.sessionType,
-              parentSessionId: 'parentSessionId' in meta ? meta.parentSessionId : cached.parentSessionId,
-              worktreeId: 'worktreeId' in meta ? (meta as any).worktreeId : cached.worktreeId,
-              hostDeviceId: 'hostDeviceId' in meta ? meta.hostDeviceId : cached.hostDeviceId,
-              // Meta-agent grouping fields: apply when the update carries them,
-              // otherwise preserve the cached value (also held by the `...cached`
-              // spread above). createdBySessionId is normalized null -> undefined.
-              agentRole: 'agentRole' in meta ? meta.agentRole : cached.agentRole,
-              createdBySessionId: 'createdBySessionId' in meta ? (meta.createdBySessionId ?? undefined) : cached.createdBySessionId,
-              isArchived: 'isArchived' in meta ? meta.isArchived : cached.isArchived,
-              isPinned: 'isPinned' in meta ? (meta as any).isPinned : cached.isPinned,
-              lastMessageAt: updatedAt ?? cached.lastMessageAt,
-              updatedAt: updatedAt ?? cached.updatedAt,
-              pendingExecution: 'pendingExecution' in meta ? meta.pendingExecution : cached.pendingExecution,
-              isExecuting: 'isExecuting' in meta ? meta.isExecuting : cached.isExecuting,
-              queuedPrompts: 'queuedPrompts' in meta ? meta.queuedPrompts : cached.queuedPrompts,
-              queuedPromptCount: 'queuedPrompts' in meta
-                ? meta.queuedPrompts?.length ?? 0
-                : cached.queuedPromptCount,
-              currentContext: 'currentContext' in meta ? meta.currentContext : cached.currentContext,
-              hasPendingPrompt: 'hasPendingPrompt' in meta ? meta.hasPendingPrompt : cached.hasPendingPrompt,
-              phase: 'phase' in meta ? (meta as any).phase : cached.phase,
-              tags: 'tags' in meta ? (meta as any).tags : cached.tags,
-              lastReadAt: 'lastReadAt' in meta ? (meta as any).lastReadAt : cached.lastReadAt,
-              draftInput: 'draftInput' in meta ? (meta as any).draftInput : cached.draftInput,
-              draftUpdatedAt: 'draftUpdatedAt' in meta ? (meta as any).draftUpdatedAt : cached.draftUpdatedAt,
-              hasBeenNamed: 'hasBeenNamed' in meta ? (meta as any).hasBeenNamed : cached.hasBeenNamed,
-            };
-            if (isIndexClientMetadataOnlyUpdate(meta)) {
-              await sendIndexClientMetadataPatch(updatedCache);
-            } else {
-              await sendIndexUpdate(updatedCache);
-            }
-          } else if (meta.title && meta.provider) {
-            // New session - need at least title and provider
-            const now = updatedAt;
-            if (now === undefined || !isRetainedSession(now)) {
-              // Too old to publish to the index. The session-room write above
-              // already happened (or reported why not), so the outcome stands.
-              return sessionRoomOutcome ?? { published: true };
-            }
-            const newEntry: CachedSessionIndex = {
-              sessionId: sessionId,
-              projectId: meta.workspaceId ?? 'default',
-              title: meta.title,
-              provider: meta.provider,
-              model: meta.model,
-              mode: meta.mode as CachedSessionIndex['mode'],
-              sessionType: meta.sessionType,
-              parentSessionId: meta.parentSessionId,
-              worktreeId: (meta as any).worktreeId,
-              hostDeviceId: meta.hostDeviceId,
-              // Meta-agent grouping fields (parity with bulk path's
-              // buildSyncedSessionIndexFields + sendIndexUpdate). Without these a
-              // freshly-created meta agent/child reaches the server/phone ungrouped
-              // until the next full bulk resync. createdBySessionId is normalized
-              // null -> undefined to match the helper.
-              agentRole: meta.agentRole,
-              createdBySessionId: meta.createdBySessionId ?? undefined,
-              isArchived: meta.isArchived,
-              isPinned: (meta as any).isPinned,
-              messageCount: 0,
-              lastMessageAt: now,
-              createdAt: now,
-              updatedAt: now,
-              pendingExecution: meta.pendingExecution,
-              isExecuting: meta.isExecuting,
-              queuedPrompts: meta.queuedPrompts,
-              queuedPromptCount: meta.queuedPrompts?.length,
-              currentContext: meta.currentContext,
-              hasPendingPrompt: meta.hasPendingPrompt,
-              phase: (meta as any).phase,
-              tags: (meta as any).tags,
-              lastReadAt: (meta as any).lastReadAt,
-              draftInput: (meta as any).draftInput,
-              draftUpdatedAt: (meta as any).draftUpdatedAt,
-              hasBeenNamed: (meta as any).hasBeenNamed,
-            };
-            await sendIndexUpdate(newEntry);
-          } else {
-            // No cached data and missing required fields for a full update.
-            // Queue the partial update to be applied when the session is cached.
-            // This handles cases like isExecuting being set before syncSessionsToIndex runs,
-            // or title updates from session naming that arrive before the session is indexed.
-            const hasPartialUpdate =
-              'isExecuting' in meta ||
-              'pendingExecution' in meta ||
-              meta.title !== undefined ||
-              'sessionType' in meta ||
-              'parentSessionId' in meta ||
-              'worktreeId' in meta ||
-              'hostDeviceId' in meta ||
-              'isArchived' in meta ||
-              'isPinned' in meta ||
-              'queuedPrompts' in meta ||
-              'currentContext' in meta ||
-              'hasPendingPrompt' in meta ||
-              'phase' in meta ||
-              'tags' in meta ||
-              'lastReadAt' in meta ||
-              'draftInput' in meta ||
-              'draftUpdatedAt' in meta ||
-              'hasBeenNamed' in meta ||
-              'updatedAt' in meta;
-            if (hasPartialUpdate) {
-              // console.log('[CollabV3] Queueing partial metadata update for session:', sessionId, { isExecuting: meta.isExecuting, pendingExecution: meta.pendingExecution, title: meta.title });
-              const existing = pendingMetadataUpdates.get(sessionId) || {};
-              if ('isExecuting' in meta) existing.isExecuting = meta.isExecuting;
-              if ('pendingExecution' in meta) existing.pendingExecution = meta.pendingExecution;
-              if (meta.title !== undefined) existing.title = meta.title;
-              if ('sessionType' in meta) existing.sessionType = meta.sessionType;
-              if ('parentSessionId' in meta) existing.parentSessionId = meta.parentSessionId;
-              if ('worktreeId' in meta) existing.worktreeId = (meta as any).worktreeId;
-              if ('hostDeviceId' in meta) existing.hostDeviceId = meta.hostDeviceId;
-              if ('isArchived' in meta) existing.isArchived = meta.isArchived;
-              if ('isPinned' in meta) existing.isPinned = (meta as any).isPinned;
-              if ('queuedPrompts' in meta) existing.queuedPrompts = meta.queuedPrompts;
-              if ('currentContext' in meta) existing.currentContext = meta.currentContext;
-              if ('hasPendingPrompt' in meta) existing.hasPendingPrompt = meta.hasPendingPrompt;
-              if ('phase' in meta) (existing as any).phase = (meta as any).phase;
-              if ('tags' in meta) (existing as any).tags = (meta as any).tags;
-              if ('lastReadAt' in meta) (existing as any).lastReadAt = (meta as any).lastReadAt;
-              if ('draftInput' in meta) (existing as any).draftInput = (meta as any).draftInput;
-              if ('draftUpdatedAt' in meta) (existing as any).draftUpdatedAt = (meta as any).draftUpdatedAt;
-              if ('hasBeenNamed' in meta) (existing as any).hasBeenNamed = (meta as any).hasBeenNamed;
-              if ('updatedAt' in meta) existing.updatedAt = meta.updatedAt;
-              pendingMetadataUpdates.set(sessionId, existing);
-            } else {
-              // console.log('[CollabV3] Skipping index update - no cached data and missing required fields for session:', sessionId);
-            }
-          }
-        }
-      }
-
-      return sessionRoomOutcome ?? { published: true };
+      };
+      // Enqueue intent before encryption or cache reads. Serializing only the
+      // final send lets a status update restore a pre-claim queue snapshot.
+      return change.type === 'metadata_updated' || change.type === 'session_deleted'
+        ? indexPublishQueue.run(sessionId, publish)
+        : publish();
     },
 
     syncSessionsToIndex(sessionsData: SessionIndexData[], options?: {

@@ -14,12 +14,12 @@
  * transcript, so listing it as queued double-reports the same prompt.
  */
 
-import type { SyncedQueuedPrompt } from '@nimbalyst/runtime/sync';
+import type { SyncedQueuedPrompt, SyncProvider } from '@nimbalyst/runtime/sync/types';
 
 export interface QueuedPromptSyncDeps {
   /** The session's still-pending rows, oldest first. */
   listPending(sessionId: string): Promise<Array<{ id: string; prompt: string; createdAt: number }>>;
-  getSyncProvider(): { pushChange?: (sessionId: string, change: any) => void } | null;
+  getSyncProvider(): Pick<SyncProvider, 'pushChange'> | null;
   logWarn(message: string): void;
 }
 
@@ -49,11 +49,15 @@ export async function publishQueuedPromptsToSync(
     }));
 
     // No `updatedAt`: draining the queue must not resort the mobile session list.
-    syncProvider.pushChange(sessionId, {
+    const outcome = await syncProvider.pushChange(sessionId, {
       type: 'metadata_updated',
       metadata: { queuedPrompts },
     });
 
+    if (outcome?.published === false) {
+      deps.logWarn(`[AIService] failed to publish queued prompts for session ${sessionId}: ${outcome.reason ?? 'not published'}`);
+      return null;
+    }
     return queuedPrompts;
   } catch (error) {
     deps.logWarn(

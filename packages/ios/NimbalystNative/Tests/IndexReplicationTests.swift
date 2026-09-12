@@ -467,6 +467,22 @@ final class IndexReplicationTests: XCTestCase {
         XCTAssertNotNil(try db.session(byId: "brandNew"))
         XCTAssertEqual(try db.queuedPrompts(forSession: "brandNew").map(\.promptTextDecrypted), ["run the tests"])
         XCTAssertEqual(try store.cursorState(db).cursor, 2)
+
+        // Queue consumption need not change the session's sort timestamp or
+        // any other visible metadata. Its revision must still clear the rows.
+        var cleared = payload
+        cleared["queuedPromptCount"] = 0
+        cleared["encryptedQueuedPrompts"] = [] as [[String: Any]]
+        try apply(try validated(try response(entries: [
+            change(entity: "session", id: "brandNew", revision: 3, session: cleared),
+        ], cursor: 3)), store: store, database: db)
+        XCTAssertTrue(try db.queuedPrompts(forSession: "brandNew").isEmpty)
+
+        // Replayed old pages must not recreate an already consumed prompt.
+        try apply(try validated(try response(entries: [
+            change(entity: "session", id: "brandNew", revision: 2, session: payload),
+        ], cursor: 3)), store: store, database: db)
+        XCTAssertTrue(try db.queuedPrompts(forSession: "brandNew").isEmpty)
     }
 
     /// The lazy schema must survive a rolled-back transaction: the tables go

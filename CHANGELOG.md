@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Messages consumed by the desktop no longer reappear in the mobile queue after session updates.
 - Sessions created on iOS open as soon as they sync, without reopening the app.
 - Accepting large document rewrites preserves paragraph order, and rejecting them restores the original formatting.
 - The Git panel names the signal when a push is killed before it finishes, instead of showing the hook's output as the error.

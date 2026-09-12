@@ -46,6 +46,45 @@ function indexUpdates(socket: FakeWebSocket): Array<Record<string, any>> {
     .filter((message) => message.type === 'indexUpdate');
 }
 
+async function createIndexedProvider() {
+  const encryptionKey = await crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['encrypt', 'decrypt'],
+  );
+  const provider = createCollabV3Sync({
+    serverUrl: 'wss://sync.example.test',
+    orgId: 'org-1',
+    personalMemberId: asPersonalMemberId('user-1'),
+    getJwt: async () => asPersonalJwt(jwtFor('user-1')),
+    encryptionKey,
+  });
+
+  await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+  const indexSocket = FakeWebSocket.instances[0];
+  indexSocket.open();
+  // The write gate opens only after a complete index read (GitHub #1117).
+  const fetching = provider.fetchIndex!();
+  await vi.waitFor(() => expect(indexSocket.send.mock.calls.some(([p]) => JSON.parse(p as string).type === 'indexPageRequest')).toBe(true));
+  const pageReq = indexSocket.send.mock.calls.map(([p]) => JSON.parse(p as string)).find((m) => m.type === 'indexPageRequest');
+  indexSocket.receive({ type: 'indexPageResponse', protocolVersion: 2, requestId: pageReq.requestId, mode: 'bootstrap', entries: [], complete: true, cursor: 0 });
+  await fetching;
+
+  provider.syncSessionsToIndex?.([{
+    id: 'session-1',
+    title: 'Queue test',
+    provider: 'openai-codex',
+    mode: 'agent',
+    workspaceId: '/workspace',
+    messageCount: 0,
+    updatedAt: 1_000,
+    createdAt: 1_000,
+  }]);
+  await vi.waitFor(() => expect(indexUpdates(indexSocket)).toHaveLength(1));
+
+  return { provider, indexSocket };
+}
+
 describe('CollabV3 queued prompt clearing', () => {
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ['Date'] });
@@ -60,40 +99,7 @@ describe('CollabV3 queued prompt clearing', () => {
   });
 
   it('publishes and preserves an explicit zero queue count', async () => {
-    const encryptionKey = await crypto.subtle.generateKey(
-      { name: 'AES-GCM', length: 256 },
-      true,
-      ['encrypt', 'decrypt'],
-    );
-    const provider = createCollabV3Sync({
-      serverUrl: 'wss://sync.example.test',
-      orgId: 'org-1',
-      personalMemberId: asPersonalMemberId('user-1'),
-      getJwt: async () => asPersonalJwt(jwtFor('user-1')),
-      encryptionKey,
-    });
-
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-    const indexSocket = FakeWebSocket.instances[0];
-    indexSocket.open();
-    // The write gate opens only after a complete index read (GitHub #1117).
-    const fetching = provider.fetchIndex!();
-    await vi.waitFor(() => expect(indexSocket.send.mock.calls.some(([p]) => JSON.parse(p as string).type === 'indexPageRequest')).toBe(true));
-    const pageReq = indexSocket.send.mock.calls.map(([p]) => JSON.parse(p as string)).find((m) => m.type === 'indexPageRequest');
-    indexSocket.receive({ type: 'indexPageResponse', protocolVersion: 2, requestId: pageReq.requestId, mode: 'bootstrap', entries: [], complete: true, cursor: 0 });
-    await fetching;
-
-    provider.syncSessionsToIndex?.([{
-      id: 'session-1',
-      title: 'Queue test',
-      provider: 'openai-codex',
-      mode: 'agent',
-      workspaceId: '/workspace',
-      messageCount: 0,
-      updatedAt: 1_000,
-      createdAt: 1_000,
-    }]);
-    await vi.waitFor(() => expect(indexUpdates(indexSocket)).toHaveLength(1));
+    const { provider, indexSocket } = await createIndexedProvider();
 
     provider.pushChange('session-1', {
       type: 'metadata_updated',
@@ -126,6 +132,83 @@ describe('CollabV3 queued prompt clearing', () => {
     expect(provider.getCachedIndexEntry?.('session-1')?.queuedPromptCount).toBe(0);
 
     provider.disconnectAll();
+  });
+
+  it.each([
+    { metadata: { isExecuting: true }, remaining: [] },
+    { metadata: { title: 'Renamed' }, remaining: [] },
+    { metadata: { draftInput: 'next prompt', draftUpdatedAt: 3000 }, remaining: [] },
+    { metadata: { isExecuting: true }, remaining: [{ id: 'p2', prompt: 'second', timestamp: 2000 }] },
+  ])('preserves the remaining queue during concurrent metadata publication: %j', async ({ metadata, remaining }) => {
+    const { provider, indexSocket } = await createIndexedProvider();
+    try {
+      await provider.pushChange('session-1', {
+        type: 'metadata_updated',
+        metadata: { queuedPrompts: [{ id: 'p1', prompt: 'first', timestamp: 1500 }, ...remaining] },
+      });
+      await Promise.all([
+        provider.pushChange('session-1', { type: 'metadata_updated', metadata: { queuedPrompts: remaining } }),
+        provider.pushChange('session-1', { type: 'metadata_updated', metadata }),
+      ]);
+      expect(provider.getCachedIndexEntry?.('session-1')?.queuedPrompts).toEqual(remaining);
+      await provider.pushChange('session-1', { type: 'metadata_updated', metadata: { title: 'After consumption' } });
+      const entry = indexUpdates(indexSocket).at(-1)?.session;
+      expect(entry.queuedPromptCount).toBe(remaining.length);
+      expect(entry.encryptedQueuedPrompts.map((prompt: { id: string }) => prompt.id)).toEqual(remaining.map(prompt => prompt.id));
+      expect(entry.updatedAt).toBe(1000);
+    } finally {
+      provider.disconnectAll();
+    }
+  });
+
+  it('does not replay a deferred queue over a newer clear when first indexing a session', async () => {
+    const { provider, indexSocket } = await createIndexedProvider();
+    try {
+      await provider.pushChange('new-session', { type: 'metadata_updated', metadata: {
+        queuedPrompts: [{ id: 'p1', prompt: 'first', timestamp: 1500 }],
+      } });
+      await provider.pushChange('new-session', { type: 'metadata_updated', metadata: {
+        title: 'New', provider: 'openai-codex', workspaceId: '/workspace', updatedAt: 1000, queuedPrompts: [],
+      } });
+      provider.syncSessionsToIndex?.([{
+        id: 'new-session', title: 'Next sync', provider: 'openai-codex', workspaceId: '/workspace',
+        messageCount: 1, updatedAt: 2000, createdAt: 1000,
+      }]);
+      await vi.waitFor(() => expect(provider.getCachedIndexEntry?.('new-session')?.messageCount).toBe(1));
+      expect(provider.getCachedIndexEntry?.('new-session')?.queuedPrompts).toEqual([]);
+      expect(indexUpdates(indexSocket).at(-1)?.session.encryptedQueuedPrompts).toEqual([]);
+    } finally {
+      provider.disconnectAll();
+    }
+  });
+
+  it('re-merges a queue clear when a remote update arrives during encryption', async () => {
+    const { provider, indexSocket } = await createIndexedProvider();
+    await provider.pushChange('session-1', { type: 'metadata_updated', metadata: {
+      queuedPrompts: [{ id: 'p1', prompt: 'first', timestamp: 1500 }],
+    } });
+    const remoteEntry = { ...indexUpdates(indexSocket).at(-1)?.session, isExecuting: true };
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const realEncrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+    const encryptSpy = vi.spyOn(crypto.subtle, 'encrypt').mockImplementationOnce(async (...args) => {
+      await held;
+      return realEncrypt(...args);
+    });
+    try {
+      const clearing = provider.pushChange('session-1', { type: 'metadata_updated', metadata: { queuedPrompts: [] } });
+      await vi.waitFor(() => expect(encryptSpy).toHaveBeenCalled());
+      indexSocket.receive({ type: 'indexBroadcast', session: remoteEntry });
+      await vi.waitFor(() => expect(provider.getCachedIndexEntry?.('session-1')?.isExecuting).toBe(true));
+      release();
+      expect(await clearing).toMatchObject({ published: true });
+      expect(provider.getCachedIndexEntry?.('session-1')).toMatchObject({ isExecuting: true, queuedPrompts: [] });
+      expect(indexUpdates(indexSocket).at(-1)?.session).toMatchObject({ isExecuting: true, encryptedQueuedPrompts: [], queuedPromptCount: 0 });
+    } finally {
+      release();
+      encryptSpy.mockRestore();
+      provider.disconnectAll();
+    }
   });
 
   it('turns an empty session-room queue payload into an explicit clear', async () => {

@@ -359,7 +359,7 @@ describe('CollabV3 index publication gate', () => {
     provider.disconnectAll();
   });
 
-  it('does not publish a payload whose connection was replaced during encryption', async () => {
+  it.each([1, 2])('does not publish a payload whose connection was replaced during encryption stage %s', async (heldCall) => {
     const { provider, indexSocket } = await createConnectedProvider();
 
     provider.syncSessionsToIndex?.([baseSession()]);
@@ -374,7 +374,7 @@ describe('CollabV3 index publication gate', () => {
     // one opens exactly the window a reconnect can land in.
     const encryptSpy = vi.spyOn(crypto.subtle, 'encrypt').mockImplementation(async (...args: any[]) => {
       encryptCalls++;
-      if (encryptCalls === 2) await held;
+      if (encryptCalls === heldCall) await held;
       return realEncrypt(args[0], args[1], args[2]);
     });
 
@@ -382,7 +382,10 @@ describe('CollabV3 index publication gate', () => {
       type: 'metadata_updated',
       metadata: { draftInput: 'mid-flight', draftUpdatedAt: 3_000 } as any,
     });
-    await vi.waitFor(() => expect(encryptCalls).toBeGreaterThanOrEqual(2));
+    await vi.waitFor(() => expect(encryptCalls).toBeGreaterThanOrEqual(heldCall));
+    const waiting = provider.pushChange('session-1', {
+      type: 'metadata_updated', metadata: { title: 'Queued before reconnect' },
+    });
 
     const packetsBeforeReconnect = indexPackets(indexSocket).length;
     // The socket this payload was built against goes away mid-encryption.
@@ -392,8 +395,8 @@ describe('CollabV3 index publication gate', () => {
     freshSocket.open();
 
     release();
-    await publishing;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(await publishing).toMatchObject({ published: false, retryable: true });
+    expect(await waiting).toMatchObject({ published: false, retryable: true });
     encryptSpy.mockRestore();
 
     // The payload must go nowhere: not onto the new socket (whose server never
