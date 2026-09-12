@@ -34,12 +34,9 @@ import { getProjectFileSyncService } from './ProjectFileSyncService';
 import { startProjectFileSync, stopAllProjectFileSync } from '../file/WorkspaceWatcher';
 import { windowStates } from '../window/WindowManager';
 import { getGitRemoteIdentities } from '../utils/gitUtils';
-import {
-  composeProjectConfig,
-  toSyncedActionPrompts,
-  type ProjectConfigSlices,
-} from './sync/projectConfigComposer';
-import type { ActionPrompt } from './ActionPromptParser';
+import { createProjectConfigSync } from './sync/projectConfigSync';
+import { getAgentWorkflowService } from './AgentWorkflowService';
+import { getActionPromptService } from './ActionPromptService';
 import { resolveProjectPath } from '../utils/workspaceDetection';
 import { decideMissingSession } from './sync/missingSessionPolicy';
 import { createHash } from 'crypto';
@@ -689,6 +686,7 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
           logger.main.warn('[SyncManager] Server index coverage is incomplete; skipping reconciliation this cycle');
           return;
         }
+        await projectConfigSync.refresh();
         const tombstonedSessionIds = new Set(serverIndex.deletedSessionIds ?? []);
         // Build a map of server sessions for quick lookup
         const serverSessionMap = new Map(
@@ -876,7 +874,9 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
             const delay = isFirstCallback ? 1000 : 0;
             setTimeout(() => {
               // Sync settings to the mobile device
+              if (state.provider !== provider) return;
               void syncSettingsToMobile();
+              void projectConfigSync.refresh();
             }, delay);
           }
         }
@@ -1349,94 +1349,22 @@ export async function syncSettingsToMobile(_legacyOpenaiApiKey?: string): Promis
 // Project Config Sync (commands, etc.)
 // ============================================================================
 
-/**
- * Latest known value of each project-config slice, per workspace.
- *
- * The blob is a whole-object replace on the wire, but its two producers (slash
- * commands and action prompts) fire independently. Main cannot recompute the
- * command list on demand -- `listEntries` needs the provider-native commands
- * that only the running provider knows -- so the last reported value is cached
- * and every publish sends both slices together.
- */
-const projectConfigSlices = new Map<string, ProjectConfigSlices>();
+const projectConfigSync = createProjectConfigSync({
+  getProvider: () => state.provider,
+  getEnabledProjects: () => store.get('sessionSync')?.enabledProjects ?? [],
+  isProjectEnabled: path => createEnabledProjectFilter()(path),
+  discoverCommands: path => getAgentWorkflowService(path).listEntries({
+    provider: getDefaultAIModel()?.split(':')[0] || 'claude-code',
+  }),
+  discoverActions: async path => (await getActionPromptService(path).list()).actions,
+  getGitRemoteHash: async (workspacePath) => {
+    const remote = await getGitRemoteIdentities(workspacePath);
+    return remote ? createHash('sha256').update(remote.canonical).digest('hex') : undefined;
+  },
+  warn: (message, error) => logger.main.warn(message, error),
+});
 
-function getProjectConfigSlices(workspacePath: string): ProjectConfigSlices {
-  let slices = projectConfigSlices.get(workspacePath);
-  if (!slices) {
-    slices = { commands: [], lastCommandsUpdate: 0, actions: [], lastActionsUpdate: 0 };
-    projectConfigSlices.set(workspacePath, slices);
-  }
-  return slices;
-}
-
-/** Compose both slices and send the whole blob. The only send site. */
-async function publishProjectConfig(workspacePath: string): Promise<void> {
-  const provider = state.provider;
-  if (!provider?.syncProjectConfig) {
-    return; // Sync not initialized or unsupported, silently skip
-  }
-
-  try {
-    // Compute gitRemoteHash from the workspace's git remote URL. This is a
-    // freshly written identity, so it uses the canonical (credential-free) form.
-    let gitRemoteHash: string | undefined;
-    const gitRemote = await getGitRemoteIdentities(workspacePath);
-    if (gitRemote) {
-      gitRemoteHash = createHash('sha256').update(gitRemote.canonical).digest('hex');
-    }
-
-    const slices = getProjectConfigSlices(workspacePath);
-    await provider.syncProjectConfig(
-      workspacePath,
-      composeProjectConfig({ ...slices, gitRemoteHash })
-    );
-  } catch (error) {
-    logger.main.error('[SyncManager] Failed to sync project config:', error);
-  }
-}
-
-/**
- * Update the slash-command slice and republish.
- * @param workspacePath The workspace path (used as project ID)
- * @param commands Array of slash commands to sync (name + description + source only)
- */
-export async function syncProjectCommandsToMobile(
-  workspacePath: string,
-  commands: Array<{ name: string; description?: string; source: string }>
-): Promise<void> {
-  const slices = getProjectConfigSlices(workspacePath);
-  slices.commands = commands.map(cmd => ({
-    name: cmd.name,
-    description: cmd.description,
-    source: cmd.source as 'builtin' | 'project' | 'user' | 'plugin',
-  }));
-  slices.lastCommandsUpdate = Date.now();
-  await publishProjectConfig(workspacePath);
-}
-
-/**
- * Update the action-prompt slice and republish.
- *
- * Unlike commands, these carry their body: mobile pastes the prompt into its
- * composer for the user to edit, which it cannot do from a name alone.
- */
-export async function syncProjectActionsToMobile(
-  workspacePath: string,
-  actions: ActionPrompt[]
-): Promise<void> {
-  const slices = getProjectConfigSlices(workspacePath);
-  const projected = toSyncedActionPrompts(actions);
-  if (projected.droppedForCount > 0 || projected.droppedForSize > 0 || projected.truncatedCount > 0) {
-    logger.main.warn(
-      `[SyncManager] ai-actions.md exceeded the sync budget for ${workspacePath}: ` +
-        `${projected.droppedForCount} over the count cap, ${projected.droppedForSize} over the size budget, ` +
-        `${projected.truncatedCount} truncated`
-    );
-  }
-  slices.actions = projected.actions;
-  slices.lastActionsUpdate = Date.now();
-  await publishProjectConfig(workspacePath);
-}
+export const { syncProjectCommandsToMobile, syncProjectActionsToMobile } = projectConfigSync;
 
 /**
  * Decrypt mobile image attachments and convert to ChatAttachment format.
@@ -1603,6 +1531,7 @@ export async function attemptReconnect(): Promise<void> {
     // message stays until the index decrypts in full (GitHub #1117).
     updateSyncStatus({ connected: true, error: personalSyncGateMessage });
     logger.main.info('[SyncManager] Successfully reconnected after network change');
+    await projectConfigSync.refresh();
 
     // 3. Fan out: all other sync providers get an immediate reconnect now that
     //    we know the network is good. TrackerSync lives in main; TeamSync and

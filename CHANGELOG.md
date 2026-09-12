@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cursor Agent no longer copies your global MCP server settings, including any secrets, into the project folder.
 - Repository-provided MCP servers no longer start for Grok Build or Cursor Agent in a workspace you have not trusted.
 - The macOS menu bar strip and the panel below it now agree on their status colors: running sessions are green, unread ones blue.
+- Mobile slash commands sync automatically when the desktop or phone reconnects, without requiring an iOS update.
 
 ### Removed
 <!-- Removed features go here -->

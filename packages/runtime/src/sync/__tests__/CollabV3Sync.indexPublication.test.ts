@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { asPersonalJwt, asPersonalMemberId } from '../../auth/jwtScopes';
 
 import { createCollabV3Sync } from '../CollabV3Sync';
+import { createProjectConfigSync } from '../../../../electron/src/main/services/sync/projectConfigSync';
 
 /**
  * The burst regression: `SyncedSessionStore` pushes `{ updatedAt }` to the index
@@ -96,7 +97,7 @@ async function createConnectedProvider() {
   const indexSocket = FakeWebSocket.instances[0];
   indexSocket.open();
   await establishIndexCoverage(provider, indexSocket);
-  return { provider, indexSocket };
+  return { provider, indexSocket, encryptionKey };
 }
 
 function baseSession(overrides: Record<string, any> = {}) {
@@ -124,6 +125,33 @@ describe('CollabV3 index publication gate', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it('publishes cold-start mobile commands through the encrypted index transport without a renderer', async () => {
+    const { provider, indexSocket, encryptionKey } = await createConnectedProvider();
+    try {
+      const sync = createProjectConfigSync({
+        getProvider: () => provider,
+        getEnabledProjects: () => ['/workspace'],
+        isProjectEnabled: path => path === '/workspace',
+        discoverCommands: async () => [{ name: 'investigate', source: 'project' }],
+        discoverActions: async () => [],
+        getGitRemoteHash: async () => undefined,
+        warn: vi.fn(),
+      });
+      await sync.refresh();
+      const packet = indexSocket.send.mock.calls.map(([data]) => JSON.parse(data as string))
+        .find(message => message.type === 'projectConfigUpdate');
+      expect(packet).toBeDefined();
+      const bytes = await crypto.subtle.decrypt({
+        name: 'AES-GCM', iv: Buffer.from(packet.configIv, 'base64'),
+      }, encryptionKey, Buffer.from(packet.encryptedConfig, 'base64'));
+      expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual({
+        commands: [{ name: 'investigate', source: 'project' }], lastCommandsUpdate: expect.any(Number),
+      });
+    } finally {
+      provider.disconnectAll();
+    }
   });
 
   it('never opens transcript rooms or sends expired bulk rows, and accepts fresh activity', async () => {
