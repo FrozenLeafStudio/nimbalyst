@@ -485,6 +485,43 @@ final class SessionListWindowTests: XCTestCase {
     // MARK: - Window model
 
     @MainActor
+    func testCreatedSessionReturnsToNewestWindowAfterPagingIntoHistory() async throws {
+        let db = try makeDatabase()
+        try seed(db, count: 450)
+        let model = SessionListWindowModel()
+        model.start(database: db, filter: filter())
+        defer { model.stop() }
+        try await settle(model)
+        for _ in 0..<4 {
+            model.loadNextPage(anchorId: nil)
+            try await settle(model)
+        }
+        XCTAssertTrue(model.canLoadPrevious)
+        let tracker = SessionCreationTracker(database: db, lookup: { _ in }, onReady: { _, _ in })
+        var selection: WorkspaceSelection?
+        let ready = expectation(description: "Created row selected")
+        let observer = tracker.$completion.compactMap { $0 }.sink { completion in
+            guard completion.requestId == "new-request", let id = completion.sessionId else { return }
+            model.refresh()
+            selection = .session(id)
+            model.setFocus(sessionId: id)
+            ready.fulfill()
+        }
+        defer { observer.cancel() }
+        tracker.register("new-request")
+        tracker.receive(CreateSessionResponse(requestId: "new-request", success: true, sessionId: "newest", error: nil))
+        XCTAssertNil(selection)
+        let visible = expectation(description: "Projection publishes newest row")
+        let rows = model.$sections.filter { _ in model.firstItemKey == "s:newest" }.prefix(1).sink { _ in visible.fulfill() }
+        defer { rows.cancel() }
+        try db.upsertSession(Session(id: "newest", projectId: projectId, titleDecrypted: "New session", createdAt: 9_000_000, updatedAt: 9_000_000))
+        await fulfillment(of: [ready, visible], timeout: 5)
+        XCTAssertEqual(selection, .session("newest"))
+        XCTAssertEqual(model.firstItemKey, "s:newest")
+        XCTAssertFalse(model.canLoadPrevious)
+    }
+
+    @MainActor
     func testWindowStaysBoundedWhilePagingThroughHistory() async throws {
         let db = try makeDatabase()
         try seed(db, count: 1_000)

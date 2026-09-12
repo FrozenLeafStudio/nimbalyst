@@ -12,6 +12,28 @@ final class IndexIngestionTests: XCTestCase {
     private let otherCrypto = CryptoManager(key: SymmetricKey(data: Data(repeating: 8, count: 32)))
     private let projectPath = "/test/ingestion"
 
+    func testCreatedSessionIsReadyOnlyAfterItsRowArrivesAndOnlyForRequester() async throws {
+        let db = try DatabaseManager()
+        let sync = manager(db)
+        var opened: [String] = []
+        sync.onSessionCreated = { _, id in opened.append(id) }
+        let requestId = try sync.createSession(projectId: projectPath)
+        func response(_ request: String, _ session: String) throws -> Data {
+            try JSONSerialization.data(withJSONObject: [
+                "type": "createSessionResponseBroadcast",
+                "response": ["requestId": request, "success": true, "sessionId": session],
+            ])
+        }
+        await sync.receiveIndexMessage(try response("another-phone", "foreign"))
+        XCTAssertTrue(opened.isEmpty, "Another device must not steal navigation")
+        await sync.receiveIndexMessage(try response(requestId, "created"))
+        XCTAssertTrue(opened.isEmpty, "A creation acknowledgement is not yet a locally resolvable session")
+        _ = try await receive(sync, sessions: [try entry("created", updatedAt: 10)])
+        XCTAssertEqual(opened, ["created"])
+        await sync.receiveIndexMessage(try response(requestId, "created"))
+        XCTAssertEqual(opened, ["created"], "A replay must not reopen the session")
+    }
+
     func testActionDraftWaitsForMatchingCreationAndIndexRow() async throws {
         let db = try DatabaseManager()
         let sync = manager(db)
@@ -21,6 +43,53 @@ final class IndexIngestionTests: XCTestCase {
         _ = try await receive(sync, sessions: [try entry("created", updatedAt: 1)])
         XCTAssertEqual(try db.session(byId: "created")?.draftInput, "Review these changes")
         XCTAssertFalse(try db.session(byId: "created")?.isExecuting ?? true)
+    }
+
+    func testCreationObservesLiveIngestionWithoutAFullIndexResponse() async throws {
+        let db = try DatabaseManager()
+        let sync = manager(db)
+        let ready = expectation(description: "Live row opens the session")
+        sync.onSessionCreated = { _, id in
+            XCTAssertEqual(id, "live-created")
+            ready.fulfill()
+        }
+        let requestId = try sync.createSession(projectId: projectPath)
+        await sync.receiveIndexMessage(try JSONSerialization.data(withJSONObject: [
+            "type": "createSessionResponseBroadcast",
+            "response": ["requestId": requestId, "success": true, "sessionId": "live-created"],
+        ]))
+        await sync.receiveIndexMessage(try JSONSerialization.data(withJSONObject: [
+            "type": "indexBroadcast", "session": try entry("live-created", updatedAt: 20),
+        ]))
+        await fulfillment(of: [ready], timeout: 3)
+    }
+
+    func testCreationLookupExistingRowFailureAndCancellation() async throws {
+        let db = try DatabaseManager()
+        try db.upsertProject(Project(id: projectPath, name: "Test"))
+        var lookups: [String] = []
+        var opened: [String] = []
+        let tracker = SessionCreationTracker(database: db, timeout: .milliseconds(40), lookup: { lookups.append($0) }, onReady: { _, id in opened.append(id) })
+        tracker.register("missing")
+        tracker.receive(CreateSessionResponse(requestId: "missing", success: true, sessionId: "new", error: nil))
+        XCTAssertEqual(lookups, ["new"], "A normal request without a draft still fetches its returned ID")
+        try db.upsertSession(Session(id: "cached", projectId: projectPath, createdAt: 1, updatedAt: 1))
+        tracker.register("cached-request")
+        tracker.receive(CreateSessionResponse(requestId: "cached-request", success: true, sessionId: "cached", error: nil))
+        XCTAssertEqual(opened, ["cached"])
+        tracker.register("failure")
+        tracker.receive(CreateSessionResponse(requestId: "failure", success: false, sessionId: nil, error: "No desktop connected"))
+        XCTAssertEqual(tracker.completion?.error, "No desktop connected")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(tracker.completion?.requestId, "missing")
+        XCTAssertNotNil(tracker.completion?.error)
+        tracker.register("cancelled")
+        tracker.receive(CreateSessionResponse(requestId: "cancelled", success: true, sessionId: "late", error: nil))
+        tracker.cancel()
+        try db.upsertSession(Session(id: "late", projectId: projectPath, createdAt: 1, updatedAt: 1))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(tracker.completion)
+        XCTAssertEqual(opened, ["cached"], "Retired account observations cannot navigate")
     }
 
     private func manager(_ db: DatabaseManager) -> SyncManager {

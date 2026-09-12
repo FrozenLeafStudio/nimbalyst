@@ -30,6 +30,13 @@ public struct SessionListView: View {
 
     @State private var searchText = ""
     @State private var isCreatingSession = false
+    @State private var pendingCreationRequests: Set<String> = []
+    @State private var creationError: String?
+
+    private var creationCompletions: AnyPublisher<SessionCreationTracker.Completion?, Never> {
+        appState.syncManager?.sessionCreations.$completion.eraseToAnyPublisher()
+            ?? Just(nil).eraseToAnyPublisher()
+    }
     @State private var phaseFilter: PhaseFilter = .all
     @State private var showArchived = false
     @State private var selectedModelId: String?
@@ -122,6 +129,8 @@ public struct SessionListView: View {
             resolveDefaultModel()
         }
         .task(id: appState.databaseManager.map(ObjectIdentifier.init)) {
+            pendingCreationRequests.removeAll()
+            isCreatingSession = false
             model.setPersistedExpansion(expandedKeys: expandedGroupKeys, collapsedKeys: collapsedMetaAgentKeys)
             model.start(database: appState.databaseManager, filter: filter)
             model.setFocus(sessionId: selectedSessionId)
@@ -131,6 +140,23 @@ public struct SessionListView: View {
             model.isHistoryComplete = complete
         }
         .onReceive(historyCoverage) { coverage = $0 }
+        .onReceive(creationCompletions) { completion in
+            guard let completion, pendingCreationRequests.remove(completion.requestId) != nil else { return }
+            isCreatingSession = !pendingCreationRequests.isEmpty
+            if let sessionId = completion.sessionId {
+                model.refresh()
+                selection = .session(sessionId)
+            } else {
+                creationError = completion.error
+            }
+        }
+        .alert("Could not open new session", isPresented: Binding(
+            get: { creationError != nil }, set: { if !$0 { creationError = nil } }
+        )) {
+            Button("OK", role: .cancel) { creationError = nil }
+        } message: {
+            Text(creationError ?? "")
+        }
         .onChange(of: filter) { _, newFilter in
             model.setFilter(newFilter)
         }
@@ -141,6 +167,8 @@ public struct SessionListView: View {
             resolveDefaultModel()
         }
         .onChange(of: project.id) { _, _ in
+            pendingCreationRequests.removeAll()
+            isCreatingSession = false
             loadExpandedState()
             model.setPersistedExpansion(expandedKeys: expandedGroupKeys, collapsedKeys: collapsedMetaAgentKeys)
             model.start(database: appState.databaseManager, filter: filter)
@@ -657,20 +685,19 @@ public struct SessionListView: View {
         guard let sync = appState.syncManager else { return }
         isCreatingSession = true
         do {
-            try sync.createSession(
+            let requestId = try sync.createSession(
                 projectId: project.id,
                 initialPrompt: nil,
                 provider: ModelPreferences.providerFromModelId(selectedModelId),
                 model: selectedModelId,
                 targetDeviceId: hostDeviceId
             )
+            pendingCreationRequests.insert(requestId)
             AnalyticsManager.shared.capture("mobile_session_created", properties: [
                 "model": selectedModelId ?? "default"
             ])
         } catch {
-            print("Failed to create session: \(error)")
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            creationError = error.localizedDescription
             isCreatingSession = false
         }
     }
@@ -680,7 +707,7 @@ public struct SessionListView: View {
         guard let sync = appState.syncManager else { return }
         isCreatingSession = true
         do {
-            try sync.createSession(
+            let requestId = try sync.createSession(
                 projectId: project.id,
                 initialPrompt: nil,
                 sessionType: "workstream",
@@ -688,11 +715,10 @@ public struct SessionListView: View {
                 model: selectedModelId,
                 targetDeviceId: hostDeviceId
             )
+            pendingCreationRequests.insert(requestId)
             AnalyticsManager.shared.capture("mobile_workstream_created")
         } catch {
-            print("Failed to create workstream: \(error)")
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            creationError = error.localizedDescription
             isCreatingSession = false
         }
     }
@@ -702,7 +728,7 @@ public struct SessionListView: View {
         guard let sync = appState.syncManager else { return }
         isCreatingSession = true
         do {
-            try sync.createSession(
+            let requestId = try sync.createSession(
                 projectId: project.id,
                 initialPrompt: nil,
                 provider: ModelPreferences.providerFromModelId(selectedModelId),
@@ -710,13 +736,12 @@ public struct SessionListView: View {
                 agentRole: "meta-agent",
                 targetDeviceId: hostDeviceId
             )
+            pendingCreationRequests.insert(requestId)
             AnalyticsManager.shared.capture("mobile_meta_agent_created", properties: [
                 "model": selectedModelId ?? "default"
             ])
         } catch {
-            print("Failed to create meta agent: \(error)")
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            creationError = error.localizedDescription
             isCreatingSession = false
         }
     }
@@ -725,7 +750,7 @@ public struct SessionListView: View {
     private func createChildSession(parentId: String, groupKey: String) {
         guard let sync = appState.syncManager else { return }
         do {
-            try sync.createSession(
+            let requestId = try sync.createSession(
                 projectId: project.id,
                 initialPrompt: nil,
                 parentSessionId: parentId,
@@ -733,11 +758,12 @@ public struct SessionListView: View {
                 model: selectedModelId,
                 targetDeviceId: hostDeviceId
             )
+            pendingCreationRequests.insert(requestId)
             AnalyticsManager.shared.capture("mobile_child_session_created")
             // Auto-expand the parent workstream
             groupExpansionBinding(for: groupKey).wrappedValue = true
         } catch {
-            print("Failed to create child session: \(error)")
+            creationError = error.localizedDescription
         }
     }
 

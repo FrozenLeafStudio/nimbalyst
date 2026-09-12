@@ -51,11 +51,14 @@ public final class SyncManager: ObservableObject {
     /// Called when settings are synced from the desktop (e.g., OpenAI API key, voice mode config).
     public var onSettingsSynced: ((SyncedSettings) -> Void)?
 
-    /// Called when the desktop confirms a create-session request succeeded.
-    /// Parameters: (requestId, sessionId). The `requestId` lets the caller match
-    /// the response to a request it originated (this broadcast reaches every
-    /// paired device), so only the requesting device navigates to the new session.
+    /// Called once a locally requested session is available in the database.
+    /// Parameters: (requestId, sessionId). Other devices' responses are ignored.
     public var onSessionCreated: ((String, String) -> Void)?
+    lazy var sessionCreations = SessionCreationTracker(
+        database: database,
+        lookup: { [weak self] in self?.requestSessionIndexLookup(sessionId: $0) },
+        onReady: { [weak self] requestId, sessionId in self?.onSessionCreated?(requestId, sessionId) }
+    )
     private var pendingCreationDrafts: [String: String] = [:]
     private var pendingSessionDrafts: [String: String] = [:]
 
@@ -376,6 +379,7 @@ public final class SyncManager: ObservableObject {
     public func disconnect() {
         pendingCreationDrafts.removeAll()
         pendingSessionDrafts.removeAll()
+        sessionCreations.cancel()
         leaveSessionRoom()
         indexClient.disconnect()
         // Drop the backlog this connection produced. A reconnect requests the
@@ -654,13 +658,12 @@ public final class SyncManager: ObservableObject {
                 if let draft {
                     pendingSessionDrafts[sessionId] = draft
                     applyPendingCreationDrafts()
-                    if pendingSessionDrafts[sessionId] != nil { requestSessionIndexLookup(sessionId: sessionId) }
                 }
-                onSessionCreated?(broadcast.response.requestId, sessionId)
             }
         } else {
             logger.error("Session creation failed: \(broadcast.response.error ?? "unknown error")")
         }
+        sessionCreations.receive(broadcast.response)
     }
 
     private func applyPendingCreationDrafts() {
@@ -1665,6 +1668,7 @@ public final class SyncManager: ObservableObject {
         }
 
         let requestId = UUID().uuidString
+        sessionCreations.register(requestId)
         if let initialDraft { pendingCreationDrafts[requestId] = initialDraft }
         let request = CreateSessionRequestMessage(
             request: EncryptedCreateSessionRequest(
