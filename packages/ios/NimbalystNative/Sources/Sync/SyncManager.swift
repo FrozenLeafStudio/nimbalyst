@@ -54,6 +54,15 @@ public final class SyncManager: ObservableObject {
     /// Called once a locally requested session is available in the database.
     /// Parameters: (requestId, sessionId). Other devices' responses are ignored.
     public var onSessionCreated: ((String, String) -> Void)?
+    public lazy var sessionCreation: SessionCreationRequests = {
+        let requests = SessionCreationRequests()
+        requests.onFailure = { [weak self] requestId, message in
+            self?.pendingCreationDrafts.removeValue(forKey: requestId)
+            self?.sessionCreations.receive(CreateSessionResponse(requestId: requestId,
+                success: false, sessionId: nil, error: message))
+        }
+        return requests
+    }()
     lazy var sessionCreations = SessionCreationTracker(
         database: database,
         lookup: { [weak self] in self?.requestSessionIndexLookup(sessionId: $0) },
@@ -150,12 +159,15 @@ public final class SyncManager: ObservableObject {
         self.init(crypto: crypto, database: database, serverUrl: serverUrl, userId: userId, registerDeviceCallbacks: true)
     }
 
+    private let creationSender: ((String, @escaping @MainActor @Sendable (Error?) -> Void) -> Void)?
+
     /// Allows index import tests to run without an application notification center.
-    init(crypto: CryptoManager, database: DatabaseManager, serverUrl: String, userId: String, registerDeviceCallbacks: Bool) {
+    init(crypto: CryptoManager, database: DatabaseManager, serverUrl: String, userId: String, registerDeviceCallbacks: Bool, creationSender: ((String, @escaping @MainActor @Sendable (Error?) -> Void) -> Void)? = nil) {
         self.crypto = crypto
         self.database = database
         self.serverUrl = serverUrl
         self.userId = userId
+        self.creationSender = creationSender
 
         startIndexIngestionGeneration()
         setupIndexClient()
@@ -377,6 +389,8 @@ public final class SyncManager: ObservableObject {
 
     /// Disconnect from all rooms.
     public func disconnect() {
+        sessionCreation.disconnect()
+        connectedDevices = []
         pendingCreationDrafts.removeAll()
         pendingSessionDrafts.removeAll()
         sessionCreations.cancel()
@@ -442,6 +456,10 @@ public final class SyncManager: ObservableObject {
         indexClient.onConnectionStateChanged = { [weak self] connected in
             Task { @MainActor in
                 self?.isConnected = connected
+                if !connected {
+                    self?.sessionCreation.disconnect()
+                    self?.connectedDevices = []
+                }
                 if connected {
                     // Versioned replication probes first; the probe's
                     // unknown_message_type answer is what falls back to the
@@ -650,6 +668,7 @@ public final class SyncManager: ObservableObject {
             logger.error("Failed to decode create_session_response_broadcast")
             return
         }
+        _ = sessionCreation.receive(broadcast.response)
         let draft = pendingCreationDrafts.removeValue(forKey: broadcast.response.requestId)
         if broadcast.response.success {
             let sessionId = broadcast.response.sessionId ?? "unknown"
@@ -1657,40 +1676,20 @@ public final class SyncManager: ObservableObject {
         targetDeviceId: String? = nil,
         initialDraft: String? = nil
     ) throws -> String {
-        let encryptedProjectId = try crypto.encryptProjectId(projectId)
-
-        var encryptedPrompt: String?
-        var promptIv: String?
-        if let prompt = initialPrompt {
-            let result = try crypto.encrypt(plaintext: prompt)
-            encryptedPrompt = result.encrypted
-            promptIv = result.iv
-        }
-
-        let requestId = UUID().uuidString
-        sessionCreations.register(requestId)
-        if let initialDraft { pendingCreationDrafts[requestId] = initialDraft }
-        let request = CreateSessionRequestMessage(
-            request: EncryptedCreateSessionRequest(
-                requestId: requestId,
-                encryptedProjectId: encryptedProjectId,
-                projectIdIv: CryptoManager.projectIdIvBase64,
-                encryptedInitialPrompt: encryptedPrompt,
-                initialPromptIv: promptIv,
-                sessionType: sessionType,
-                parentSessionId: parentSessionId,
-                provider: provider,
-                model: model,
-                agentRole: agentRole,
-                timestamp: Int(Date().timeIntervalSince1970 * 1000),
-                targetDeviceId: targetDeviceId
-            )
+        let requestId = try sessionCreation.create(
+            SessionCreationOptions(projectId: projectId, initialPrompt: initialPrompt,
+                sessionType: sessionType, parentSessionId: parentSessionId,
+                provider: provider, model: model, agentRole: agentRole, targetDeviceId: targetDeviceId),
+            crypto: crypto, devices: connectedDevices, isConnected: isConnected,
+            onRegistered: { [self] requestId in
+                sessionCreations.register(requestId)
+                if let initialDraft { pendingCreationDrafts[requestId] = initialDraft }
+            },
+            send: { [self] json, completion in
+                if let creationSender { creationSender(json, completion) }
+                else { indexClient.sendRaw(json, completion: completion) }
+            }
         )
-
-        if let data = try? JSONEncoder().encode(request),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-        }
         return requestId
     }
 

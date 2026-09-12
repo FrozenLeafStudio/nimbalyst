@@ -31,7 +31,6 @@ public struct SessionListView: View {
     @State private var searchText = ""
     @State private var isCreatingSession = false
     @State private var pendingCreationRequests: Set<String> = []
-    @State private var creationError: String?
 
     private var creationCompletions: AnyPublisher<SessionCreationTracker.Completion?, Never> {
         appState.syncManager?.sessionCreations.$completion.eraseToAnyPublisher()
@@ -147,15 +146,8 @@ public struct SessionListView: View {
                 model.refresh()
                 selection = .session(sessionId)
             } else {
-                creationError = completion.error
+                appState.syncManager?.sessionCreation.errorMessage = completion.error
             }
-        }
-        .alert("Could not open new session", isPresented: Binding(
-            get: { creationError != nil }, set: { if !$0 { creationError = nil } }
-        )) {
-            Button("OK", role: .cancel) { creationError = nil }
-        } message: {
-            Text(creationError ?? "")
         }
         .onChange(of: filter) { _, newFilter in
             model.setFilter(newFilter)
@@ -697,7 +689,7 @@ public struct SessionListView: View {
                 "model": selectedModelId ?? "default"
             ])
         } catch {
-            creationError = error.localizedDescription
+            appState.syncManager?.sessionCreation.errorMessage = error.localizedDescription
             isCreatingSession = false
         }
     }
@@ -718,7 +710,7 @@ public struct SessionListView: View {
             pendingCreationRequests.insert(requestId)
             AnalyticsManager.shared.capture("mobile_workstream_created")
         } catch {
-            creationError = error.localizedDescription
+            appState.syncManager?.sessionCreation.errorMessage = error.localizedDescription
             isCreatingSession = false
         }
     }
@@ -741,7 +733,7 @@ public struct SessionListView: View {
                 "model": selectedModelId ?? "default"
             ])
         } catch {
-            creationError = error.localizedDescription
+            appState.syncManager?.sessionCreation.errorMessage = error.localizedDescription
             isCreatingSession = false
         }
     }
@@ -763,7 +755,7 @@ public struct SessionListView: View {
             // Auto-expand the parent workstream
             groupExpansionBinding(for: groupKey).wrappedValue = true
         } catch {
-            creationError = error.localizedDescription
+            appState.syncManager?.sessionCreation.errorMessage = error.localizedDescription
         }
     }
 

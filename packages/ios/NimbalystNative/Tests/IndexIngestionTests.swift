@@ -92,8 +92,26 @@ final class IndexIngestionTests: XCTestCase {
         XCTAssertEqual(opened, ["cached"], "Retired account observations cannot navigate")
     }
 
-    private func manager(_ db: DatabaseManager) -> SyncManager {
-        SyncManager(crypto: crypto, database: db, serverUrl: "https://invalid.example", userId: "test", registerDeviceCallbacks: false)
+    func testCreationSendFailureCompletesRegisteredRequestImmediately() throws {
+        let sync = manager(try DatabaseManager(), sendError: NSError(domain: "test", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Send failed"]))
+        let requestId = try sync.createSession(projectId: projectPath, initialDraft: "Preserve me")
+        XCTAssertEqual(sync.sessionCreations.completion?.requestId, requestId)
+        XCTAssertEqual(sync.sessionCreations.completion?.error, "Send failed")
+        XCTAssertEqual(sync.sessionCreation.pendingCount, 0)
+    }
+
+    private func manager(_ db: DatabaseManager, sendError: Error? = nil) -> SyncManager {
+        let sync = SyncManager(crypto: crypto, database: db, serverUrl: "https://invalid.example", userId: "test", registerDeviceCallbacks: false,
+            creationSender: { _, completion in completion(sendError) })
+        sync.isConnected = true
+        sync.connectedDevices = [
+            DeviceInfo(deviceId: "desktop", name: "Mac", type: "desktop", platform: "macos", appVersion: nil,
+                connectedAt: 1, lastActiveAt: 1, isFocused: false, status: "away"),
+            DeviceInfo(deviceId: "sandbox-one", name: "Sandbox", type: "headless", platform: "linux", appVersion: nil,
+                connectedAt: 1, lastActiveAt: 2, isFocused: false, status: "active"),
+        ]
+        return sync
     }
 
     /// A session entry. `valid: false` encrypts the project id under a key this

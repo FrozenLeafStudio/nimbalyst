@@ -411,6 +411,7 @@ public struct UnregisterLiveActivityTokenMessage: Encodable {
 struct CreateSessionRequestMessage: Encodable {
     let type = "createSessionRequest"
     let request: EncryptedCreateSessionRequest
+    var targetDeviceId: String? = nil
 }
 
 struct EncryptedCreateSessionRequest: Codable {

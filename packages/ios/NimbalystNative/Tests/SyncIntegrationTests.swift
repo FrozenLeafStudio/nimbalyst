@@ -20,6 +20,12 @@ final class SyncIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testSessionCreationDoesNotSilentlySucceedWithoutAConnectedDesktop() throws {
+        let sync = SyncManager(crypto: crypto, database: database, serverUrl: "https://invalid.example", userId: Self.userId, registerDeviceCallbacks: false)
+        XCTAssertThrowsError(try sync.createSession(projectId: "/test/project"))
+    }
+
+    @MainActor
     func testIndexLoadCompletesOnlyAfterImportAndRejectsFailedImports() async throws {
         let sync = SyncManager(crypto: crypto, database: database, serverUrl: "https://invalid.example", userId: Self.userId, registerDeviceCallbacks: false)
         XCTAssertEqual(sync.indexLoadState, .loading)

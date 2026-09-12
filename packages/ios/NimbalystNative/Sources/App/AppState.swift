@@ -60,9 +60,8 @@ public final class AppState: ObservableObject {
     #if os(iOS)
     @Published public private(set) var voiceAgent: VoiceAgent?
 
-    /// Session the UI should navigate to because the voice agent just created it
-    /// on this device. Observed by the navigation views (iPhone stack / iPad
-    /// split) to open the new session. Set back to nil by the view once handled.
+    /// Session to open after creation on this device, through voice or the UI.
+    /// Cleared by the navigation view once handled.
     @Published public var voiceNavigationRequest: String?
     #endif
 
@@ -634,14 +633,14 @@ public final class AppState: ObservableObject {
             }
         }
 
-        // When the voice agent creates a session, switch this device's UI to it.
-        // Only the device that issued the request navigates (matched by requestId);
-        // other paired devices just see the session appear in their list.
-        sync.onSessionCreated = { [weak self, weak voice] requestId, sessionId in
+        // SyncManager only delivers successes for this device's pending requests.
+        // Open sessions created by the toolbar as well as those created by voice.
+        sync.onSessionCreated = { [weak self, weak voice, weak sync] requestId, sessionId in
             Task { @MainActor in
-                guard let self, let voice,
-                      voice.consumePendingCreateSession(requestId: requestId) else { return }
-                voice.activeSessionId = sessionId
+                guard let self, let sync, self.syncManager === sync else { return }
+                if voice?.consumePendingCreateSession(requestId: requestId) == true {
+                    voice?.activeSessionId = sessionId
+                }
                 await self.navigateWhenSessionAvailable(sessionId)
             }
         }
