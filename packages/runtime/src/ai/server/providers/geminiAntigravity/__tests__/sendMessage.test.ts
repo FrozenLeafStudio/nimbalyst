@@ -112,6 +112,51 @@ describe('GeminiAntigravityProvider.sendMessage', () => {
     expect(getModelResponse).toHaveBeenCalledTimes(2);
   });
 
+  // The producer half of tool-call titles (a model-supplied description
+  // alongside name/arguments) shipped with no test on this envelope -> chunk
+  // boundary. These two pin it.
+  it('carries a model-supplied description from the envelope into the tool_call chunk', async () => {
+    getModelResponse
+      .mockResolvedValueOnce(
+        '{"tool_call":{"name":"echo","arguments":{"x":1},"description":"Echo the value"}}',
+      )
+      .mockResolvedValueOnce('done');
+    executor.mockResolvedValue({ text: 'echoed-1' });
+
+    const chunks = await collect(
+      provider.sendMessage('use the tool', undefined, 's3', undefined, undefined, undefined, [
+        { type: 'function', function: { name: 'echo' } },
+      ]),
+    );
+
+    const announce = chunks.find((c) => c.type === 'tool_call' && c.toolCall?.result === undefined);
+    const withResult = chunks.find(
+      (c) => c.type === 'tool_call' && c.toolCall?.result !== undefined,
+    );
+    expect(announce?.toolCall?.description).toBe('Echo the value');
+    expect(withResult?.toolCall?.description).toBe('Echo the value');
+  });
+
+  it('leaves the tool_call chunk description undefined when the envelope omits it', async () => {
+    getModelResponse
+      .mockResolvedValueOnce('{"tool_call":{"name":"echo","arguments":{"x":1}}}')
+      .mockResolvedValueOnce('done');
+    executor.mockResolvedValue({ text: 'echoed-1' });
+
+    const chunks = await collect(
+      provider.sendMessage('use the tool', undefined, 's4', undefined, undefined, undefined, [
+        { type: 'function', function: { name: 'echo' } },
+      ]),
+    );
+
+    const announce = chunks.find((c) => c.type === 'tool_call' && c.toolCall?.result === undefined);
+    const withResult = chunks.find(
+      (c) => c.type === 'tool_call' && c.toolCall?.result !== undefined,
+    );
+    expect(announce?.toolCall?.description).toBeUndefined();
+    expect(withResult?.toolCall?.description).toBeUndefined();
+  });
+
   it('actually executes a run_command tool call in the workspace and returns its output', async () => {
     // run_command runs in this process (real child_process), NOT through the
     // injected executor - so this asserts genuine execution end-to-end through
