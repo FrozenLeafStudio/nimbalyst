@@ -1755,6 +1755,9 @@ export const RichTranscriptView = React.forwardRef<
       ? extractCodexFileChanges((tool.arguments as Record<string, any> | undefined)?.changes)
       : editTool ? extractEditsFromToolMessage(toolMsg) : [];
     const toolDisplayName = formatToolDisplayName(tool.toolName || '') || tool.toolName || 'Tool';
+    // View-model title (out-of-band, not `arguments`); distinct from the sub-agent
+    // `description` below, which reads `arguments.description`.
+    const toolCallTitle = tool.description?.trim() ? tool.description.trim() : null;
 
     if (editTool && editEntries.length > 0) {
       return (
@@ -1795,6 +1798,69 @@ export const RichTranscriptView = React.forwardRef<
           ? 'rich-transcript-tool-card child-tool rounded border border-[var(--nim-border)] overflow-hidden bg-[var(--nim-bg-tertiary)]'
           : 'rich-transcript-tool-card rounded border border-[var(--nim-border)] overflow-hidden bg-[var(--nim-bg-secondary)]';
 
+    // Name span: styled as the primary line when there is no title, or as the
+    // faint secondary line (beside the args) when `toolCallTitle` takes the primary slot.
+    const nameSpanClass = toolCallTitle
+      ? 'rich-transcript-tool-name font-mono text-xs text-[var(--nim-text-muted)]'
+      : 'rich-transcript-tool-name font-mono text-sm text-[var(--nim-text)] font-medium';
+    const nameNode = (
+      <span className={nameSpanClass} title={tool.toolName || undefined}>
+        {isTeammate
+          ? (toolMsg.subagent?.teammateName || 'Teammate')
+          : isSubAgent
+            ? (toolArgs?.run_in_background ? 'Background Agent' : 'Sub-Agent')
+            : toolDisplayName}
+        {isTeammate && toolMsg.subagent?.teammateMode && (
+          <span className="rich-transcript-tool-subagent-type text-[var(--nim-text-muted)] font-normal text-xs ml-1">({toolMsg.subagent?.teammateMode})</span>
+        )}
+        {isSubAgent && !isTeammate && toolMsg.subagent?.agentType && (
+          <span className="rich-transcript-tool-subagent-type text-[var(--nim-primary)] font-semibold"> [{toolMsg.subagent?.agentType}]</span>
+        )}
+      </span>
+    );
+    const subagentAuditNode = subagentAuditLabel ? (
+      <span
+        className="rich-transcript-subagent-audit min-w-0 max-w-40 truncate text-[11px] text-[var(--nim-text-muted)]"
+        aria-label={subagentAuditLabel}
+        title={subagentAuditLabel}
+      >
+        {toolMsg.subagent?.model}{toolMsg.subagent?.model && toolMsg.subagent?.reasoningEffort ? ' · ' : ''}{toolMsg.subagent?.reasoningEffort}
+      </span>
+    ) : null;
+    const argsNode = !isSubAgent && tool.arguments ? (() => {
+      const argStr = formatToolArguments(tool.toolName, tool.arguments, workspacePath);
+      if (!argStr) return null;
+
+      // Check if there's a clickable file path (only for tools that reference actual files)
+      const filePath = extractFilePathFromArgs(tool.toolName, tool.arguments);
+      const isClickable = onOpenFile && filePath;
+
+      if (isClickable) {
+        return (
+          <span
+            role="link"
+            tabIndex={0}
+            className="rich-transcript-tool-args rich-transcript-tool-args-link text-[var(--nim-text-muted)] flex-1 overflow-hidden text-ellipsis whitespace-nowrap bg-transparent border-none p-0 m-0 font-inherit text-[var(--nim-link)] cursor-pointer no-underline text-left hover:underline"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenFile(filePath);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.stopPropagation();
+                e.preventDefault();
+                onOpenFile(filePath);
+              }
+            }}
+            title={`Open ${filePath}`}
+          >
+            {argStr}
+          </span>
+        );
+      }
+      return <span className="rich-transcript-tool-args text-[var(--nim-text-muted)] flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{argStr}</span>;
+    })() : null;
+
     return (
       <div key={toolRenderKey} className={`rich-transcript-tool-container mb-2 ${depth > 0 ? 'nested ml-0' : ''}`} style={{ marginLeft: depth > 0 ? '1rem' : '0' }}>
         <div className={cardClass}>
@@ -1812,61 +1878,24 @@ export const RichTranscriptView = React.forwardRef<
               // Wrench icon for regular tools
               <MaterialSymbol icon="build" size={16} className="rich-transcript-tool-icon w-4 h-4 text-[var(--nim-primary)] shrink-0" />
             )}
-            <span className="rich-transcript-tool-name font-mono text-sm text-[var(--nim-text)] font-medium" title={tool.toolName || undefined}>
-              {isTeammate
-                ? (toolMsg.subagent?.teammateName || 'Teammate')
-                : isSubAgent
-                  ? (toolArgs?.run_in_background ? 'Background Agent' : 'Sub-Agent')
-                  : toolDisplayName}
-              {isTeammate && toolMsg.subagent?.teammateMode && (
-                <span className="rich-transcript-tool-subagent-type text-[var(--nim-text-muted)] font-normal text-xs ml-1">({toolMsg.subagent?.teammateMode})</span>
-              )}
-              {isSubAgent && !isTeammate && toolMsg.subagent?.agentType && (
-                <span className="rich-transcript-tool-subagent-type text-[var(--nim-primary)] font-semibold"> [{toolMsg.subagent?.agentType}]</span>
-              )}
-            </span>
-            {subagentAuditLabel && (
-              <span
-                className="rich-transcript-subagent-audit min-w-0 max-w-40 truncate text-[11px] text-[var(--nim-text-muted)]"
-                aria-label={subagentAuditLabel}
-                title={subagentAuditLabel}
-              >
-                {toolMsg.subagent?.model}{toolMsg.subagent?.model && toolMsg.subagent?.reasoningEffort ? ' · ' : ''}{toolMsg.subagent?.reasoningEffort}
-              </span>
+            {toolCallTitle ? (
+              // Two-line card: model-supplied title as the prose primary line,
+              // today's name+args render demoted to a faint secondary line underneath.
+              <div className="flex flex-col gap-0.5 min-w-0 flex-1 overflow-hidden">
+                <span className="rich-transcript-tool-title font-sans text-sm text-[var(--nim-text)] whitespace-nowrap overflow-hidden text-ellipsis">{toolCallTitle}</span>
+                <span className="flex items-center gap-1.5 min-w-0">
+                  {nameNode}
+                  {subagentAuditNode}
+                  {argsNode}
+                </span>
+              </div>
+            ) : (
+              <>
+                {nameNode}
+                {subagentAuditNode}
+                {argsNode}
+              </>
             )}
-            {!isSubAgent && tool.arguments && (() => {
-              const argStr = formatToolArguments(tool.toolName, tool.arguments, workspacePath);
-              if (!argStr) return null;
-
-              // Check if there's a clickable file path (only for tools that reference actual files)
-              const filePath = extractFilePathFromArgs(tool.toolName, tool.arguments);
-              const isClickable = onOpenFile && filePath;
-
-              if (isClickable) {
-                return (
-                  <span
-                    role="link"
-                    tabIndex={0}
-                    className="rich-transcript-tool-args rich-transcript-tool-args-link text-[var(--nim-text-muted)] flex-1 overflow-hidden text-ellipsis whitespace-nowrap bg-transparent border-none p-0 m-0 font-inherit text-[var(--nim-link)] cursor-pointer no-underline text-left hover:underline"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onOpenFile(filePath);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.stopPropagation();
-                        e.preventDefault();
-                        onOpenFile(filePath);
-                      }
-                    }}
-                    title={`Open ${filePath}`}
-                  >
-                    {argStr}
-                  </span>
-                );
-              }
-              return <span className="rich-transcript-tool-args text-[var(--nim-text-muted)] flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{argStr}</span>;
-            })()}
             {/* Status indicator: sub-agents/teammates show live status, regular tools show success/error */}
             {isSubAgent ? (() => {
               // Look up teammate status from session metadata

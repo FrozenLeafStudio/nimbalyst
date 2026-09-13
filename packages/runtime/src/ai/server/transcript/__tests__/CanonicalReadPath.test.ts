@@ -4,6 +4,8 @@ import { TranscriptProjector } from '../TranscriptProjector';
 import type { TranscriptViewMessage } from '../TranscriptProjector';
 import type { ITranscriptEventStore } from '../types';
 import { createMockStore } from './helpers/createMockStore';
+import { TranscriptTransformer } from '../TranscriptTransformer';
+import type { IRawMessageStore, RawMessage, ISessionMetadataStore } from '../TranscriptTransformer';
 
 // ---------------------------------------------------------------------------
 // Helper: project canonical events into view messages
@@ -417,5 +419,153 @@ describe('Canonical Read Path Integration', () => {
       expect(events).toHaveLength(0);
       expect(messages).toHaveLength(0);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gemini end-to-end: raw row -> parser -> processDescriptor -> writer ->
+// projector -> view-model
+// ---------------------------------------------------------------------------
+//
+// T1 (descriptor -> ToolCallPayload) and T2 (raw row -> descriptor) each have
+// their own tests pinning one link of the chain in isolation. Neither proves
+// the whole chain holds together. This drives an actual raw
+// `ai_agent_messages` row through `TranscriptTransformer` -- the single
+// production entry point from raw messages to canonical events, used both
+// for the first load of a session and for every reload -- and then through
+// `TranscriptProjector` into the exact view-model shape a React component
+// receives, asserting `description` reaches the far end unchanged.
+//
+// Minimal local mocks: this file's `createMockStore` already covers
+// `ITranscriptEventStore`; only the raw-message and session-metadata stores
+// `TranscriptTransformer` also depends on are missing, so they're added here
+// rather than importing the larger mock set from `TranscriptTransformer.test.ts`.
+function createMockRawStore(messages: RawMessage[]): IRawMessageStore {
+  return {
+    async getMessages(sessionId, afterId) {
+      return messages
+        .filter((m) => m.sessionId === sessionId && (afterId == null || m.id > afterId))
+        .sort((a, b) => a.id - b.id);
+    },
+  };
+}
+
+function createMockMetadataStore(): ISessionMetadataStore {
+  const statuses = new Map<
+    string,
+    {
+      transformVersion: number | null;
+      lastRawMessageId: number | null;
+      lastTransformedAt: Date | null;
+      transformStatus: 'pending' | 'complete' | 'error' | null;
+    }
+  >();
+
+  return {
+    async getTransformStatus(sessionId) {
+      return (
+        statuses.get(sessionId) ?? {
+          transformVersion: null,
+          lastRawMessageId: null,
+          lastTransformedAt: null,
+          transformStatus: null,
+        }
+      );
+    },
+    async updateTransformStatus(sessionId, update) {
+      statuses.set(sessionId, update);
+    },
+  };
+}
+
+describe('Gemini end-to-end: raw row -> parser -> processDescriptor -> writer -> projector -> view-model', () => {
+  const SESSION_ID = 'gemini-e2e-session';
+  const PROVIDER = 'antigravity-gemini-agent';
+
+  function geminiToolRow(id: number, content: string): RawMessage {
+    return {
+      id,
+      sessionId: SESSION_ID,
+      source: PROVIDER,
+      direction: 'output',
+      content,
+      createdAt: new Date('2026-09-13T00:00:00.000Z'),
+      metadata: { role: 'tool', toolUseId: `agy-e2e-${id}` },
+    };
+  }
+
+  async function loadSession(rawStore: IRawMessageStore, transcriptStore: ITranscriptEventStore) {
+    const transformer = new TranscriptTransformer(rawStore, transcriptStore, createMockMetadataStore());
+    await transformer.ensureUpToDate(SESSION_ID, PROVIDER);
+    const events = await transcriptStore.getSessionEvents(SESSION_ID);
+    return TranscriptProjector.project(events).messages;
+  }
+
+  it('a description on the raw row survives to the final view-model unchanged', async () => {
+    const row = geminiToolRow(
+      1,
+      JSON.stringify({
+        name: 'list_files',
+        args: { path: '~/.gemini/scratch' },
+        result: 'a.ts\nb.ts',
+        description: 'List scratch directory',
+      }),
+    );
+    const rawStore = createMockRawStore([row]);
+    const transcriptStore = createMockStore();
+
+    const messages = await loadSession(rawStore, transcriptStore);
+
+    const toolMsg = messages.find((m) => m.type === 'tool_call');
+    expect(toolMsg?.toolCall?.toolName).toBe('list_files');
+    expect(toolMsg?.toolCall?.description).toBe('List scratch directory');
+  });
+
+  it('a raw row with no description produces a view-model description of null', async () => {
+    const row = geminiToolRow(
+      2,
+      JSON.stringify({
+        name: 'list_files',
+        args: { path: '~/.gemini/scratch' },
+        result: 'a.ts\nb.ts',
+        // No `description` key at all -- the pre-feature row shape.
+      }),
+    );
+    const rawStore = createMockRawStore([row]);
+    const transcriptStore = createMockStore();
+
+    const messages = await loadSession(rawStore, transcriptStore);
+
+    const toolMsg = messages.find((m) => m.type === 'tool_call');
+    expect(toolMsg?.toolCall?.toolName).toBe('list_files');
+    expect(toolMsg?.toolCall?.description).toBeNull();
+  });
+
+  it('a description survives a simulated reload (full reparse from the raw row)', async () => {
+    // Canonical events are rebuilt from the raw log, not cached across loads.
+    // `forceReparseSession` is the production entry point for exactly this --
+    // it wipes a session's canonical events and re-runs the parser over the
+    // raw log from scratch, which is what a reload does for any session
+    // whose transform version doesn't match the current one.
+    const row = geminiToolRow(
+      3,
+      JSON.stringify({
+        name: 'list_files',
+        args: { path: '~/.gemini/scratch' },
+        result: 'a.ts\nb.ts',
+        description: 'List scratch directory',
+      }),
+    );
+    const rawStore = createMockRawStore([row]);
+    const transcriptStore = createMockStore();
+    const transformer = new TranscriptTransformer(rawStore, transcriptStore, createMockMetadataStore());
+
+    await transformer.ensureUpToDate(SESSION_ID, PROVIDER);
+    const firstLoad = TranscriptProjector.project(await transcriptStore.getSessionEvents(SESSION_ID)).messages;
+    expect(firstLoad.find((m) => m.type === 'tool_call')?.toolCall?.description).toBe('List scratch directory');
+
+    await transformer.forceReparseSession(SESSION_ID, PROVIDER);
+    const reloaded = TranscriptProjector.project(await transcriptStore.getSessionEvents(SESSION_ID)).messages;
+    expect(reloaded.find((m) => m.type === 'tool_call')?.toolCall?.description).toBe('List scratch directory');
   });
 });

@@ -72,7 +72,7 @@ export class GeminiAntigravityRawParser implements IRawMessageParser {
   }
 
   private parseToolRow(msg: RawMessage): CanonicalEventDescriptor[] {
-    let row: { name?: unknown; args?: unknown; result?: unknown };
+    let row: { name?: unknown; args?: unknown; result?: unknown; description?: unknown };
     try {
       row = JSON.parse(msg.content) as typeof row;
     } catch {
@@ -97,6 +97,7 @@ export class GeminiAntigravityRawParser implements IRawMessageParser {
         type: 'tool_call_started',
         toolName,
         toolDisplayName: toolName,
+        description: readDescription(row.description),
         arguments: args,
         targetFilePath: readTargetFilePath(args),
         providerToolCallId,
@@ -125,6 +126,18 @@ function readTargetFilePath(args: Record<string, unknown>): string | null {
     if (typeof value === 'string' && value) return value;
   }
   return null;
+}
+
+/**
+ * A weak model may emit `""`, `null`, or a number for `description`, and rows
+ * written before this field existed have no key at all. Anything but a
+ * non-empty trimmed string becomes `undefined` so the descriptor falls back
+ * to the tool name, never an empty or garbage title.
+ */
+function readDescription(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 function safeStringify(value: unknown): string {

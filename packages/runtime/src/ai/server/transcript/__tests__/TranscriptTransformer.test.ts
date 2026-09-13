@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { TranscriptTransformer } from '../TranscriptTransformer';
 import type { IRawMessageStore, RawMessage, ISessionMetadataStore } from '../TranscriptTransformer';
 import type { ITranscriptEventStore, TranscriptEvent } from '../types';
+import { processDescriptor } from '../processDescriptor';
+import { TranscriptWriter } from '../TranscriptWriter';
+import type { ToolCallStartedDescriptor } from '../parsers/IRawMessageParser';
 
 // ---------------------------------------------------------------------------
 // Mock stores
@@ -1876,5 +1879,76 @@ describe('TranscriptTransformer', () => {
       const status = metadataStore.getStatus(SESSION_ID);
       expect(status.transformStatus).toBe('error');
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// processDescriptor -- tool_call_started 'description' forwarding
+// ---------------------------------------------------------------------------
+//
+// Direct descriptor -> writer integration (not routed through a raw parser):
+// exercises the same processDescriptor/TranscriptWriter link the transformer
+// uses internally, to pin that a descriptor's optional `description` field
+// reaches the persisted ToolCallPayload unchanged, and defaults to null when
+// absent.
+describe('processDescriptor: tool_call_started description', () => {
+  const SESSION_ID = 'test-session-description';
+  const PROVIDER = 'claude-code';
+
+  function makeToolCallStartedDescriptor(
+    overrides: Partial<ToolCallStartedDescriptor> = {},
+  ): ToolCallStartedDescriptor {
+    return {
+      type: 'tool_call_started',
+      toolName: 'list_files',
+      toolDisplayName: 'List Files',
+      arguments: { path: '~/.gemini' },
+      providerToolCallId: 'tool-1',
+      ...overrides,
+    };
+  }
+
+  it('forwards a descriptor-provided description onto the ToolCallPayload', async () => {
+    const transcriptStore = createMockTranscriptStore();
+    const writer = new TranscriptWriter(transcriptStore, PROVIDER);
+    const toolEventIds = new Map<string, number>();
+    const subagentEventIds = new Map<string, number>();
+
+    const desc = makeToolCallStartedDescriptor({ description: 'List scratch directory' });
+
+    const event = await processDescriptor(
+      writer,
+      transcriptStore,
+      SESSION_ID,
+      desc,
+      toolEventIds,
+      subagentEventIds,
+    );
+
+    expect(event).not.toBeNull();
+    const payload = event!.payload as any;
+    expect(payload.description).toBe('List scratch directory');
+  });
+
+  it('defaults description to null when the descriptor omits it', async () => {
+    const transcriptStore = createMockTranscriptStore();
+    const writer = new TranscriptWriter(transcriptStore, PROVIDER);
+    const toolEventIds = new Map<string, number>();
+    const subagentEventIds = new Map<string, number>();
+
+    const desc = makeToolCallStartedDescriptor();
+
+    const event = await processDescriptor(
+      writer,
+      transcriptStore,
+      SESSION_ID,
+      desc,
+      toolEventIds,
+      subagentEventIds,
+    );
+
+    expect(event).not.toBeNull();
+    const payload = event!.payload as any;
+    expect(payload.description).toBeNull();
   });
 });
