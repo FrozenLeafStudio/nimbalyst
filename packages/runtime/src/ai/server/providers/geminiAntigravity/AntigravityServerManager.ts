@@ -24,6 +24,8 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { randomUUID } from 'crypto';
 import { acquireSpawnLock, releaseSpawnLock } from './spawnLock';
+// LOCAL DEBUG ONLY -- drop with the debug commit.
+import { logEvent, started, clampPayload } from './debugLog';
 
 const SERVICE = 'exa.language_server_pb.LanguageServerService';
 
@@ -437,10 +439,19 @@ export class AntigravityServerManager {
       const enumName = modelKeyOrEnum.startsWith('MODEL_')
         ? modelKeyOrEnum
         : await this.resolveModelEnum(modelKeyOrEnum, ep);
+      const elapsed = started();
+      logEvent('rpc_start', {
+        method: 'GetModelResponse', attempt, model: enumName,
+        promptBytes: prompt.length, timeoutMs, port: ep.httpsPort, owned: ep.owned,
+      });
       try {
         const res = await this.rpc<{ response?: string }>(
           'GetModelResponse', { prompt, model: enumName }, ep, timeoutMs, abortSignal);
         const text = res.response ?? '';
+        logEvent('rpc_end', {
+          outcome: 'ok', attempt, ms: elapsed(), responseBytes: text.length,
+          response: clampPayload(text),
+        });
         if (typeof text === 'string' && text.includes('no longer supported')) {
           this.noteVersionGateRejection();
           this.stop();
@@ -459,12 +470,18 @@ export class AntigravityServerManager {
         const msg = err instanceof Error ? err.message : String(err);
         const isTimeout = msg.includes('timed out');
         const isHttp4xx = /HTTP 4\d\d/.test(msg);
+        logEvent('rpc_end', {
+          outcome: isTimeout ? 'timeout' : 'error', attempt, ms: elapsed(),
+          promptBytes: prompt.length, timeoutMs, error: msg,
+        });
         if (!isTimeout || isHttp4xx || attempt >= MAX_ATTEMPTS) throw err;
         // A timeout says nothing about whether the server is alive. Ask it.
         // Still healthy means the generation is simply not finished, and
         // re-running it would discard the progress already made. Only a server
         // that has actually died is worth a second attempt.
-        if (await this.isHealthy(ep)) throw err;
+        const healthy = await this.isHealthy(ep);
+        logEvent('health_check', { attempt, healthy, decision: healthy ? 'give-up' : 'respawn' });
+        if (healthy) throw err;
         // Stop rather than forget: discovery matches any `--subclient_type hub`
         // process, so our own child would come back as `owned: false`.
         if (ep.owned) this.stop();
