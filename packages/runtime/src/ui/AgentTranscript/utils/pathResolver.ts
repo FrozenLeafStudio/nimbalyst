@@ -229,7 +229,9 @@ export function formatToolArguments(
       return parts.join(' ');
     }
 
-    case 'bash': {
+    // 'run_command' is Gemini's name for the same thing Claude calls 'bash'.
+    case 'bash':
+    case 'run_command': {
       const command = args.command;
       if (command) {
         return command.length > 50 ? command.slice(0, 50) + '...' : command;

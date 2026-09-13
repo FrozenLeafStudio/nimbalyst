@@ -607,6 +607,18 @@ const isEditToolName = (name?: string): boolean => {
 
 const WRITE_TOOL_NAMES = new Set(['write', 'notebookedit']);
 
+// Tool names that are read-only across every built-in provider. Deliberately a
+// denylist rather than trying to enumerate every tool that CAN write: missing
+// a read-only name here just leaves today's behavior (the affordance still
+// offered, mildly redundant) rather than risking hiding a real one.
+const READ_ONLY_TOOL_NAMES = new Set([
+  'read', 'glob', 'grep', 'ls',
+  'read_file', 'list_files', 'search_files',
+]);
+
+const isKnownReadOnlyTool = (name?: string): boolean =>
+  !!name && READ_ONLY_TOOL_NAMES.has(name.toLowerCase());
+
 /**
  * The interactive-prompt tool set and the MCP prefix rule live in
  * `ai/server/interactivePromptTools` because the transcript parser and the live
@@ -1718,7 +1730,11 @@ export const RichTranscriptView = React.forwardRef<
     const isSubAgent = toolMsg.type === 'subagent';
     const isTeammate = isSubAgent && !!(toolMsg.subagent?.teammateName || toolMsg.subagent?.teamName);
     const hasChildren = isSubAgent && toolMsg.subagent?.childEvents && toolMsg.subagent.childEvents.length > 0;
-    const lazyDiffLoader = tool.providerToolCallId && loadToolCallDiffs
+    // A known read-only call (list_files, read_file, Grep, ...) cannot have
+    // produced a file change, so never offer to load one -- the affordance
+    // showed up on every Gemini call regardless of tool, because Gemini sets
+    // providerToolCallId on all of them, read or write.
+    const lazyDiffLoader = tool.providerToolCallId && loadToolCallDiffs && !isKnownReadOnlyTool(tool.toolName)
       ? () => loadToolCallDiffs(tool.providerToolCallId!, toolMsg.createdAt?.getTime())
       : undefined;
 
@@ -1827,6 +1843,18 @@ export const RichTranscriptView = React.forwardRef<
         {toolMsg.subagent?.model}{toolMsg.subagent?.model && toolMsg.subagent?.reasoningEffort ? ' · ' : ''}{toolMsg.subagent?.reasoningEffort}
       </span>
     ) : null;
+    // The collapsed secondary line already shows the full value when the call
+    // takes exactly one argument and it's a path -- e.g. `read_file
+    // README.md`. Expanding to a JSON panel for `{"path": "README.md"}` then
+    // shows nothing new. Keyed on the same property names
+    // `formatToolArguments`'s default branch reads, so this tracks whatever
+    // the summary actually renders rather than guessing independently.
+    const argKeys = tool.arguments ? Object.keys(tool.arguments) : [];
+    const singleArgIsPathOnly =
+      argKeys.length === 1 &&
+      ['file_path', 'path', 'filePath', 'file'].includes(argKeys[0]) &&
+      typeof (tool.arguments as Record<string, unknown>)[argKeys[0]] === 'string';
+
     const argsNode = !isSubAgent && tool.arguments ? (() => {
       const argStr = formatToolArguments(tool.toolName, tool.arguments, workspacePath);
       if (!argStr) return null;
@@ -1982,8 +2010,9 @@ export const RichTranscriptView = React.forwardRef<
                 </details>
               )}
 
-              {/* Show regular tool arguments (not for sub-agents) */}
-              {!isSubAgent && tool.arguments && Object.keys(tool.arguments).length > 0 && (
+              {/* Show regular tool arguments (not for sub-agents), unless the
+                  collapsed line above already showed the whole thing */}
+              {!isSubAgent && tool.arguments && argKeys.length > 0 && !singleArgIsPathOnly && (
                 <div className="rich-transcript-tool-section mb-1.5">
                   <div className="rich-transcript-tool-section-label text-[var(--nim-text-faint)] mb-0.5 text-xs">Arguments:</div>
                   <JSONViewer data={tool.arguments} maxHeight="16rem" />

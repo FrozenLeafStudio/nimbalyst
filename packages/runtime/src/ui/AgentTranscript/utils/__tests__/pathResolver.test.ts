@@ -172,6 +172,26 @@ describe('pathResolver', () => {
       });
     });
 
+    // Gemini's name for the same tool Claude calls 'Bash'. Before this shared
+    // a case with 'bash', it fell through to the generic default branch,
+    // which truncates the first two arg values to 20 characters -- losing
+    // most of a real shell command in the collapsed transcript line.
+    describe('run_command tool (Gemini)', () => {
+      it('should format command the same way as Bash', () => {
+        const args = { command: 'git log --oneline -10' };
+        const result = formatToolArguments('run_command', args, workspacePath);
+        expect(result).toBe('git log --oneline -10');
+      });
+
+      it('should truncate long commands at 50 chars, not the generic 20', () => {
+        const args = { command: 'very long command '.repeat(10) };
+        const result = formatToolArguments('run_command', args, workspacePath);
+        expect(result).toContain('...');
+        expect(result.length).toBeLessThanOrEqual(53);
+        expect(result.length).toBeGreaterThan(23); // longer than the 20-char generic fallback + '...'
+      });
+    });
+
     describe('Unknown tools', () => {
       it('should try to extract file path from common properties', () => {
         const args = { filePath: '/Users/john/projects/myapp/src/test.ts' };

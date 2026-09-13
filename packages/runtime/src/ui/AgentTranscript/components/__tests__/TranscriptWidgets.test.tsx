@@ -470,6 +470,113 @@ describe('RichTranscriptView generic tool card - title rendering', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  function makeToolCall(overrides: Partial<TranscriptViewMessage['toolCall']>): TranscriptViewMessage {
+    const base = makeGenericToolMessage('A title');
+    return { ...base, toolCall: { ...base.toolCall!, ...overrides } };
+  }
+
+  it('does not offer to load file changes for a known read-only tool', async () => {
+    stubRenderGlobals();
+    let unmount: (() => void) | undefined;
+    try {
+      const loadToolCallDiffs = vi.fn();
+      const rendered = render(
+        <RichTranscriptView
+          sessionId="ro-1"
+          sessionStatus="idle"
+          messages={[makeToolCall({ toolName: 'read_file', arguments: { path: 'README.md' } })]}
+          persistScrollState={false}
+          loadToolCallDiffs={loadToolCallDiffs}
+        />
+      );
+      unmount = rendered.unmount;
+
+      fireEvent.click(screen.getByText('A title').closest('button')!);
+      // A role-based query here trips a jsdom/nwsapi quirk with Tailwind's
+      // bracketed arbitrary-value classes (text-[0.7rem]) elsewhere in the
+      // same button; the text is exactly what a user would see, so assert on
+      // that instead of computing an accessible name.
+      expect(screen.queryByText('File Changes')).toBeNull();
+    } finally {
+      unmount?.();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('still offers to load file changes for a tool that can write', async () => {
+    stubRenderGlobals();
+    let unmount: (() => void) | undefined;
+    try {
+      const loadToolCallDiffs = vi.fn();
+      const rendered = render(
+        <RichTranscriptView
+          sessionId="rw-1"
+          sessionStatus="idle"
+          messages={[makeToolCall({
+            toolName: 'write_file',
+            arguments: { path: 'notes.md', content: 'hello' },
+          })]}
+          persistScrollState={false}
+          loadToolCallDiffs={loadToolCallDiffs}
+        />
+      );
+      unmount = rendered.unmount;
+
+      fireEvent.click(screen.getByText('A title').closest('button')!);
+      expect(screen.queryByText('File Changes')).not.toBeNull();
+    } finally {
+      unmount?.();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('hides the Arguments panel when the collapsed line already showed the only argument', () => {
+    stubRenderGlobals();
+    let unmount: (() => void) | undefined;
+    try {
+      const rendered = render(
+        <RichTranscriptView
+          sessionId="args-1"
+          sessionStatus="idle"
+          messages={[makeToolCall({ toolName: 'read_file', arguments: { path: 'README.md' } })]}
+          persistScrollState={false}
+        />
+      );
+      unmount = rendered.unmount;
+
+      fireEvent.click(screen.getByText('A title').closest('button')!);
+      expect(screen.queryByText('Arguments:')).toBeNull();
+    } finally {
+      unmount?.();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('keeps the Arguments panel when there is more than the collapsed line shows', () => {
+    stubRenderGlobals();
+    let unmount: (() => void) | undefined;
+    try {
+      const rendered = render(
+        <RichTranscriptView
+          sessionId="args-2"
+          sessionStatus="idle"
+          messages={[makeToolCall({
+            toolName: 'write_file',
+            arguments: { path: 'notes.md', content: 'hello world' },
+          })]}
+          persistScrollState={false}
+        />
+      );
+      unmount = rendered.unmount;
+
+      fireEvent.click(screen.getByText('A title').closest('button')!);
+      expect(screen.queryByText('Arguments:')).not.toBeNull();
+    } finally {
+      unmount?.();
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 // ============================================================================
