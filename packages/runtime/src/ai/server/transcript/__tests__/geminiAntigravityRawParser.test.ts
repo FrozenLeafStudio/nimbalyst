@@ -102,6 +102,61 @@ describe('GeminiAntigravityRawParser', () => {
     });
   });
 
+  it('reads a description off the tool row and trims it', async () => {
+    const out = await parser.parseMessage(
+      raw({
+        content: JSON.stringify({
+          name: 'list_files',
+          args: { path: '~/.gemini/scratch' },
+          result: 'a.ts\nb.ts',
+          description: '  List scratch directory  ',
+        }),
+        metadata: { role: 'tool', toolUseId: 'agy-123-2' },
+      }),
+      CONTEXT,
+    );
+    expect(out[0]).toMatchObject({
+      type: 'tool_call_started',
+      description: 'List scratch directory',
+    });
+  });
+
+  it('leaves description undefined for a row with no such key (pre-feature row)', async () => {
+    const out = await parser.parseMessage(
+      raw({
+        content: JSON.stringify({
+          name: 'write_file',
+          args: { path: 'src/a.ts', content: 'x' },
+          result: 'Wrote src/a.ts (1 bytes, 1 line(s)).',
+        }),
+        metadata: { role: 'tool', toolUseId: 'agy-123-3' },
+      }),
+      CONTEXT,
+    );
+    expect((out[0] as { description?: unknown }).description).toBeUndefined();
+  });
+
+  it.each([
+    ['empty string', ''],
+    ['whitespace only', '   '],
+    ['wrong type (number)', 123],
+    ['explicit null', null],
+  ])('drops a garbage description: %s', async (_label, description) => {
+    const out = await parser.parseMessage(
+      raw({
+        content: JSON.stringify({
+          name: 'list_files',
+          args: { path: '.' },
+          result: 'ok',
+          description,
+        }),
+        metadata: { role: 'tool', toolUseId: 'agy-123-4' },
+      }),
+      CONTEXT,
+    );
+    expect((out[0] as { description?: unknown }).description).toBeUndefined();
+  });
+
   it('marks a failed tool call as an error', async () => {
     const out = await parser.parseMessage(
       raw({
