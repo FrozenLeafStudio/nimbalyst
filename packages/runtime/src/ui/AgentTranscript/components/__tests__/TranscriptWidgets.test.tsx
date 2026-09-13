@@ -22,8 +22,28 @@ import * as rtl from '@testing-library/react';
 import { createStore, Provider as JotaiProvider } from 'jotai';
 import type { TranscriptViewMessage } from '../../../../ai/server/transcript/TranscriptProjector';
 import type { CustomToolWidgetProps } from '../CustomToolWidgets/index';
+import { RichTranscriptView } from '../RichTranscriptView';
 
 const { render, screen, fireEvent, waitFor } = rtl;
+
+// RichTranscriptView virtualizes the message list with `virtua`; render its children
+// directly so the generic tool card tests below can query the real DOM.
+vi.mock('virtua', async () => {
+  const ReactModule = await import('react');
+  return {
+    VList: ReactModule.forwardRef(({ children }: { children: React.ReactNode }, ref) => {
+      ReactModule.useImperativeHandle(ref, () => ({
+        cache: undefined,
+        scrollOffset: 0,
+        scrollSize: 300,
+        viewportSize: 100,
+        findItemIndex: () => 0,
+        scrollToIndex: vi.fn(),
+      }));
+      return <div data-testid="mock-vlist">{ReactModule.Children.toArray(children)}</div>;
+    }),
+  };
+});
 
 // Mock clipboard
 vi.mock('../../../../utils/clipboard', () => ({
@@ -339,6 +359,116 @@ describe('MessageSegment', () => {
     );
     expect(screen.getByText('screenshot.png')).toBeDefined();
     expect(screen.getByText('1.0 KB')).toBeDefined();
+  });
+});
+
+// ============================================================================
+// RichTranscriptView generic tool card - title rendering
+//
+// MessageSegment's own tool-call render (tested above) is dead in production --
+// only reachable with showToolCalls={true}, which RichTranscriptView never passes.
+// These tests render RichTranscriptView directly instead.
+// ============================================================================
+
+describe('RichTranscriptView generic tool card - title rendering', () => {
+  function makeGenericToolMessage(description: string | null): TranscriptViewMessage {
+    return {
+      id: 1,
+      sequence: 1,
+      createdAt: new Date(1_784_648_445_000),
+      type: 'tool_call',
+      subagentId: null,
+      toolCall: {
+        toolName: 'list_files',
+        toolDisplayName: 'list_files',
+        status: 'completed',
+        description,
+        arguments: { path: '~/.gemini/scratch' },
+        targetFilePath: null,
+        mcpServer: null,
+        mcpTool: null,
+        providerToolCallId: 'tool-title-1',
+        progress: [],
+        result: 'file1.txt\nfile2.txt',
+      },
+    };
+  }
+
+  // Stub/unstub by hand per test rather than via beforeEach/afterEach: RTL's auto-cleanup
+  // unmount needs CSS still stubbed, and the sync requestAnimationFrame stub must not leak
+  // into later elapsed-timer tests (it recurses synchronously and blows the call stack).
+  function stubRenderGlobals() {
+    vi.stubGlobal('CSS', { highlights: { delete: vi.fn(), set: vi.fn() } });
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0);
+      return 1;
+    });
+  }
+
+  it('renders exactly today\'s single-line card when description is absent (no regression)', () => {
+    stubRenderGlobals();
+    let unmount: (() => void) | undefined;
+    try {
+      const rendered = render(
+        <RichTranscriptView
+          sessionId="title-1"
+          sessionStatus="idle"
+          messages={[makeGenericToolMessage(null)]}
+          persistScrollState={false}
+        />
+      );
+      unmount = rendered.unmount;
+      const { container } = rendered;
+
+      // No title line at all - no reserved empty space.
+      expect(container.querySelector('.rich-transcript-tool-title')).toBeNull();
+
+      // The name span renders directly inside the button, not wrapped in the
+      // two-line flex-col container.
+      const nameSpan = container.querySelector('.rich-transcript-tool-name');
+      expect(nameSpan).not.toBeNull();
+      expect(nameSpan?.parentElement?.classList.contains('rich-transcript-tool-button')).toBe(true);
+      expect(nameSpan?.textContent).toContain('list_files');
+    } finally {
+      unmount?.();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('renders a two-line card with the title as primary and name/args as secondary when description is present', () => {
+    stubRenderGlobals();
+    let unmount: (() => void) | undefined;
+    try {
+      const rendered = render(
+        <RichTranscriptView
+          sessionId="title-2"
+          sessionStatus="idle"
+          messages={[makeGenericToolMessage('List scratch directory')]}
+          persistScrollState={false}
+        />
+      );
+      unmount = rendered.unmount;
+      const { container } = rendered;
+
+      const titleEl = container.querySelector('.rich-transcript-tool-title');
+      expect(titleEl).not.toBeNull();
+      expect(titleEl?.textContent).toBe('List scratch directory');
+
+      // Secondary line still carries the original name + args render.
+      const nameSpan = container.querySelector('.rich-transcript-tool-name');
+      expect(nameSpan).not.toBeNull();
+      expect(nameSpan?.textContent).toContain('list_files');
+
+      const argsEl = container.querySelector('.rich-transcript-tool-args');
+      expect(argsEl).not.toBeNull();
+      expect(argsEl?.textContent?.length).toBeGreaterThan(0);
+
+      // Title and name/args are siblings within the wrapper, not the button directly.
+      expect(nameSpan?.parentElement?.classList.contains('rich-transcript-tool-button')).toBe(false);
+    } finally {
+      unmount?.();
+      vi.unstubAllGlobals();
+    }
   });
 });
 
