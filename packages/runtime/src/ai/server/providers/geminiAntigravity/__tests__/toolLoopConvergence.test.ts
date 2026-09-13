@@ -104,8 +104,60 @@ describe('AntigravityToolLoopProtocol convergence hardening', () => {
     const events = await drain(proto.run('task', 'sys', LIST_TOOL, async () => 'x'));
 
     const text = events.find((e) => e.type === 'text') as Extract<Ev, { type: 'text' }>;
-    expect(text?.content).toBe('[Agent reached tool-call iteration limit]');
+    // The stub now carries a state summary after the first line (below), so
+    // pin only the line that other callers/greps match on.
+    expect(text?.content.split('\n')[0]).toBe('[Agent reached tool-call iteration limit]');
     expect(events[events.length - 1].type).toBe('complete');
+  });
+
+  it('appends a state summary to the limit stub when the nudge yields nothing usable', async () => {
+    // The nudge call itself fabricates ANOTHER tool-call envelope instead of
+    // real text -- stripToolCallJson strips it to empty, so the loop falls
+    // through to the stub. This is the turn-3 failure mode from the field log
+    // (40 iterations, 33 run_command, 0 write_file): a bare stub with no lead.
+    let call = 0;
+    const RUN_TOOL = [{ type: 'function' as const, function: { name: 'run_command' } }];
+    const { proto } = makeProto(async () => {
+      call++;
+      if (call <= 2) return '{"tool_call":{"name":"run_command","arguments":{"command":"git status"}}}';
+      return '{"tool_call":{"name":"read_file","arguments":{"path":"ghost.md"}}}';
+    }, 2);
+
+    const events = await drain(
+      proto.run('investigate the failing build', 'sys', RUN_TOOL, async () => 'exit code: 0\nstdout: ok'),
+    );
+
+    const text = events.find((e) => e.type === 'text') as Extract<Ev, { type: 'text' }>;
+    const lines = text?.content.split('\n') ?? [];
+    expect(lines[0]).toBe('[Agent reached tool-call iteration limit]');
+    expect(text?.content).toContain('Request: investigate the failing build');
+    expect(text?.content).toContain('Tool calls made this turn (2 total):');
+    expect(text?.content).toContain('- run_command git status (x2)');
+    expect(text?.content).toContain('Recent tool results:');
+    expect(text?.content).toContain('run_command: exit code: 0 stdout: ok');
+    expect(text?.content).toContain(
+      'The turn hit the tool-call limit without completing the requested action.',
+    );
+    expect(events[events.length - 1].type).toBe('complete');
+  });
+
+  it('leaves the nudge text untouched when it yields real usable text (unchanged behaviour)', async () => {
+    // Covered structurally by 'force-synthesizes a real answer at the iteration
+    // cap instead of the stub' above; this pins that the summary machinery is
+    // NOT invoked on that branch -- the content is exactly the nudge's text.
+    let call = 0;
+    const { proto } = makeProto(async () => {
+      call++;
+      return call <= 2
+        ? '{"tool_call":{"name":"list_files","arguments":{"path":"."}}}'
+        : 'Final synthesized answer from gathered context.';
+    }, 2);
+
+    const events = await drain(proto.run('task', 'sys', LIST_TOOL, async () => 'x'));
+
+    const text = events.find((e) => e.type === 'text') as Extract<Ev, { type: 'text' }>;
+    expect(text?.content).toBe('Final synthesized answer from gathered context.');
+    expect(text?.content.startsWith('[Agent reached tool-call iteration limit]')).toBe(false);
   });
 
   it('stores only the compact tool-call envelope in history, not hallucinated thinking text', async () => {

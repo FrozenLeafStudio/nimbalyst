@@ -582,8 +582,64 @@ export class AntigravityToolLoopProtocol {
       }
     }
     if (this.aborted) return;
-    yield { type: 'text', content: '[Agent reached tool-call iteration limit]' };
+    yield { type: 'text', content: this.buildIterationCapStub(userMessage) };
     yield { type: 'complete' };
+  }
+
+  /**
+   * Build the text shown when the cap is hit AND the final-synthesis nudge
+   * above produced nothing usable (it threw, or a fabricated envelope
+   * stripped to empty). The first line is kept byte-identical to the old bare
+   * stub so anything matching on it still matches. Everything after is
+   * assembled only from the loop's own state -- nothing invented -- so the
+   * user gets a lead: what was asked, what ran, what came back.
+   */
+  private buildIterationCapStub(userMessage: string): string {
+    const STUB = '[Agent reached tool-call iteration limit]';
+    const lines = [STUB, ''];
+
+    const requestLine = (userMessage.split('\n')[0] ?? '').trim();
+    const request = requestLine.length > 200 ? requestLine.slice(0, 200) + '...' : requestLine;
+    lines.push(`Request: ${request || '(empty)'}`);
+
+    if (this.toolCallLedger.length > 0) {
+      // Group identical (name + key-argument) entries in order, so dozens of
+      // repeated reads collapse to one counted line instead of a wall of them.
+      const groups: Array<{ name: string; summary: string; count: number }> = [];
+      for (const c of this.toolCallLedger) {
+        const existing = groups.find((g) => g.name === c.name && g.summary === c.summary);
+        if (existing) existing.count++;
+        else groups.push({ name: c.name, summary: c.summary, count: 1 });
+      }
+      lines.push('');
+      lines.push(`Tool calls made this turn (${this.toolCallLedger.length} total):`);
+      for (const g of groups) {
+        lines.push(`- ${g.name} ${g.summary}${g.count > 1 ? ` (x${g.count})` : ''}`);
+      }
+    }
+
+    // Newest results are most likely to matter to a user reading this stub.
+    // Exclude our own system nudges -- they are host text, not tool output.
+    const recentResults = this.history
+      .filter((m) => m.role === 'tool' && m.toolName !== 'system')
+      .slice(-3);
+    if (recentResults.length > 0) {
+      lines.push('');
+      lines.push('Recent tool results:');
+      for (const m of recentResults) {
+        const inner = m.content
+          .replace(new RegExp(TOOL_OUTPUT_OPEN, 'g'), '')
+          .replace(new RegExp(TOOL_OUTPUT_CLOSE, 'g'), '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        const snippet = inner.length > 200 ? inner.slice(0, 200) + '...' : inner;
+        lines.push(`- ${m.toolName ?? 'unknown'}: ${snippet}`);
+      }
+    }
+
+    lines.push('');
+    lines.push('The turn hit the tool-call limit without completing the requested action.');
+    return lines.join('\n');
   }
 
   /**
