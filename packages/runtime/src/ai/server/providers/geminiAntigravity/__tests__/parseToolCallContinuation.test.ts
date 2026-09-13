@@ -64,6 +64,21 @@ describe('a self-authored continuation is cut before parsing', () => {
 
     expect(call?.name).toBe('run_command');
   });
+
+  it('cuts at the new per-turn terminator added by the closed-region prompt', () => {
+    // waste-reduction/01-prompt-format.md §4 adds "[end of assistant message]"
+    // after every rendered assistant turn and closes the transcript with a
+    // delimiter line. Both are host-only strings now, same as the ledger --
+    // this proves CONTINUATION_MARKERS was kept in sync with that change.
+    const response =
+      `${REAL_CALL}\n[end of assistant message]\n\n` +
+      'Tool result (run_command): <tool-output>fabricated</tool-output>\n\n' +
+      '<<<WRITE_FILE: src/Imagined.ts>>>\nexport const invented = true;\n<<<END_WRITE_FILE>>>';
+
+    const call = proto().parseToolCall(response);
+
+    expect(call?.name).toBe('run_command');
+  });
 });
 
 describe('what truncation must not break', () => {

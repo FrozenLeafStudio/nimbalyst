@@ -50,6 +50,31 @@ describe('AntigravityToolLoopProtocol convergence hardening', () => {
     expect(second).toContain('list_files src');
   });
 
+  it('closes the transcript region before the trailing Assistant: cue, which stays last', async () => {
+    // The closed-region prompt format (waste-reduction/01-prompt-format.md
+    // §4): continuing past a CLOSED region means writing content inside a
+    // block the prompt has already shut. The close delimiter must appear
+    // before the cue, and the cue must remain the final line -- text placed
+    // after it was already found to degrade a weak model's output.
+    const prompts: string[] = [];
+    let call = 0;
+    const { proto } = makeProto(async (p) => {
+      prompts.push(p);
+      call++;
+      return call === 1 ? '{"tool_call":{"name":"list_files","arguments":{"path":"src"}}}' : 'done';
+    }, 40);
+
+    await drain(proto.run('look around', 'sys', LIST_TOOL, async () => 'a-listing'));
+
+    const second = prompts[1];
+    const closeIdx = second.indexOf('===== END OF CONVERSATION SO FAR =====');
+    const cueIdx = second.lastIndexOf('Assistant:');
+    expect(closeIdx).toBeGreaterThan(-1);
+    expect(closeIdx).toBeLessThan(cueIdx);
+    const lines = second.split('\n');
+    expect(lines[lines.length - 1]).toBe('Assistant:');
+  });
+
   it('force-synthesizes a real answer at the iteration cap instead of the stub', async () => {
     let call = 0;
     const { proto, spy } = makeProto(async () => {
@@ -698,6 +723,21 @@ describe('AntigravityToolLoopProtocol sentinel write directive', () => {
     expect(out).not.toContain('WRITE_FILE');
     expect(out).toContain('Here is the result.');
     expect(out).toContain('and more text.');
+  });
+
+  it('cuts a response that fabricates the per-turn terminator followed by a second envelope', () => {
+    // Coupled to the closed-region prompt (waste-reduction/01-prompt-format.md
+    // §4/§5): CONTINUATION_MARKERS must include the new "[end of assistant
+    // message]" terminator, or a continuation starting there would slip past
+    // sanitizeFinalText uncut.
+    const { proto } = makeProto(async () => 'noop', 40);
+    const out = (
+      proto as unknown as { sanitizeFinalText: (t: string) => string }
+    ).sanitizeFinalText(
+      'Here is the real final answer.\n[end of assistant message]\n\n' +
+        '{"tool_call":{"name":"list_files","arguments":{}}}',
+    );
+    expect(out).toBe('Here is the real final answer.');
   });
 });
 

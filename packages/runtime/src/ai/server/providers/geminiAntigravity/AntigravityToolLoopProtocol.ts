@@ -66,6 +66,20 @@ export interface ProtocolMessage {
 const TOOL_OUTPUT_OPEN = '<tool-output>';
 const TOOL_OUTPUT_CLOSE = '</tool-output>';
 
+/**
+ * Opens/closes the read-only transcript region in `renderPrompt`. A chat-tuned
+ * model handed a document ending in "Assistant:" treats the job as finishing
+ * that document, which means writing every remaining speaker - re-labelling
+ * "Tool result (" doesn't change that frame, a document author still writes
+ * all speakers. Putting the transcript inside an explicitly CLOSED region
+ * changes the frame: continuing past the close means writing content inside a
+ * block the prompt has already shut. Module-level (not class-static) so
+ * CONTINUATION_MARKERS below, which is also module-level, can reference them.
+ */
+const TRANSCRIPT_OPEN =
+  '===== BEGIN CONVERSATION SO FAR (written by the host, read-only) =====';
+const TRANSCRIPT_CLOSE = '===== END OF CONVERSATION SO FAR =====';
+
 // Max times per turn we re-prompt a model that described a tool call in prose
 // instead of emitting the JSON envelope, before accepting its text as final.
 const MAX_SOFT_MISSES = 2;
@@ -121,6 +135,12 @@ const CONTINUATION_MARKERS = [
   '\nInput to tool:',
   '\nOutput from ',
   '\n[Progress:',
+  // Added with the closed-region prompt: the per-turn terminator and the
+  // region delimiters are host-only strings too, so a continuation that
+  // reproduces them is cut the same way as the older markers above.
+  '\n[end of assistant message]',
+  '\n' + TRANSCRIPT_OPEN,
+  '\n' + TRANSCRIPT_CLOSE,
 ];
 
 /** Offset of the earliest continuation marker, or -1 when there is none. */
@@ -923,15 +943,23 @@ export class AntigravityToolLoopProtocol {
       if (pairedToolKept || hasNoResult) keepAssistantIdx.add(i);
     }
 
+    parts.push(TRANSCRIPT_OPEN);
+    parts.push('');
+
     for (let i = 0; i < this.history.length; i++) {
       const msg = this.history[i];
       if (msg.role === 'user') {
         parts.push(`User: ${msg.content}`);
       } else if (msg.role === 'assistant') {
+        // Every prior assistant turn is explicitly terminated, so the document
+        // contains a precedent for an assistant turn ENDING, not just for one
+        // being followed by a tool result.
         if (keepAssistantIdx.has(i)) {
-          parts.push(`Assistant: ${msg.content}`);
+          parts.push(`Assistant: ${msg.content}\n[end of assistant message]`);
         } else {
-          parts.push('Assistant: [earlier tool call omitted - see progress ledger below]');
+          parts.push(
+            'Assistant: [earlier tool call omitted - see progress ledger below]\n[end of assistant message]',
+          );
         }
       } else if (msg.role === 'tool') {
         if (keepToolIdx.has(i)) {
@@ -946,6 +974,9 @@ export class AntigravityToolLoopProtocol {
       parts.push('');
     }
 
+    // Host scaffolding, inside the closed region: it was measured being
+    // copied verbatim into the model's own output when it sat in the open
+    // stream just before the trailing cue.
     if (this.toolCallLedger.length > 0) {
       const inspected = this.toolCallLedger.map((c) => `- ${c.name} ${c.summary}`).join('\n');
       parts.push(
@@ -956,6 +987,25 @@ export class AntigravityToolLoopProtocol {
       parts.push('');
     }
 
+    parts.push(TRANSCRIPT_CLOSE);
+    parts.push('');
+
+    // The stop contract: placed BEFORE the trailing "Assistant:" cue, never
+    // after it. The finalize call above (~line 551) already established that
+    // appending anything after the cue malforms the turn structure for a weak
+    // model, so this instructs, then leaves the cue last.
+    parts.push(
+      'Everything above was written by the host, not by you, and is now closed. Write ONLY ' +
+        'the next single assistant message, then stop. It must be exactly one of:',
+    );
+    parts.push('  (a) one {"tool_call":{...}} JSON envelope and nothing else; or');
+    parts.push('  (b) your final answer as plain text, with no JSON.');
+    parts.push(
+      'You cannot see what a tool returns until you stop and the host runs it. Any ' +
+        '"Tool result (", "<tool-output>", "[Progress:", "User:" or second envelope you write ' +
+        'would be fiction, is discarded by the host, and wastes the turn. Write one message only.',
+    );
+    parts.push('');
     parts.push('Assistant:');
     return parts.join('\n');
   }
@@ -1313,9 +1363,18 @@ export class AntigravityToolLoopProtocol {
     // utf-8 plain text.
     const neutralized = capped.replace(/tool_call/g, 'tool_<<escaped>>_call');
     // Also strip pre-existing wrapping tags so we don't double-wrap on resume.
+    // The transcript region delimiters are stripped too -- since a real result
+    // is rendered INSIDE that region, a tool that emitted either literal
+    // string could otherwise close the region early or open a fake one from
+    // inside supposedly-inert data. (Contains parentheses, so split/join
+    // instead of a RegExp to avoid escaping.)
     const stripped = neutralized
       .replace(new RegExp(TOOL_OUTPUT_OPEN, 'g'), '')
-      .replace(new RegExp(TOOL_OUTPUT_CLOSE, 'g'), '');
+      .replace(new RegExp(TOOL_OUTPUT_CLOSE, 'g'), '')
+      .split(TRANSCRIPT_OPEN)
+      .join('')
+      .split(TRANSCRIPT_CLOSE)
+      .join('');
     return `${TOOL_OUTPUT_OPEN}${stripped}${TOOL_OUTPUT_CLOSE}`;
   }
 }
