@@ -38,6 +38,7 @@ import {
 } from '../atoms/voiceModeState';
 import { voiceModeSettingsAtom, type VoiceModeSettings } from '../atoms/appSettings';
 import { VoiceListenWindowController } from './voiceListenWindow';
+import { hasVoiceAudioSignal } from '../../utils/voiceAudioActivity';
 import { formatGitCommitProposalForVoice } from './voiceInteractivePrompt';
 import { activeSessionIdAtom, agentSessionAttentionAtom, sessionRegistryAtom, sessionHasPendingInteractivePromptAtom, sessionPendingPromptsAtom, sessionProcessingAtom, respondToPromptAtom, refreshSessionListAtom, reloadSessionDataAtom } from '../atoms/sessions';
 import { windowModeAtom } from '../atoms/windowMode';
@@ -93,6 +94,8 @@ export function getCurrentVoiceFilePath(): string | null {
 // while the user is still talking.
 
 let lastSpeechHoldReason: string | null = null;
+// Live has incremental transcripts, not VAD. A hold must be renewed by text.
+const LIVE_SPEECH_LEASE_MS = 1500;
 const listenWindow = new VoiceListenWindowController({
   getWindowMs: () => store.get(voiceModeSettingsAtom).listenWindowMs ?? 15000,
   onExpire: () => {
@@ -107,6 +110,13 @@ const listenWindow = new VoiceListenWindowController({
     lastSpeechHoldReason = reason;
     console.log(`[voiceModeListeners] Listen window held open, user is speaking (${reason})`);
     writeDiagnosticEntry(`Listen window: held open during speech (${reason})`);
+  },
+  onSpeechExpired: () => {
+    _userSpeaking = false;
+    lastSpeechHoldReason = null;
+    console.info('[VoiceSleep] Live speech hold expired without new transcript');
+    if (getVoiceAudioActiveQuery()?.()) schedulePostTurnListenWindow(true);
+    pumpVoiceEvents();
   },
 });
 
@@ -209,6 +219,7 @@ export function sleepVoiceListening(): void {
   _userSpeaking = false;
   clearPostTurnPending();
   store.set(voiceListenStateAtom, 'sleeping');
+  console.info('[VoiceSleep] Idle listening ended; requesting transport pause');
   // Tell main process to suspend the inactivity disconnect timer
   const voiceSessionId = store.get(voiceActiveSessionIdAtom);
   if (voiceSessionId) {
@@ -930,6 +941,12 @@ export function initVoiceModeListeners(): () => void {
       // Wake from sleeping when assistant starts speaking so the mic
       // is open for the user to interrupt or respond.
       // Keep the countdown stopped while assistant audio is playing.
+      if (_voiceEngine === 'live' && !hasVoiceAudioSignal(payload.audioBase64)) {
+        // Preserve stream timing while awake, without cancelling the idle
+        // timer, waking a sleeping session, or marking an announcement heard.
+        if (store.get(voiceListenStateAtom) === 'listening') getVoiceAudioCallback()?.(payload.audioBase64);
+        return;
+      }
       if (store.get(voiceListenStateAtom) === 'sleeping') {
         wakeVoiceListening(false);
       }
@@ -962,7 +979,7 @@ export function initVoiceModeListeners(): () => void {
     }) => {
       if (!isVoiceActive()) return;
       _userSpeaking = true;
-      listenWindow.speechStarted();
+      listenWindow.speechStarted(_voiceEngine === 'live' ? LIVE_SPEECH_LEASE_MS : undefined);
     })
   );
 
@@ -983,7 +1000,8 @@ export function initVoiceModeListeners(): () => void {
       // countdown AND holds later arm requests until speech_stopped.
       // (voice-mode:speech-started normally set this already; interrupt can
       // arrive up to 500ms later on the deferred barge-in path.)
-      listenWindow.speechStarted();
+      // Live's delayed playback-flush decision is not new speech evidence.
+      if (_voiceEngine !== 'live') listenWindow.speechStarted();
 
       // Discard any pending post-turn timer: the user is now driving the
       // turn. If we left it pending, the AudioPlayback.stop() below would
@@ -1218,7 +1236,7 @@ export function initVoiceModeListeners(): () => void {
       // after the user finished.
       if (_voiceEngine === 'live' && payload.delta.trim().length > 0) {
         _userSpeaking = true;
-        listenWindow.speechStarted();
+        listenWindow.speechStarted(LIVE_SPEECH_LEASE_MS);
       }
     })
   );
@@ -1238,10 +1256,12 @@ export function initVoiceModeListeners(): () => void {
       itemId: string;
     }) => {
       if (!isVoiceActive()) return;
-      _userSpeaking = false;
-      lastSpeechHoldReason = null;
-      listenWindow.speechStopped();
-      if (getVoiceAudioActiveQuery()?.()) schedulePostTurnListenWindow(true);
+      if (payload.itemId === _captionItemId) {
+        _userSpeaking = false;
+        lastSpeechHoldReason = null;
+        listenWindow.speechStopped();
+        if (getVoiceAudioActiveQuery()?.()) schedulePostTurnListenWindow(true);
+      }
 
       if (payload.itemId === _captionItemId) {
         _captionItemId = null;
@@ -1273,13 +1293,15 @@ export function initVoiceModeListeners(): () => void {
       if (!isVoiceActive()) return;
 
       // Live text is activity, but its accounting cannot tell us when it ends.
-      if (store.get(voiceListenStateAtom) === 'sleeping') {
-        wakeVoiceListening(false);
-      }
-      listenWindow.clear();
-      if (_voiceEngine === 'live') {
-        if (getVoiceAudioActiveQuery()?.()) schedulePostTurnListenWindow(true);
-        else listenWindow.start('assistant-text');
+      if (_voiceEngine !== 'live' || payload.text.trim().length > 0) {
+        if (store.get(voiceListenStateAtom) === 'sleeping') {
+          wakeVoiceListening(false);
+        }
+        listenWindow.clear();
+        if (_voiceEngine === 'live') {
+          if (getVoiceAudioActiveQuery()?.()) schedulePostTurnListenWindow(true);
+          else listenWindow.start('assistant-text');
+        }
       }
       // Deliberately NOT noting the announcement as heard here: assistant text
       // is the backend having accepted it, and a fragment of the answer already

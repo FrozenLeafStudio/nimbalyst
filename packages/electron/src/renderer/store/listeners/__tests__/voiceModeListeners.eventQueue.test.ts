@@ -97,7 +97,7 @@ async function boot(options?: { listenState?: 'listening' | 'sleeping' }) {
 /** Hand an announcement its audio and let that audio finish playing. */
 async function hearAnnouncement(): Promise<void> {
   const listenersModule = await import('../voiceModeListeners');
-  fire('voice-mode:audio-received', { sessionId: FOCUSED_SESSION, audioBase64: 'AAAA' });
+  fire('voice-mode:audio-received', { sessionId: FOCUSED_SESSION, audioBase64: 'AQABAA==' });
   listenersModule.notifyVoiceAudioPlaybackDrained();
 }
 
@@ -112,6 +112,27 @@ const sentOn = (channel: string): unknown[] =>
   send.mock.calls.filter((call) => call[0] === channel).map((call) => call[1]);
 
 describe('voice listen timeout wiring', () => {
+  it('sleeps despite continuous silent Live output and a lost speech close', async () => {
+    const { store, voice, dispose } = await boot();
+    const { wakeVoiceListening } = await import('../voiceModeListeners');
+    fire('voice-mode:engine-selected', { sessionId: FOCUSED_SESSION, engine: 'live', generation: 7, workspacePath: '/ws' });
+    vi.useFakeTimers();
+    try {
+      wakeVoiceListening();
+      fire('voice-mode:transcript-delta', { sessionId: FOCUSED_SESSION, itemId: 'lost-close', delta: 'hello' });
+      for (let i = 0; i < 180; i++) {
+        if (i === 30) fire('voice-mode:interrupt', { sessionId: FOCUSED_SESSION });
+        fire('voice-mode:audio-received', { sessionId: FOCUSED_SESSION, audioBase64: 'AAAA' });
+        vi.advanceTimersByTime(100);
+      }
+      expect(store.get(voice.voiceListenStateAtom)).toBe('sleeping');
+      fire('voice-mode:audio-received', { sessionId: FOCUSED_SESSION, audioBase64: 'AAAA' });
+      fire('voice-mode:text-received', { sessionId: FOCUSED_SESSION, text: ' ' });
+      expect(store.get(voice.voiceListenStateAtom)).toBe('sleeping');
+      expect(sentOn('voice-mode:listen-state-changed')).toContainEqual(expect.objectContaining({ sleeping: true }));
+    } finally { dispose(); vi.useRealTimers(); }
+  });
+
   it('times out Live text-only output and keeps explicit sleep through a pending audio drain', async () => {
     const { store, voice, dispose } = await boot();
     const { notifyVoiceAudioPlaybackDrained, sleepVoiceListening } = await import('../voiceModeListeners');
@@ -122,7 +143,7 @@ describe('voice listen timeout wiring', () => {
       fire('voice-mode:text-received', { sessionId: FOCUSED_SESSION, text: 'Hello' });
       vi.advanceTimersByTime(15_000);
       expect(store.get(voice.voiceListenStateAtom)).toBe('sleeping');
-      fire('voice-mode:audio-received', { sessionId: FOCUSED_SESSION, audioBase64: 'AAAA' });
+      fire('voice-mode:audio-received', { sessionId: FOCUSED_SESSION, audioBase64: 'AQABAA==' });
       expect(store.get(voice.voiceListenStateAtom)).toBe('listening');
       sleepVoiceListening();
       notifyVoiceAudioPlaybackDrained();
@@ -146,7 +167,7 @@ describe('voice listen timeout wiring', () => {
     vi.useFakeTimers();
     try {
       wakeVoiceListening();
-      fire('voice-mode:audio-received', { sessionId: FOCUSED_SESSION, audioBase64: 'AAAA' });
+      fire('voice-mode:audio-received', { sessionId: FOCUSED_SESSION, audioBase64: 'AQABAA==' });
       if (engine === 'realtime') {
         fire('voice-mode:token-usage', { sessionId: FOCUSED_SESSION, engine, usage: {} });
       }
@@ -252,7 +273,7 @@ describe('voice event queue wiring', () => {
     // a single fragment carries no announcement identity, so it could belong to
     // whatever the model was already saying.
     const { notifyVoiceAudioPlaybackDrained } = await import('../voiceModeListeners');
-    listeners.get('voice-mode:audio-received')?.({ sessionId: FOCUSED_SESSION, audioBase64: 'AAAA' });
+    listeners.get('voice-mode:audio-received')?.({ sessionId: FOCUSED_SESSION, audioBase64: 'AQABAA==' });
     notifyVoiceAudioPlaybackDrained();
 
     // Main forwards the spoken answer with the session the voice agent is
@@ -303,7 +324,7 @@ describe('voice event queue wiring', () => {
     // voice session and PCM and nothing that identifies which announcement it
     // belongs to, so it cannot be told apart from the tail of whatever was
     // already being spoken.
-    fire('voice-mode:audio-received', { sessionId: FOCUSED_SESSION, audioBase64: 'AAAA' });
+    fire('voice-mode:audio-received', { sessionId: FOCUSED_SESSION, audioBase64: 'AQABAA==' });
     expect(sentOn('voice-mode:announce-completion')).toHaveLength(1);
 
     // Our own playback queue draining is the one thing the application owns:
