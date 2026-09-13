@@ -1,14 +1,6 @@
-/**
- * Engine-specific voice settings data and the rules around previewing a voice.
- *
- * The preview trap this guards: `voice-mode:preview-voice` does not reach the
- * speech-to-speech engine at all. It calls a separate TTS endpoint, which has
- * its own, smaller voice list. Passing a name that endpoint does not know fails;
- * passing a name it happens to share produces a sample that is not what the
- * conversation will sound like. So a voice is previewable only when we can name
- * the TTS voice to use, and any stand-in is labelled as one.
- */
+/** Engine-specific voice choices and preview availability. */
 
+import { liveVoicePreviews } from './liveVoicePreviews';
 import type { VoiceEngineId } from '../../store/atoms/voiceModeState';
 
 /**
@@ -38,13 +30,7 @@ export interface VoiceCatalogEntry {
   engines: readonly VoiceEngineId[];
 }
 
-/**
- * Live does not publish its own voice list. Its session config takes the same
- * voice names (the Live startup fixtures use `marin`), so the same catalog is
- * offered on both engines. If an engine rejects a name at startup it reports
- * that itself -- we do not invent a restriction here, and we do not invent
- * Live-only names either.
- */
+/** Built-in voices currently offered by the settings picker. */
 export const VOICE_CATALOG: readonly VoiceCatalogEntry[] = [
   { id: 'ash', name: 'Ash', description: 'Clear and confident', gender: 'male', engines: ['realtime', 'live'] },
   { id: 'echo', name: 'Echo', description: 'Smooth and resonant', gender: 'male', engines: ['realtime', 'live'] },
@@ -92,6 +78,14 @@ export interface VoicePreviewEligibility {
 }
 
 export function previewEligibility(engine: VoiceEngineId, voiceId: string): VoicePreviewEligibility {
+  if (engine === 'live') {
+    const recorded = Object.prototype.hasOwnProperty.call(liveVoicePreviews, voiceId);
+    return {
+      canPreview: recorded,
+      approximate: false,
+      note: recorded ? '' : 'No recording is available for this voice.',
+    };
+  }
   const standIn = TTS_STAND_INS[voiceId];
   const direct = TTS_NATIVE_VOICES.has(voiceId);
 
@@ -100,18 +94,6 @@ export function previewEligibility(engine: VoiceEngineId, voiceId: string): Voic
       canPreview: false,
       approximate: false,
       note: 'Preview is unavailable for this voice -- the preview service has no matching voice, and playing a different one would be misleading.',
-    };
-  }
-
-  // Live speaks through a different model than the preview endpoint, so even a
-  // name the endpoint knows is only an approximation of the Live rendering.
-  if (engine === 'live') {
-    return {
-      canPreview: true,
-      approximate: true,
-      note: standIn
-        ? 'Preview uses a similar voice on a separate text-to-speech service. GPT-Live renders this voice differently.'
-        : 'Preview uses a separate text-to-speech service. GPT-Live renders this voice differently.',
     };
   }
 

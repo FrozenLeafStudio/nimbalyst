@@ -23,8 +23,10 @@ import {
   type SystemPromptConfig,
   type VoiceEngineSetting,
 } from '../../store/atoms/appSettings';
+import { liveVoicePreviews } from './liveVoicePreviews';
+import { useVoicePreview } from './useVoicePreview';
 import { previewEligibility, resolveVoiceForEngine, voiceGroupsForEngine } from './voiceEngineOptions';
-import { voiceModePreviewAudioAtom } from '../../store/atoms/voiceModeState';
+import { useRemoteVoicePreview } from './useRemoteVoicePreview';
 import { addSessionFullAtom, setSelectedWorkstreamAtom, setWindowModeAtom, navigateToSettingsAtom } from '../../store';
 import { useDialog } from '../../contexts/DialogContext';
 import { AlphaBadge, SETTINGS_ALPHA_TOOLTIP } from '../common/AlphaBadge';
@@ -91,8 +93,9 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
 
   const [showVoiceAgentPrompt, setShowVoiceAgentPrompt] = React.useState(false);
   const [showCodingAgentPrompt, setShowCodingAgentPrompt] = React.useState(false);
-  const [isPreviewPlaying, setIsPreviewPlaying] = React.useState(false);
-  const audioRef = React.useRef<HTMLAudioElement | null>(null);
+  const localPreview = useVoicePreview(activeEngine === 'live' ? liveVoicePreviews[effectiveVoice] : undefined);
+  const remotePreview = useRemoteVoicePreview(activeEngine !== 'live', effectiveVoice);
+  const isPreviewPlaying = activeEngine === 'live' ? localPreview.isPlaying : remotePreview.isPlaying;
 
   // Project summary state. Generation now happens inside an agent session, so
   // there's no in-panel spinner -- we only track whether the file exists on
@@ -253,48 +256,6 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
     handleSettingChange({ enabled: newEnabled });
   };
 
-  // Listen for preview audio from main process
-  // Stop any playing audio on unmount.
-  React.useEffect(() => {
-    return () => {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current = null;
-      }
-    };
-  }, []);
-
-  // Play preview audio when main process broadcasts a `voice-mode:preview-audio`
-  // event. The IPC event is handled centrally in
-  // store/listeners/voiceModeListeners.ts which writes voiceModePreviewAudioAtom;
-  // we play only on *new* bumps so any audio that was queued up before this
-  // panel mounted doesn't replay on open.
-  const previewAudio = useAtomValue(voiceModePreviewAudioAtom);
-  const initialPreviewAudioRef = React.useRef(previewAudio);
-  React.useEffect(() => {
-    if (previewAudio === initialPreviewAudioRef.current) return;
-    if (!previewAudio) return;
-    const { audioBase64, format } = previewAudio.payload;
-    const audio = new Audio(`data:audio/${format};base64,${audioBase64}`);
-    audioRef.current = audio;
-    setIsPreviewPlaying(true);
-
-    audio.onended = () => {
-      setIsPreviewPlaying(false);
-      audioRef.current = null;
-    };
-
-    audio.onerror = () => {
-      setIsPreviewPlaying(false);
-      audioRef.current = null;
-    };
-
-    audio.play().catch(() => {
-      setIsPreviewPlaying(false);
-      audioRef.current = null;
-    });
-  }, [previewAudio]);
-
   // Use defaults for turn detection
   const currentTurnDetection = { ...DEFAULT_TURN_DETECTION, ...turnDetection };
 
@@ -315,31 +276,7 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
     });
   };
 
-  const handlePreviewVoice = async () => {
-    if (!preview.canPreview) return;
-    if (isPreviewPlaying) {
-      // Stop current preview
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current = null;
-      }
-      setIsPreviewPlaying(false);
-      return;
-    }
-
-    setIsPreviewPlaying(true);
-    try {
-      const result = await window.electronAPI?.invoke('voice-mode:preview-voice', effectiveVoice);
-      if (!result?.success) {
-        console.error('[VoiceModePanel] Preview failed:', result?.message);
-        setIsPreviewPlaying(false);
-      }
-      // Audio will be received via IPC and played automatically
-    } catch (error) {
-      console.error('[VoiceModePanel] Preview error:', error);
-      setIsPreviewPlaying(false);
-    }
-  };
+  const handlePreviewVoice = activeEngine === 'live' ? localPreview.toggle : remotePreview.toggle;
   return (
     <div className="provider-panel flex flex-col">
       <div className="provider-panel-header mb-6 pb-4 border-b border-[var(--nim-border)]">
@@ -511,7 +448,7 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
                 </select>
                 <button
                   onClick={handlePreviewVoice}
-                  disabled={!preview.canPreview || (isPreviewPlaying && !audioRef.current)}
+                  disabled={!preview.canPreview || (activeEngine !== 'live' && remotePreview.isLoading)}
                   className={`px-3 py-1.5 rounded border border-[var(--nim-border)] cursor-pointer flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed ${
                     isPreviewPlaying
                       ? 'bg-[var(--nim-primary)] text-white'
@@ -532,9 +469,12 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
               </div>
               <p className="provider-panel-hint mt-2 text-xs text-[var(--nim-text-muted)]">
                 {preview.canPreview
-                  ? "Preview plays a short sample using OpenAI's text-to-speech service."
+                  ? activeEngine === 'live'
+                    ? 'Preview plays a recording of this GPT Live voice.'
+                    : "Preview plays a short sample using OpenAI's text-to-speech service."
                   : preview.note}
                 {preview.canPreview && preview.note && <span> {preview.note}</span>}
+                {activeEngine === 'live' && localPreview.error && <span role="alert"> {localPreview.error}</span>}
               </p>
             </div>
           </div>
