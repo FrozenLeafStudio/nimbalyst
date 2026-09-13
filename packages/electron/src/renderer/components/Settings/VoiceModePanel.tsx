@@ -21,7 +21,9 @@ import {
   type RealtimeReasoningEffort,
   type TurnDetectionConfig,
   type SystemPromptConfig,
+  type VoiceEngineSetting,
 } from '../../store/atoms/appSettings';
+import { previewEligibility, resolveVoiceForEngine, voiceGroupsForEngine } from './voiceEngineOptions';
 import { voiceModePreviewAudioAtom } from '../../store/atoms/voiceModeState';
 import { addSessionFullAtom, setSelectedWorkstreamAtom, setWindowModeAtom, navigateToSettingsAtom } from '../../store';
 import { useDialog } from '../../contexts/DialogContext';
@@ -41,38 +43,6 @@ const DEFAULT_TURN_DETECTION: TurnDetectionConfig = {
   silenceDuration: 500,
   interruptible: true,
 };
-
-// Available OpenAI Realtime API voices with descriptions
-// Some voices are Realtime-only and use approximations for TTS preview
-// Gender categorization based on OpenAI documentation and community observations
-const VOICE_OPTIONS: Array<{
-  id: string;
-  name: string;
-  description: string;
-  gender: 'male' | 'female' | 'neutral';
-  realtimeOnly?: boolean; // If true, preview uses a similar voice approximation
-}> = [
-  // Male voices
-  { id: 'ash', name: 'Ash', description: 'Clear and confident', gender: 'male' },
-  { id: 'echo', name: 'Echo', description: 'Smooth and resonant', gender: 'male' },
-  { id: 'verse', name: 'Verse', description: 'Dynamic and engaging', gender: 'male', realtimeOnly: true },
-  { id: 'cedar', name: 'Cedar', description: 'Deep and authoritative', gender: 'male', realtimeOnly: true },
-  // Female voices
-  { id: 'coral', name: 'Coral', description: 'Warm and friendly', gender: 'female' },
-  { id: 'sage', name: 'Sage', description: 'Thoughtful and calm', gender: 'female' },
-  { id: 'shimmer', name: 'Shimmer', description: 'Bright and cheerful', gender: 'female' },
-  { id: 'ballad', name: 'Ballad', description: 'Melodic and expressive', gender: 'female', realtimeOnly: true },
-  { id: 'marin', name: 'Marin', description: 'Natural and conversational', gender: 'female', realtimeOnly: true },
-  // Neutral voices
-  { id: 'alloy', name: 'Alloy', description: 'Balanced and versatile', gender: 'neutral' },
-];
-
-// Group voices by gender for the dropdown
-const VOICE_GROUPS = [
-  { label: 'Male', voices: VOICE_OPTIONS.filter(v => v.gender === 'male') },
-  { label: 'Female', voices: VOICE_OPTIONS.filter(v => v.gender === 'female') },
-  { label: 'Neutral', voices: VOICE_OPTIONS.filter(v => v.gender === 'neutral') },
-];
 
 type MicAccessStatus = 'not-determined' | 'granted' | 'denied' | 'restricted' | 'unknown';
 
@@ -95,6 +65,7 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
   // Extract values from atom
   const {
     enabled,
+    engine,
     voice,
     model,
     reasoningEffort,
@@ -107,6 +78,11 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
 
   // Check if OpenAI key is configured
   const hasOpenAIKey = !!apiKeys.openai;
+
+  const activeEngine: VoiceEngineSetting = engine ?? 'live';
+  const voiceGroups = React.useMemo(() => voiceGroupsForEngine(activeEngine), [activeEngine]);
+  const effectiveVoice = resolveVoiceForEngine(activeEngine, voice);
+  const preview = previewEligibility(activeEngine, effectiveVoice);
 
   // Handler to update any voice mode setting
   const handleSettingChange = React.useCallback((updates: Partial<VoiceModeSettings>) => {
@@ -326,7 +302,21 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
     handleSettingChange({ turnDetection: { ...currentTurnDetection, ...updates } });
   };
 
+  // Switching engines carries the voice over only if the target engine accepts
+  // it; otherwise the stored voice is corrected now rather than failing at
+  // connect time.
+  const handleModelChange = (nextModel: 'gpt-live-1' | RealtimeModel) => {
+    const nextEngine: VoiceEngineSetting = nextModel === 'gpt-live-1' ? 'live' : 'realtime';
+    const nextVoice = resolveVoiceForEngine(nextEngine, voice);
+    handleSettingChange({
+      engine: nextEngine,
+      ...(nextModel === 'gpt-live-1' ? {} : { model: nextModel }),
+      ...(nextVoice === voice ? {} : { voice: nextVoice as VoiceId }),
+    });
+  };
+
   const handlePreviewVoice = async () => {
+    if (!preview.canPreview) return;
     if (isPreviewPlaying) {
       // Stop current preview
       if (audioRef.current) {
@@ -339,7 +329,7 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
 
     setIsPreviewPlaying(true);
     try {
-      const result = await window.electronAPI?.invoke('voice-mode:preview-voice', voice);
+      const result = await window.electronAPI?.invoke('voice-mode:preview-voice', effectiveVoice);
       if (!result?.success) {
         console.error('[VoiceModePanel] Preview failed:', result?.message);
         setIsPreviewPlaying(false);
@@ -446,46 +436,50 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
       {enabled && hasOpenAIKey && (
         <>
           <div className="provider-panel-section mb-6">
-            <h4 className="provider-panel-section-title text-base font-medium mb-4 text-[var(--nim-text)]">Model</h4>
-
             <div className="setting-item py-3">
-              <div className="setting-text flex flex-col gap-0.5">
-                <span className="setting-name text-sm font-medium text-[var(--nim-text)]">Realtime Model</span>
-                <span className="setting-description text-xs text-[var(--nim-text-muted)]">
-                  gpt-realtime-2 is newer, with stronger reasoning, a larger context window, and more consistent voice rendering. gpt-realtime is the fallback for accounts without access (selected automatically if needed).
-                </span>
-              </div>
+              <label htmlFor="voice-model" className="setting-name text-sm font-medium text-[var(--nim-text)]">Voice model</label>
+              <p className="setting-description text-xs text-[var(--nim-text-muted)] mt-1">
+                The model you talk to. Your coding agent is configured separately.
+              </p>
               <select
-                value={model ?? 'gpt-realtime-2'}
-                onChange={(e) => handleSettingChange({ model: e.target.value as RealtimeModel })}
+                id="voice-model"
+                value={activeEngine === 'live' ? 'gpt-live-1' : (model ?? 'gpt-realtime-2')}
+                onChange={(e) => handleModelChange(e.target.value as 'gpt-live-1' | RealtimeModel)}
                 className="mt-2 px-3 py-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)]"
                 data-testid="voice-mode-model-select"
               >
-                <option value="gpt-realtime-2">gpt-realtime-2 (recommended)</option>
+                <option value="gpt-live-1">gpt-live-1 (default)</option>
+                <option value="gpt-realtime-2">gpt-realtime-2</option>
                 <option value="gpt-realtime">gpt-realtime</option>
               </select>
+              <p className="setting-description text-xs text-[var(--nim-text-muted)] mt-2">
+                Changes apply to your next voice connection.
+              </p>
             </div>
 
-            <div className="setting-item py-3">
-              <div className="setting-text flex flex-col gap-0.5">
-                <span className="setting-name text-sm font-medium text-[var(--nim-text)]">Reasoning Effort</span>
-                <span className="setting-description text-xs text-[var(--nim-text-muted)]">
-                  Higher = smarter but slower and more expensive. Low is recommended for a responsive voice relay. Applies to gpt-realtime-2.
-                </span>
+            {activeEngine === 'realtime' && model !== 'gpt-realtime' && (
+              <div className="setting-item py-3">
+                <div className="setting-text flex flex-col gap-0.5">
+                  <span className="setting-name text-sm font-medium text-[var(--nim-text)]">Reasoning Effort</span>
+                  <span className="setting-description text-xs text-[var(--nim-text-muted)]">
+                    Higher = smarter but slower and more expensive. Low is recommended for a responsive voice relay. Applies to gpt-realtime-2.
+                  </span>
+                </div>
+                <select
+                  value={reasoningEffort ?? 'low'}
+                  onChange={(e) => handleSettingChange({ reasoningEffort: e.target.value as RealtimeReasoningEffort })}
+                  className="mt-2 px-3 py-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)]"
+                  data-testid="voice-mode-reasoning-effort-select"
+                >
+                  <option value="minimal">Minimal (fastest)</option>
+                  <option value="low">Low (recommended)</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="xhigh">Extra high (slowest, smartest)</option>
+                </select>
               </div>
-              <select
-                value={reasoningEffort ?? 'low'}
-                onChange={(e) => handleSettingChange({ reasoningEffort: e.target.value as RealtimeReasoningEffort })}
-                className="mt-2 px-3 py-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)]"
-                data-testid="voice-mode-reasoning-effort-select"
-              >
-                <option value="minimal">Minimal (fastest)</option>
-                <option value="low">Low (recommended)</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-                <option value="xhigh">Extra high (slowest, smartest)</option>
-              </select>
-            </div>
+
+            )}
           </div>
 
           <div className="provider-panel-section mb-6">
@@ -500,11 +494,12 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
               </div>
               <div className="flex items-center gap-2 mt-2">
                 <select
-                  value={voice}
+                  value={effectiveVoice}
                   onChange={(e) => handleSettingChange({ voice: e.target.value as VoiceId })}
                   className="flex-1 px-3 py-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)]"
+                  data-testid="voice-mode-voice-select"
                 >
-                  {VOICE_GROUPS.map((group) => (
+                  {voiceGroups.map((group) => (
                     <optgroup key={group.label} label={group.label}>
                       {group.voices.map((v) => (
                         <option key={v.id} value={v.id}>
@@ -516,25 +511,30 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
                 </select>
                 <button
                   onClick={handlePreviewVoice}
-                  disabled={isPreviewPlaying && !audioRef.current}
-                  className={`px-3 py-1.5 rounded border border-[var(--nim-border)] cursor-pointer flex items-center gap-1 ${
+                  disabled={!preview.canPreview || (isPreviewPlaying && !audioRef.current)}
+                  className={`px-3 py-1.5 rounded border border-[var(--nim-border)] cursor-pointer flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed ${
                     isPreviewPlaying
                       ? 'bg-[var(--nim-primary)] text-white'
                       : 'bg-[var(--nim-bg-secondary)] text-[var(--nim-text)]'
                   }`}
-                  title={isPreviewPlaying ? 'Stop preview' : 'Preview this voice'}
+                  title={
+                    !preview.canPreview
+                      ? preview.note
+                      : isPreviewPlaying
+                        ? 'Stop preview'
+                        : 'Preview this voice'
+                  }
+                  data-testid="voice-mode-preview-voice"
                 >
                   <MaterialSymbol icon={isPreviewPlaying ? 'stop' : 'play_arrow'} size={16} />
                   {isPreviewPlaying ? 'Stop' : 'Preview'}
                 </button>
               </div>
               <p className="provider-panel-hint mt-2 text-xs text-[var(--nim-text-muted)]">
-                Preview plays a short sample using OpenAI's TTS API.
-                {VOICE_OPTIONS.find(v => v.id === voice)?.realtimeOnly && (
-                  <span className="text-[var(--nim-text-muted)]">
-                    {' '}This voice is Realtime-only; preview uses a similar voice.
-                  </span>
-                )}
+                {preview.canPreview
+                  ? "Preview plays a short sample using OpenAI's text-to-speech service."
+                  : preview.note}
+                {preview.canPreview && preview.note && <span> {preview.note}</span>}
               </p>
             </div>
           </div>
@@ -769,25 +769,43 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
 
           <div className="provider-panel-section mb-6">
             <h4 className="provider-panel-section-title text-base font-medium mb-4 text-[var(--nim-text)]">Usage & Pricing</h4>
-            <p className="provider-panel-hint text-sm text-[var(--nim-text-muted)]">
-              OpenAI charges for voice mode usage:
-            </p>
-            <ul className="ml-5 mt-2 mb-2 text-sm text-[var(--nim-text-muted)] list-disc">
-              <li>Audio Input: $0.06 per minute</li>
-              <li>Audio Output: $0.24 per minute</li>
-              <li>Plus standard token costs for processing</li>
-            </ul>
-            <p className="provider-panel-hint text-sm text-[var(--nim-text-muted)]">
-              Example: A 5-minute conversation costs approximately $0.50
-            </p>
+            {activeEngine === 'live' ? (
+              <>
+                <p className="provider-panel-hint text-sm text-[var(--nim-text-muted)]">
+                  GPT-Live is billed per second of connected session time, not per token:
+                </p>
+                <ul className="ml-5 mt-2 mb-2 text-sm text-[var(--nim-text-muted)] list-disc">
+                  <li>Voice session: $0.05 per minute connected</li>
+                  <li>Billing continues during silence and while a task runs; closing the session stops it</li>
+                  <li>The delegated controller model is billed separately, on its own rates</li>
+                </ul>
+                <p className="provider-panel-hint text-sm text-[var(--nim-text-muted)]">
+                  Example: 10 connected minutes is $0.50 of voice time, before controller and coding-agent costs.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="provider-panel-hint text-sm text-[var(--nim-text-muted)]">
+                  Realtime is billed per token, so cost follows how much is spoken:
+                </p>
+                <ul className="ml-5 mt-2 mb-2 text-sm text-[var(--nim-text-muted)] list-disc">
+                  <li>Audio input: about $0.02 per minute you speak</li>
+                  <li>Audio output: about $0.08 per minute the assistant speaks</li>
+                  <li>Plus transcription and text/history tokens</li>
+                </ul>
+                <p className="provider-panel-hint text-sm text-[var(--nim-text-muted)]">
+                  Example: 10 minutes with each side speaking 5 is roughly $0.50, before coding-agent costs.
+                </p>
+              </>
+            )}
           </div>
 
           <div className="provider-panel-section mb-6">
             <h4 className="provider-panel-section-title text-base font-medium mb-4 text-[var(--nim-text)]">How It Works</h4>
             <p className="provider-panel-hint text-sm text-[var(--nim-text-muted)]">
-              Voice Mode uses OpenAI's Advanced Voice Mode (GPT Realtime) as an intelligent
-              voice interface to Claude Code. You speak your coding requests naturally,
-              and the voice assistant translates them into Claude Code commands.
+              Voice Mode uses {activeEngine === 'live' ? 'GPT-Live' : 'GPT Realtime'} as an intelligent
+              voice interface to your coding agent. You speak your coding requests naturally,
+              and the voice assistant translates them into agent commands.
             </p>
             <p className="provider-panel-hint mt-2 text-sm text-[var(--nim-text-muted)]">
               When Claude Code finishes working, the assistant summarizes what was done
