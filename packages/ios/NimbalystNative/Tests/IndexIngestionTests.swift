@@ -92,6 +92,34 @@ final class IndexIngestionTests: XCTestCase {
         XCTAssertEqual(opened, ["cached"], "Retired account observations cannot navigate")
     }
 
+    /// NIM-5925: when the acknowledgement beats index ingestion, the row can
+    /// still arrive on its own -- a v2 lookup page writes it straight to GRDB
+    /// with no ingestion outcome behind it. The draft used to sit in memory
+    /// until some unrelated bulk response happened along.
+    func testPendingCreationDraftIsAppliedWhenTheRowArrivesWithoutAnIndexResponse() async throws {
+        let db = try DatabaseManager()
+        try db.upsertProject(Project(id: projectPath, name: "Test"))
+        let sync = manager(db)
+        let requestId = try sync.createSession(projectId: projectPath, initialDraft: "Carry me across")
+        await sync.receiveIndexMessage(try JSONSerialization.data(withJSONObject: [
+            "type": "createSessionResponseBroadcast",
+            "response": ["requestId": requestId, "success": true, "sessionId": "created"],
+        ]))
+        XCTAssertNil(try db.session(byId: "created"), "The acknowledgement arrived before the row")
+
+        try db.upsertSession(Session(id: "created", projectId: projectPath, createdAt: 1, updatedAt: 1))
+
+        let applied = expectation(description: "The pending draft lands on the row")
+        for _ in 0..<50 {
+            if try db.session(byId: "created")?.draftInput == "Carry me across" {
+                applied.fulfill()
+                break
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        await fulfillment(of: [applied], timeout: 2)
+    }
+
     func testCreationSendFailureCompletesRegisteredRequestImmediately() throws {
         let sync = manager(try DatabaseManager(), sendError: NSError(domain: "test", code: 1,
             userInfo: [NSLocalizedDescriptionKey: "Send failed"]))
@@ -103,7 +131,7 @@ final class IndexIngestionTests: XCTestCase {
 
     private func manager(_ db: DatabaseManager, sendError: Error? = nil) -> SyncManager {
         let sync = SyncManager(crypto: crypto, database: db, serverUrl: "https://invalid.example", userId: "test", registerDeviceCallbacks: false,
-            creationSender: { _, completion in completion(sendError) })
+            sender: { _, _, completion in completion(sendError) })
         sync.isConnected = true
         sync.connectedDevices = [
             DeviceInfo(deviceId: "desktop", name: "Mac", type: "desktop", platform: "macos", appVersion: nil,
@@ -123,6 +151,7 @@ final class IndexIngestionTests: XCTestCase {
         title: String? = nil,
         phase: String? = nil,
         draft: String? = nil,
+        draftUpdatedAt: Int? = nil,
         isExecuting: Bool? = nil,
         valid: Bool = true
     ) throws -> [String: Any] {
@@ -142,7 +171,7 @@ final class IndexIngestionTests: XCTestCase {
         if phase != nil || draft != nil {
             let meta = ClientMetadata(
                 currentContext: nil, hasPendingPrompt: nil, phase: phase,
-                tags: nil, draftInput: draft, draftUpdatedAt: draft == nil ? nil : updatedAt
+                tags: nil, draftInput: draft, draftUpdatedAt: draft == nil ? nil : (draftUpdatedAt ?? updatedAt)
             )
             let json = String(data: try JSONEncoder().encode(meta), encoding: .utf8)!
             let encrypted = try crypto.encrypt(plaintext: json)
@@ -337,8 +366,40 @@ final class IndexIngestionTests: XCTestCase {
         XCTAssertEqual(try db.session(byId: "s1")?.draftInput, "unsent local text")
         XCTAssertEqual(try db.session(byId: "s1")?.lastReadAt, readAt)
 
-        try await receive(sync, sessions: [try entry("s1", updatedAt: 12, title: "T", draft: "")])
-        XCTAssertNil(try db.session(byId: "s1")?.draftInput, "An explicit empty draft is a clear, not an omission")
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 12, title: "T", draft: "", draftUpdatedAt: 51)])
+        XCTAssertNil(try db.session(byId: "s1")?.draftInput, "A newer explicit empty draft is a clear, not an omission")
+    }
+
+    /// NIM-5923: `draftUpdatedAt` is the field that orders drafts, and it was
+    /// never compared. A page built before the user's last keystroke -- a
+    /// reconnect replay, or one already in flight -- overwrote the composer.
+    func testOlderRemoteDraftCannotOverwriteANewerLocalOne() async throws {
+        let db = try DatabaseManager()
+        let sync = manager(db)
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 10, title: "T")])
+        try db.updateSessionDraftInput(sessionId: "s1", draftInput: "what the user is typing", draftUpdatedAt: 500)
+
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 11, title: "T",
+                                                     draft: "stale remote text", draftUpdatedAt: 400)])
+        XCTAssertEqual(try db.session(byId: "s1")?.draftInput, "what the user is typing")
+        XCTAssertEqual(try db.session(byId: "s1")?.draftUpdatedAt, 500)
+
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 12, title: "T",
+                                                     draft: "newer remote text", draftUpdatedAt: 600)])
+        XCTAssertEqual(try db.session(byId: "s1")?.draftInput, "newer remote text", "A newer remote draft still wins")
+    }
+
+    /// An older clear is still an older write. Without the stamp comparison a
+    /// replayed clear silently emptied the composer.
+    func testOlderRemoteClearCannotEmptyANewerLocalDraft() async throws {
+        let db = try DatabaseManager()
+        let sync = manager(db)
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 10, title: "T")])
+        try db.updateSessionDraftInput(sessionId: "s1", draftInput: "unsent", draftUpdatedAt: 500)
+
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 11, title: "T",
+                                                     draft: "", draftUpdatedAt: 400)])
+        XCTAssertEqual(try db.session(byId: "s1")?.draftInput, "unsent")
     }
 
     // MARK: - Generations

@@ -58,7 +58,7 @@ import { getCredentials, resetCredentials, generateQRPairingPayload, isUsingSecu
 import {
     isSyncProviderReady,
     onSyncStatusChange,
-    triggerIncrementalSync,
+    triggerIncrementalSync, projectConfigSync,
     updateSleepPrevention,
 } from '../services/SyncManager';
 import { getDocSyncStatusForWorkspace } from '../file/WorkspaceWatcher';
@@ -1172,6 +1172,7 @@ export function registerSettingsHandlers() {
             docSyncEnabledProjects,
             enabled: enabledProjects.length > 0,
         }));
+        void projectConfigSync.refresh().catch(err => logger.main.warn('[sync:set-project-selection] Failed to refresh project config', err));
         logger.store.info(
             `[sync:set-project-selection] ${enabledProjects.length} project(s) enabled, `
             + `${docSyncEnabledProjects.length} with document sync`,
@@ -1229,6 +1230,7 @@ export function registerSettingsHandlers() {
         });
 
         logger.store.info(`[sync:toggle-project] Project sync ${enabled ? 'enabled' : 'disabled'} for: ${workspacePath}`);
+        void projectConfigSync.refresh(workspacePath).catch(err => logger.main.warn(`[sync:toggle-project] Failed to refresh config for ${workspacePath}`, err));
 
         // If a project was enabled, trigger sync to push its sessions immediately
         if (enabled) {

@@ -1,0 +1,18 @@
+{
+  "openaiApiKey": "",
+  "voiceMode": {
+    "voice": "marin",
+    "submitDelayMs": 1200
+  },
+  "availableModels": [
+    {
+      "id": "claude-code:opus",
+      "name": "Claude Opus",
+      "provider": "claude-code"
+    }
+  ],
+  "defaultModel": "claude-code:opus",
+  "metaAgentEnabled": true,
+  "preferredAgentLanguage": "en",
+  "version": 7
+}

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { logger } from '../../utils/logger';
 import { TranscriptRuntime } from '@nimbalyst/runtime/ai/server/transcript/TranscriptRuntime';
 import type { RawMessage } from '@nimbalyst/runtime/ai/server/transcript/TranscriptTransformer';
 import type { ChatAttachment, SessionData } from '@nimbalyst/runtime/ai/server/types';
@@ -285,7 +286,10 @@ export class RemoteSessionMirror {
     const outcome = await provider.pushChange(id, { type: 'metadata_updated', metadata: {
       queuedPrompts: [...queue, { id: promptId, prompt: preparedPrompt.trim(), timestamp: Date.now(), ...(encrypted.length ? {attachments: encrypted} : {}), ...(options ? {options} : {}) }],
     } });
-    if (outcome && !outcome.published) throw new Error('The prompt could not be sent. Keep it and retry when connected.');
+    if (outcome && !outcome.published) {
+      logger.main.warn(`[RemoteSessionMirror] Failed to publish prompt for session ${id}: ${outcome.reason ?? 'not published'}`);
+      throw new Error('The prompt could not be sent. Keep it and retry when connected.');
+    }
     return { promptId };
   }
   async workspaceContext(id: string, workspace: string): Promise<unknown> {

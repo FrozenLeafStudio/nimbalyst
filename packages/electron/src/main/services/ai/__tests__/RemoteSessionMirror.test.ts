@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RemoteSessionMirror } from '../RemoteSessionMirror';
 import type { SessionChange, SyncProvider } from '@nimbalyst/runtime/sync/types';
+import { logger } from '../../../utils/logger';
 
 function fixture() {
   const entry = { sessionId: 'remote', hostDeviceId: 'sandbox-1', projectId: '/repo', title: 'Remote test', provider: 'claude-code', messageCount: 0, createdAt: 100, updatedAt: 200, lastMessageAt: 200 };
@@ -30,6 +31,15 @@ function fixture() {
 
 afterEach(() => vi.useRealTimers());
 describe('remote desktop mirrors', () => {
+  it.each([true, false])('logs the provider reason and retains the user-facing queue failure (retryable=%s)', async (retryable) => {
+    const f = fixture();
+    const warn = vi.spyOn(logger.main, 'warn').mockImplementation(() => {});
+    try {
+      f.provider.pushChange.mockResolvedValueOnce({ published: false, retryable, reason: 'remote queue disconnected' } as never);
+      await expect(f.mirror.queue('remote', '/repo', 'prompt')).rejects.toThrow('The prompt could not be sent');
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/session remote: remote queue disconnected/));
+    } finally { warn.mockRestore(); }
+  });
   it('reconnects an observed transcript before queueing after an idle socket expires', async () => {
     const f = fixture();
     const stop = await f.mirror.watch('remote', '/repo', vi.fn());

@@ -100,6 +100,16 @@ async function createConnectedProvider() {
   return { provider, indexSocket, encryptionKey };
 }
 
+/** The real provider always reports an outcome; a `void` here is itself a failure. */
+async function publishBatch(
+  provider: ReturnType<typeof createCollabV3Sync>,
+  sessions: Array<Record<string, any>>,
+) {
+  const outcome = await provider.syncSessionsToIndex!(sessions as never);
+  if (!outcome) throw new Error('syncSessionsToIndex reported no publish outcome');
+  return outcome;
+}
+
 function baseSession(overrides: Record<string, any> = {}) {
   return {
     id: 'session-1',
@@ -446,5 +456,70 @@ describe('CollabV3 index publication gate', () => {
     expect(indexPackets(indexSocket).at(-1)?.session.updatedAt).toBe(1_400);
 
     provider.disconnectAll();
+  });
+
+  /**
+   * R-C1-5: a one-shot send that never reached the wire must not fulfil. This
+   * drives the real public sender with a key that cannot encrypt, so the build
+   * inside the send channel throws exactly the way a project-id encryption
+   * failure does.
+   */
+  it('rejects the public send when the payload cannot be built', async () => {
+    const decryptOnlyKey = await crypto.subtle.generateKey(
+      { name: 'AES-GCM', length: 256 }, true, ['decrypt'],
+    );
+    const provider = createCollabV3Sync({
+      serverUrl: 'wss://sync.example.test',
+      orgId: 'org-1',
+      personalMemberId: asPersonalMemberId('user-1'),
+      getJwt: async () => asPersonalJwt(jwtFor('user-1')),
+      encryptionKey: decryptOnlyKey,
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const indexSocket = FakeWebSocket.instances[0];
+    indexSocket.open();
+
+    const sending = provider.sendCreateSessionRequest!({
+      requestId: 'req-encrypt-fail',
+      projectId: '/workspace',
+      timestamp: 1_000,
+    });
+
+    await expect(sending).rejects.toThrow(/create session request/);
+    await sending.catch((err: { reason?: string; retryable?: boolean }) => {
+      expect(err.reason).toBe('failed to build create session request');
+      // Deterministic: the same key would fail the same way on a retry.
+      expect(err.retryable).toBe(false);
+    });
+    expect(indexPackets(indexSocket)).toHaveLength(0);
+    provider.disconnectAll();
+  });
+
+  /**
+   * The mobile create-session ack is only honest if the publish it waits on
+   * reports what actually happened. A queued batch is NOT a published one.
+   */
+  it('reports whether a bulk publish reached the transport', async () => {
+    const { provider, indexSocket } = await createConnectedProvider();
+
+    const sent = await publishBatch(provider, [baseSession()]);
+    expect(sent).toEqual({ published: true, publishedSessionIds: ['session-1'] });
+    expect(indexPackets(indexSocket)).toHaveLength(1);
+
+    // Nothing eligible for personal sync: refused, and not worth retrying.
+    const ineligible = await publishBatch(provider, [
+      baseSession({ id: 'tutorial-1', metadata: { tutorial: true } }),
+    ]);
+    expect(ineligible.published).toBe(false);
+    expect(ineligible.publishedSessionIds).toEqual([]);
+
+    provider.disconnectAll();
+
+    // Disconnected: the batch is queued for reconnect, which the caller must be
+    // able to tell apart from "on the wire".
+    const queued = await publishBatch(provider, [baseSession({ id: 'session-2' })]);
+    expect(queued.published).toBe(false);
+    expect(queued.retryable).toBe(true);
+    expect(queued.reason).toContain('queued');
   });
 });

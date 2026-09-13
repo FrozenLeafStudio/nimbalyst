@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createSyncedSessionStore } from '../SyncedSessionStore';
+import { createMessageSyncHandler, createSyncedSessionStore } from '../SyncedSessionStore';
+import { resetPushOutcomeWarnings } from '../pushOutcome';
 import type { SessionStore } from '../../ai/adapters/sessionStore';
 import type { SyncProvider, SessionChange
  } from '../types';
@@ -11,6 +12,7 @@ describe('SyncedSessionStore', () => {
   let capturedChanges: { sessionId: string; change: SessionChange }[];
 
   beforeEach(() => {
+    resetPushOutcomeWarnings();
     capturedChanges = [];
 
     mockBaseStore = {
@@ -76,6 +78,40 @@ describe('SyncedSessionStore', () => {
     }
   });
 
+  it('warns separately for unpublished messages and timestamp metadata, preserving the message outcome', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const outcome = { published: false, reason: 'message disconnected' };
+      mockSyncProvider.pushChange = vi.fn().mockResolvedValueOnce(outcome)
+        .mockResolvedValueOnce({ published: false, reason: 'index disconnected' });
+      const message = { sessionId: 's1', source: 'claude-code', direction: 'output' as const, content: 'hello' };
+      await expect(createMessageSyncHandler(mockSyncProvider).onMessageCreated(message, 123)).resolves.toEqual(outcome);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/s1.*message disconnected/));
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/s1.*index disconnected/));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('warns for unpublished metadata and catches rejected publication after local persistence', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+      mockSyncProvider.pushChange = vi.fn().mockResolvedValueOnce({ published: false, reason: 'index disconnected' });
+      await store.updateMetadata('s1', { title: 'Updated' });
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/s1.*index disconnected/));
+      const error = new Error('transport rejected');
+      // Pre-attach a handler so the pre-fix regression run cannot leak a rejection.
+      const rejection = Promise.reject(error);
+      void rejection.catch(() => {});
+      mockSyncProvider.pushChange = vi.fn().mockReturnValue(rejection);
+      await expect(store.updateMetadata('s2', { title: 'Updated again' })).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('s2'), error);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('create() returns after local persistence even when sync connect is slow', async () => {
     // Regression coverage for GitHub #705: creating a new empty session should
     // only wait for local persistence, not for the session-room WebSocket.
@@ -116,6 +152,25 @@ describe('SyncedSessionStore', () => {
     expect(capturedChanges).toHaveLength(1);
 
     await createPromise;
+  });
+
+  it('keeps create and draft writes independent of publication, but awaits deletion before disconnecting', async () => {
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    mockSyncProvider.pushChange = vi.fn(() => pending);
+    const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    let writesFinished = false;
+    const writes = (async () => {
+      await store.create({ id: 's1', provider: 'claude-code', workspaceId: '/ws' });
+      await store.updateMetadata('s1', { draftInput: 'draft' });
+      writesFinished = true;
+    })();
+    await vi.waitFor(() => expect(writesFinished).toBe(true));
+    const deletion = store.delete('s1');
+    expect(mockSyncProvider.disconnect).not.toHaveBeenCalled();
+    release();
+    await Promise.all([writes, deletion]);
+    expect(mockSyncProvider.disconnect).toHaveBeenCalledWith('s1');
   });
 
   it('should pass title when updating metadata', async () => {

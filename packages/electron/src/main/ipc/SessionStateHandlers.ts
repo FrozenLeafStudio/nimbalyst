@@ -1,3 +1,4 @@
+import { warnIfUnpublished } from '@nimbalyst/runtime/sync/pushOutcome';
 /**
  * IPC Handlers for Session State Management
  *
@@ -457,10 +458,10 @@ export async function registerSessionStateHandlers() {
  * and leave the subscription live — a stale "isExecuting=true" on mobile is
  * otherwise never cleared, pinning the mobile spinner on "Thinking..." forever.
  */
-export function pushExecutionStateToMobile(
+export async function pushExecutionStateToMobile(
   event: SessionStateEvent,
   syncProvider: import('@nimbalyst/runtime/sync').SyncProvider | null,
-): void {
+): Promise<void> {
   if (
     event.type !== 'session:started' &&
     event.type !== 'session:completed' &&
@@ -479,13 +480,15 @@ export function pushExecutionStateToMobile(
 
   console.log(`[SessionStateHandlers] Syncing execution state to mobile: sessionId=${sessionId} isExecuting=${isExecuting}`);
 
-  syncProvider.pushChange(sessionId, {
-    type: 'metadata_updated',
-    metadata: {
-      isExecuting,
-      updatedAt: Date.now(),
-    },
-  });
+  try {
+    const outcome = await syncProvider.pushChange(sessionId, {
+      type: 'metadata_updated',
+      metadata: { isExecuting, updatedAt: Date.now() },
+    });
+    warnIfUnpublished(message => console.warn(message), sessionId, '[SessionStateHandlers] Failed to publish execution state', outcome);
+  } catch (error) {
+    console.warn(`[SessionStateHandlers] Failed to publish execution state for session ${sessionId}:`, error);
+  }
 }
 
 /**
@@ -499,7 +502,7 @@ function setupSyncSubscription(stateManager: ReturnType<typeof getSessionStateMa
     console.log('[SessionStateHandlers] Setting up execution state sync to mobile');
 
     const unsubscribe = stateManager.subscribe((event: SessionStateEvent) => {
-      pushExecutionStateToMobile(event, getSyncProvider());
+      void pushExecutionStateToMobile(event, getSyncProvider());
     });
 
     syncSubscriptionCleanup = unsubscribe;

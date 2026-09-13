@@ -1,3 +1,5 @@
+import { warnIfUnpublished } from '@nimbalyst/runtime/sync/pushOutcome';
+import type { SessionChange } from '@nimbalyst/runtime/sync/types';
 import { sessionInbox } from './sessionInboxService';
 import { codexQuestionTurns } from './codexQuestionTurns';
 /**
@@ -911,7 +913,7 @@ export class MessageStreamingHandler {
     // renderers AND mobile sync. Mirrors what SessionNamingService does for
     // the MCP-tool path so direct repo writes from the provider do not bypass
     // the kanban refresh and iOS push.
-    const onSessionMetadataUpdated = (data: { sessionId: string; metadata: Record<string, unknown> }) => {
+    const onSessionMetadataUpdated = async (data: { sessionId: string; metadata: Record<string, unknown> }) => {
       for (const window of BrowserWindow.getAllWindows()) {
         if (!window.isDestroyed()) {
           window.webContents.send('sessions:session-updated', data.sessionId, data.metadata);
@@ -919,13 +921,18 @@ export class MessageStreamingHandler {
       }
       const sp = getSyncProvider();
       if (sp && (data.metadata.phase !== undefined || data.metadata.tags !== undefined)) {
-        const syncMeta: Record<string, unknown> = {};
+        const syncMeta: Extract<SessionChange, { type: 'metadata_updated' }>['metadata'] = {};
         if (data.metadata.phase !== undefined) syncMeta.phase = data.metadata.phase as string;
         if (data.metadata.tags !== undefined) syncMeta.tags = data.metadata.tags as string[];
-        sp.pushChange(data.sessionId, {
-          type: 'metadata_updated',
-          metadata: syncMeta as any,
-        });
+        try {
+          const outcome = await sp.pushChange(data.sessionId, {
+            type: 'metadata_updated',
+            metadata: syncMeta,
+          });
+          warnIfUnpublished(message => logger.main.warn(message), data.sessionId, '[AIService] Failed to publish sync change', outcome);
+        } catch (error) {
+          logger.main.warn(`[AIService] Failed to publish sync change for session ${data.sessionId}:`, error);
+        }
       }
     };
     this.installListener(provider, 'session:metadata-updated', onSessionMetadataUpdated);
@@ -1279,10 +1286,18 @@ export class MessageStreamingHandler {
     // Mark session as executing for mobile sync (shows "Running" indicator)
     const syncProvider = getSyncProvider();
     if (syncProvider) {
-      syncProvider.pushChange(session.id, {
-        type: 'metadata_updated',
-        metadata: { isExecuting: true } as any,
-      });
+      // First-token latency must not wait for index publication. This task catches failures internally.
+      void (async () => {
+        try {
+          const outcome = await syncProvider.pushChange(session.id, {
+            type: 'metadata_updated',
+            metadata: { isExecuting: true },
+          });
+          warnIfUnpublished(message => logger.main.warn(message), session.id, '[AIService] Failed to publish sync change', outcome);
+        } catch (error) {
+          logger.main.warn(`[AIService] Failed to publish sync change for session ${session.id}:`, error);
+        }
+      })();
     }
 
     // Mirrors this turn's direct Git commands into the workspace Git journal so
@@ -1652,15 +1667,23 @@ export class MessageStreamingHandler {
               // Push live context usage to mobile sync
               const syncProvider = getSyncProvider();
               if (syncProvider) {
-                syncProvider.pushChange(session.id, {
-                  type: 'metadata_updated',
-                  metadata: {
-                    currentContext: {
-                      tokens: partialContextFill,
-                      contextWindow: partialContextWindow,
-                    },
-                  } as any,
-                });
+                // Streaming chunks must not wait for index publication. This task catches failures internally.
+                void (async () => {
+                  try {
+                    const outcome = await syncProvider.pushChange(session.id, {
+                      type: 'metadata_updated',
+                      metadata: {
+                        currentContext: {
+                          tokens: partialContextFill,
+                          contextWindow: partialContextWindow,
+                        },
+                      },
+                    });
+                    warnIfUnpublished(message => logger.main.warn(message), session.id, '[AIService] Failed to publish sync change', outcome);
+                  } catch (error) {
+                    logger.main.warn(`[AIService] Failed to publish sync change for session ${session.id}:`, error);
+                  }
+                })();
               }
 
               session.tokenUsage = updatedUsage;
@@ -2516,15 +2539,20 @@ export class MessageStreamingHandler {
               if (contextFillTokens !== undefined && contextWindowForDisplay) {
                 const syncProvider = getSyncProvider();
                 if (syncProvider) {
-                  syncProvider.pushChange(session.id, {
-                    type: 'metadata_updated',
-                    metadata: {
-                      currentContext: {
-                        tokens: contextFillTokens,
-                        contextWindow: contextWindowForDisplay,
+                  try {
+                    const outcome = await syncProvider.pushChange(session.id, {
+                      type: 'metadata_updated',
+                      metadata: {
+                        currentContext: {
+                          tokens: contextFillTokens,
+                          contextWindow: contextWindowForDisplay,
+                        },
                       },
-                    } as any,
-                  });
+                    });
+                    warnIfUnpublished(message => logger.main.warn(message), session.id, '[AIService] Failed to publish sync change', outcome);
+                  } catch (error) {
+                    logger.main.warn(`[AIService] Failed to publish sync change for session ${session.id}:`, error);
+                  }
                 }
               }
 
@@ -2640,15 +2668,20 @@ export class MessageStreamingHandler {
               if (reportsCurrentContext && contextFillTokens !== undefined && reportedContextWindow) {
                 const syncProvider = getSyncProvider();
                 if (syncProvider) {
-                  syncProvider.pushChange(session.id, {
-                    type: 'metadata_updated',
-                    metadata: {
-                      currentContext: {
-                        tokens: contextFillTokens,
-                        contextWindow: reportedContextWindow,
+                  try {
+                    const outcome = await syncProvider.pushChange(session.id, {
+                      type: 'metadata_updated',
+                      metadata: {
+                        currentContext: {
+                          tokens: contextFillTokens,
+                          contextWindow: reportedContextWindow,
+                        },
                       },
-                    } as any,
-                  });
+                    });
+                    warnIfUnpublished(message => logger.main.warn(message), session.id, '[AIService] Failed to publish sync change', outcome);
+                  } catch (error) {
+                    logger.main.warn(`[AIService] Failed to publish sync change for session ${session.id}:`, error);
+                  }
                 }
               }
 
@@ -3024,10 +3057,15 @@ export class MessageStreamingHandler {
 
       // Clear executing and pending prompt flags for mobile sync
       if (syncProvider && !this.svc.sessionsProcessingQueue.has(session.id)) {
-        syncProvider.pushChange(session.id, {
-          type: 'metadata_updated',
-          metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
-        });
+        try {
+          const outcome = await syncProvider.pushChange(session.id, {
+            type: 'metadata_updated',
+            metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
+          });
+          warnIfUnpublished(message => logger.main.warn(message), session.id, '[AIService] Failed to publish sync change', outcome);
+        } catch (error) {
+          logger.main.warn(`[AIService] Failed to publish sync change for session ${session.id}:`, error);
+        }
       }
 
       // Clean up queued prompt tracking
@@ -3121,10 +3159,15 @@ export class MessageStreamingHandler {
 
         // Clear executing and pending prompt flags for mobile sync on error
         if (syncProvider && !this.svc.sessionsProcessingQueue.has(session.id)) {
-          syncProvider.pushChange(session.id, {
-            type: 'metadata_updated',
-            metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
-          });
+          try {
+            const outcome = await syncProvider.pushChange(session.id, {
+              type: 'metadata_updated',
+              metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
+            });
+            warnIfUnpublished(message => logger.main.warn(message), session.id, '[AIService] Failed to publish sync change', outcome);
+          } catch (error) {
+            logger.main.warn(`[AIService] Failed to publish sync change for session ${session.id}:`, error);
+          }
 
           // Forced (#1268): a session that died unattended is exactly when the
           // user needs to hear about it, so the server -- not this process --

@@ -12,7 +12,7 @@ import os
 ///   - SwiftUI views observe the database for reactive updates
 @MainActor
 public final class SyncManager: ObservableObject {
-    private let logger = Logger(subsystem: "com.nimbalyst.app", category: "SyncManager")
+    let logger = Logger(subsystem: "com.nimbalyst.app", category: "SyncManager")
 
     private let crypto: CryptoManager
     private let database: DatabaseManager
@@ -22,7 +22,7 @@ public final class SyncManager: ObservableObject {
         return client
     }()
     private let sessionClient = WebSocketClient()
-    private let decoder = JSONDecoder()
+    let decoder = JSONDecoder()
     /// Decodes index-room JSON away from the main actor. See IndexMessageDecoder.
     private let indexDecoder = IndexMessageDecoder()
 
@@ -66,10 +66,70 @@ public final class SyncManager: ObservableObject {
     lazy var sessionCreations = SessionCreationTracker(
         database: database,
         lookup: { [weak self] in self?.requestSessionIndexLookup(sessionId: $0) },
-        onReady: { [weak self] requestId, sessionId in self?.onSessionCreated?(requestId, sessionId) }
+        onReady: { [weak self] requestId, sessionId in
+            // #NIM-5925: the tracker fires on the committed GRDB row, which is
+            // the only moment that is guaranteed to exist. Waiting for the next
+            // bulk ingestion outcome dropped the draft whenever the row arrived
+            // on a lookup page instead.
+            self?.applyPendingCreationDrafts()
+            self?.onSessionCreated?(requestId, sessionId)
+        }
     )
     private var pendingCreationDrafts: [String: String] = [:]
     private var pendingSessionDrafts: [String: String] = [:]
+
+    /// The last sync failure worth showing the user, or nil once it clears.
+    /// Fed by the request registry and by the decrypt/storage paths that used to
+    /// log and return. Rendering lives outside the sync layer.
+    @Published public private(set) var syncError: SyncError?
+
+    /// Collapses a burst of same-kind failures into one banner. See
+    /// SyncErrorCoalescer -- alternating draft and read-receipt failures against
+    /// one dead socket are a single interruption.
+    private var errorCoalescer = SyncErrorCoalescer()
+
+    /// The only way `syncError` is set. Every failure path goes through here so
+    /// the coalescing rule cannot be bypassed by a new call site.
+    private func report(_ error: SyncError) {
+        guard let published = errorCoalescer.accept(error) else { return }
+        syncError = published
+    }
+
+    public func clearSyncError() {
+        syncError = nil
+        errorCoalescer.clear()
+    }
+
+    /// Every outbound message that is not fire-and-forget. See SyncRequestRegistry.
+    private(set) lazy var requests: SyncRequestRegistry = {
+        let registry = SyncRequestRegistry(timeout: requestTimeout) { [weak self] channel, json, completion in
+            guard let self else {
+                completion(NSError(domain: "SyncManager", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Sync stopped"]))
+                return
+            }
+            if let sender = self.sender {
+                sender(channel, json, completion)
+                return
+            }
+            switch channel {
+            case .index: self.indexClient.sendRaw(json, completion: completion)
+            case .session: self.sessionClient.sendRaw(json, completion: completion)
+            }
+        }
+        registry.onOutcome = { [weak self] outcome in
+            guard let self, let error = outcome.error else { return }
+            if outcome.kind == .voiceTool {
+                // The caller is suspended on a continuation, not watching a
+                // banner; resuming it is the whole report.
+                self.voiceTools.fail(outcome.requestId, message: error.message)
+                return
+            }
+            guard outcome.kind.isUserVisible else { return }
+            self.report(error)
+        }
+        return registry
+    }()
 
     /// Called with diagnostic info when session message sync completes (success or failure).
     /// Parameters: (sessionId, diagnostic).
@@ -118,6 +178,18 @@ public final class SyncManager: ObservableObject {
     /// Buffer for paginated sync responses before committing to DB.
     private var sessionSyncBuffer: [ServerMessageEntry] = []
 
+    /// The room the session socket is joined to, readable from the socket's own
+    /// queue. #NIM-5924: session-room traffic carries no session id, so it used
+    /// to be attributed to `activeSessionId` -- read on the main actor one hop
+    /// later, by which time navigation may have moved on. Capturing the room at
+    /// arrival is the closest thing to keying on the broadcast's own session
+    /// that the wire currently allows.
+    private let sessionRoom = SessionRoomBox()
+
+    /// Last applied metadata timestamp per session, so a late or replayed
+    /// metadata broadcast cannot re-run the executing -> idle transition.
+    private var lastMetadataUpdatedAt: [String: Int] = [:]
+
     // MARK: - Index Ingestion
 
     /// The serial owner of index decode/decrypt/apply work for the current
@@ -159,15 +231,40 @@ public final class SyncManager: ObservableObject {
         self.init(crypto: crypto, database: database, serverUrl: serverUrl, userId: userId, registerDeviceCallbacks: true)
     }
 
-    private let creationSender: ((String, @escaping @MainActor @Sendable (Error?) -> Void) -> Void)?
+    /// Replaces both sockets for tests. Production leaves this nil.
+    private let sender: SyncRequestRegistry.Sender?
+    /// Last settings broadcast accepted per desktop. See SettingsSyncApplier.
+    private let settingsVersions: AppliedSettingsVersionStore
+
+    /// Whether this manager may touch UNUserNotificationCenter and ActivityKit.
+    ///
+    /// Both trap with `bundleProxyForCurrentProcess is nil` outside an app
+    /// bundle, which is every `swift test` run on macOS. The flag used to gate
+    /// only the init-time callback wiring, so a test that merely called
+    /// `connect` still crashed on the first `NotificationManager.shared` touch
+    /// in the connection-state handler.
+    let registersDeviceTokens: Bool
+    private let requestTimeout: Duration
 
     /// Allows index import tests to run without an application notification center.
-    init(crypto: CryptoManager, database: DatabaseManager, serverUrl: String, userId: String, registerDeviceCallbacks: Bool, creationSender: ((String, @escaping @MainActor @Sendable (Error?) -> Void) -> Void)? = nil) {
+    init(
+        crypto: CryptoManager,
+        database: DatabaseManager,
+        serverUrl: String,
+        userId: String,
+        registerDeviceCallbacks: Bool,
+        requestTimeout: Duration = .seconds(30),
+        sender: SyncRequestRegistry.Sender? = nil,
+        settingsVersions: AppliedSettingsVersionStore = AppliedSettingsVersionStore()
+    ) {
         self.crypto = crypto
         self.database = database
         self.serverUrl = serverUrl
         self.userId = userId
-        self.creationSender = creationSender
+        self.sender = sender
+        self.requestTimeout = requestTimeout
+        self.settingsVersions = settingsVersions
+        self.registersDeviceTokens = registerDeviceCallbacks
 
         startIndexIngestionGeneration()
         setupIndexClient()
@@ -206,7 +303,10 @@ public final class SyncManager: ObservableObject {
         replication = IndexReplicationClient(
             generation: generation,
             send: { [weak self] json in
-                self?.indexClient.sendRaw(json)
+                // Not user-visible: the replication client re-drives its own
+                // cursor from `start()` on the next connect, so a failed page
+                // request is recorded and retried by its owner, not by a banner.
+                self?.requests.send(kind: .indexRequest, channel: .index, json: json)
             },
             submitPage: { [weak self] response, request in
                 guard let self else { return }
@@ -390,6 +490,10 @@ public final class SyncManager: ObservableObject {
     /// Disconnect from all rooms.
     public func disconnect() {
         sessionCreation.disconnect()
+        // A deliberate disconnect drops the parked writes too: on reconnect the
+        // account may be a different one, and replaying a draft for an identity
+        // we are no longer writing for would publish it to the wrong index.
+        requests.cancel()
         connectedDevices = []
         pendingCreationDrafts.removeAll()
         pendingSessionDrafts.removeAll()
@@ -417,6 +521,7 @@ public final class SyncManager: ObservableObject {
         }
 
         activeSessionId = sessionId
+        sessionRoom.sessionId = sessionId
         sessionSyncBuffer = []
 
         let roomId = "org:\(orgId ?? ""):user:\(effectiveUserId):session:\(sessionId)"
@@ -446,7 +551,9 @@ public final class SyncManager: ObservableObject {
             return
         }
         sessionClient.disconnect()
+        if let leaving = activeSessionId { lastMetadataUpdatedAt.removeValue(forKey: leaving) }
         activeSessionId = nil
+        sessionRoom.sessionId = nil
         sessionSyncBuffer = []
     }
 
@@ -458,29 +565,23 @@ public final class SyncManager: ObservableObject {
                 self?.isConnected = connected
                 if !connected {
                     self?.sessionCreation.disconnect()
+                    self?.requests.disconnect()
                     self?.connectedDevices = []
                 }
                 if connected {
+                    // Re-publish the optimistic local writes whose send never
+                    // landed, from the rows as they read now.
+                    self?.requests.reconnect()
                     // Versioned replication probes first; the probe's
                     // unknown_message_type answer is what falls back to the
                     // legacy index request (see IndexReplicationClient).
                     self?.indexLoadState = .loading
                     self?.replication?.start()
-                    if NotificationManager.shared.shouldRegisterForPush,
-                       let token = NotificationManager.shared.deviceToken {
-                        self?.registerPushToken(token)
-                    } else {
-                        self?.unregisterPushToken()
-                    }
                     // ActivityKit hands out a push-to-start token once per
                     // launch, which is routinely before the socket is up. A
                     // token that only existed while we were disconnected is a
                     // card that never appears, with nothing to see in any log.
-                    if FleetActivityController.shared.shouldRegister {
-                        FleetActivityController.shared.resendTokens()
-                    } else {
-                        self?.unregisterLiveActivityToken(kind: nil)
-                    }
+                    self?.registerDeviceTokensOnConnect()
                 }
             }
         }
@@ -627,9 +728,7 @@ public final class SyncManager: ObservableObject {
         case "settingsSyncBroadcast":
             handleSettingsSyncBroadcast(data)
         case "createWorktreeResponseBroadcast":
-            // Response to our worktree creation request - the worktree session
-            // will appear via indexBroadcast, so no special handling needed
-            break
+            handleCreateWorktreeResponse(data)
         case "voiceToolResponseBroadcast":
             handleVoiceToolResponse(data)
         case "error":
@@ -685,6 +784,21 @@ public final class SyncManager: ObservableObject {
         sessionCreations.receive(broadcast.response)
     }
 
+    /// The worktree session itself arrives via the index, but the answer is the
+    /// only thing that says the desktop got as far as trying. Without it the
+    /// request had no tracker and no timeout: a failure looked like a slow one.
+    private func handleCreateWorktreeResponse(_ data: Data) {
+        guard let broadcast = try? decoder.decode(CreateWorktreeResponseBroadcast.self, from: data) else {
+            logger.error("Failed to decode createWorktreeResponseBroadcast")
+            return
+        }
+        let response = broadcast.response
+        requests.resolve(
+            requestId: response.requestId,
+            detail: response.success ? nil : (response.error ?? "The desktop could not create the worktree.")
+        )
+    }
+
     private func applyPendingCreationDrafts() {
         for (sessionId, draft) in pendingSessionDrafts {
             guard (try? database.session(byId: sessionId)) != nil else { continue }
@@ -696,199 +810,58 @@ public final class SyncManager: ObservableObject {
     // MARK: - Voice Tool Proxy (mobile -> desktop)
 
     /// Result of a proxied voice tool call.
-    public struct VoiceToolCallResult {
-        public let success: Bool
-        public let result: String?
-        public let error: String?
+    public typealias VoiceToolCallResult = VoiceToolProxy.Result
+
+    private lazy var voiceTools = VoiceToolProxy(crypto: crypto) { [weak self] requestId, json in
+        self?.requests.request(kind: .voiceTool, requestId: requestId, channel: .index, json: json)
     }
-
-    /// Continuations awaiting a desktop voice-tool response, keyed by requestId.
-    private var pendingVoiceToolCalls: [String: CheckedContinuation<VoiceToolCallResult, Never>] = [:]
-
-    /// Voice-tool request timeout. The memory engine lives on the desktop; if no
-    /// desktop is connected the request never gets answered, so we resolve
-    /// gracefully after this window.
-    private static let voiceToolTimeoutNs: UInt64 = 30_000_000_000 // 30s
 
     /// Run a desktop-hosted voice tool (e.g. project-memory lookup) by proxying
     /// it over the sync channel. Returns the tool result, or a graceful failure
     /// if the desktop is unavailable / doesn't respond in time.
     public func callVoiceTool(toolName: String, argsJson: String, projectId: String) async -> VoiceToolCallResult {
-        let encryptedProjectId: String
-        let toolNameEnc: (encrypted: String, iv: String)
-        let argsEnc: (encrypted: String, iv: String)
-        do {
-            encryptedProjectId = try crypto.encryptProjectId(projectId)
-            toolNameEnc = try crypto.encrypt(plaintext: toolName)
-            argsEnc = try crypto.encrypt(plaintext: argsJson)
-        } catch {
-            return VoiceToolCallResult(success: false, result: nil, error: "Failed to encrypt voice tool request")
-        }
-
-        let requestId = UUID().uuidString
-        let message = VoiceToolRequestMessage(
-            request: EncryptedVoiceToolRequest(
-                requestId: requestId,
-                encryptedProjectId: encryptedProjectId,
-                projectIdIv: CryptoManager.projectIdIvBase64,
-                encryptedToolName: toolNameEnc.encrypted,
-                toolNameIv: toolNameEnc.iv,
-                encryptedArgs: argsEnc.encrypted,
-                argsIv: argsEnc.iv,
-                timestamp: Int(Date().timeIntervalSince1970 * 1000)
-            )
-        )
-
-        guard let data = try? JSONEncoder().encode(message),
-              let json = String(data: data, encoding: .utf8) else {
-            return VoiceToolCallResult(success: false, result: nil, error: "Failed to encode voice tool request")
-        }
-
-        return await withCheckedContinuation { continuation in
-            pendingVoiceToolCalls[requestId] = continuation
-            indexClient.sendRaw(json)
-
-            // Timeout fallback (desktop offline / slow).
-            Task { [weak self] in
-                try? await Task.sleep(nanoseconds: SyncManager.voiceToolTimeoutNs)
-                guard let self else { return }
-                if let pending = self.pendingVoiceToolCalls.removeValue(forKey: requestId) {
-                    pending.resume(returning: VoiceToolCallResult(
-                        success: false,
-                        result: nil,
-                        error: "Project memory is unavailable because your desktop isn't connected."
-                    ))
-                }
-            }
-        }
+        await voiceTools.call(toolName: toolName, argsJson: argsJson, projectId: projectId)
     }
 
     private func handleVoiceToolResponse(_ data: Data) {
-        guard let broadcast = try? decoder.decode(VoiceToolResponseBroadcast.self, from: data) else {
-            logger.error("Failed to decode voiceToolResponseBroadcast")
-            return
-        }
-        let resp = broadcast.response
-        guard let continuation = pendingVoiceToolCalls.removeValue(forKey: resp.requestId) else {
-            return // already resolved by timeout, or not ours
-        }
-        var resultText: String?
-        if let enc = resp.encryptedResult, let iv = resp.resultIv {
-            resultText = crypto.decryptOrNil(encryptedBase64: enc, ivBase64: iv)
-        }
-        var errorText: String?
-        if let enc = resp.encryptedError, let iv = resp.errorIv {
-            errorText = crypto.decryptOrNil(encryptedBase64: enc, ivBase64: iv)
-        }
-        continuation.resume(returning: VoiceToolCallResult(
-            success: resp.success,
-            result: resultText,
-            error: errorText
-        ))
-    }
-
-    // MARK: - Device Presence
-
-    private func handleDevicesList(_ data: Data) {
-        struct DevicesListMessage: Codable {
-            let devices: [DeviceInfo]
-        }
-        guard let msg = try? decoder.decode(DevicesListMessage.self, from: data) else { return }
-        connectedDevices = msg.devices
-    }
-
-    private func handleDeviceJoined(_ data: Data) {
-        struct DeviceJoinedMessage: Codable {
-            let device: DeviceInfo
-        }
-        guard let msg = try? decoder.decode(DeviceJoinedMessage.self, from: data) else { return }
-        if !connectedDevices.contains(where: { $0.deviceId == msg.device.deviceId }) {
-            connectedDevices.append(msg.device)
-        }
-    }
-
-    private func handleDeviceLeft(_ data: Data) {
-        struct DeviceLeftMessage: Codable {
-            let deviceId: String
-        }
-        guard let msg = try? decoder.decode(DeviceLeftMessage.self, from: data) else { return }
-        connectedDevices.removeAll { $0.deviceId == msg.deviceId }
+        guard let requestId = voiceTools.receive(data) else { return }
+        requests.resolve(requestId: requestId)
     }
 
     // MARK: - Settings Sync
 
-    private func handleSettingsSyncBroadcast(_ data: Data) {
-        guard let broadcast = try? decoder.decode(SettingsSyncBroadcast.self, from: data) else {
-            logger.error("Failed to decode settingsSyncBroadcast")
-            return
-        }
-
-        let payload = broadcast.settings
-        logger.info("Received settings sync from device: \(payload.deviceId), version: \(payload.version)")
-
-        // Decrypt the settings JSON using the shared encryption key
-        guard let settingsJson = crypto.decryptOrNil(
-            encryptedBase64: payload.encryptedSettings,
-            ivBase64: payload.settingsIv
-        ) else {
-            logger.error("Failed to decrypt synced settings")
-            return
-        }
-
-        guard let settingsData = settingsJson.data(using: .utf8),
-              let settings = try? JSONDecoder().decode(SyncedSettings.self, from: settingsData) else {
-            logger.error("Failed to parse decrypted settings JSON")
-            return
-        }
-
-        logger.info("Decrypted settings: version=\(settings.version), hasOpenAIKey=\(settings.openaiApiKey != nil)")
-
-        // Store the OpenAI API key in the Keychain
-        do {
-            if try applySyncedOpenAIKey(settings.openaiApiKey, store: KeychainManager.storeOpenAIApiKey, delete: KeychainManager.deleteOpenAIApiKey) {
-                NotificationCenter.default.post(name: .init("OpenAIApiKeySynced"), object: nil)
+    func handleSettingsSyncBroadcast(_ data: Data) {
+        switch SettingsSyncApplier.decode(data, crypto: crypto) {
+        case .failure(let failure):
+            logger.error("Settings sync rejected: \(failure.label)")
+            if failure == .undecryptable {
+                report(SyncError(kind: .decrypt,
+                    message: "Settings from your desktop could not be read with this device's key."))
             }
-        } catch {
-            logger.error("Could not apply synced OpenAI credential to Keychain")
-        }
-
-        #if os(iOS)
-        // Store voice mode settings if present. preferredAgentLanguage is a
-        // top-level field, so persist it even when voiceMode itself is absent --
-        // it pins the voice agent's spoken language to the desktop default.
-        if settings.voiceMode != nil || settings.preferredAgentLanguage != nil {
-            var currentSettings = VoiceModeSettings.load()
-            if let voiceMode = settings.voiceMode {
-                if let voice = voiceMode.voice {
-                    currentSettings.voice = voice
-                }
-                if let delay = voiceMode.submitDelayMs {
-                    currentSettings.promptConfirmationDelay = TimeInterval(delay) / 1000.0
-                }
+        case .success(let accepted):
+            let payload = accepted.payload
+            // #NIM-5921: the desktop's counter restarts at zero on every desktop
+            // launch, so a rejoin used to replay an old payload -- including the
+            // OpenAI credential -- over newer state.
+            guard SettingsSyncApplier.isFresh(
+                version: payload.version,
+                timestamp: payload.timestamp,
+                lastApplied: settingsVersions.lastApplied(deviceId: payload.deviceId)
+            ) else {
+                logger.info("Settings sync rejected: \(SettingsSyncApplier.Failure.stale.label) (v\(payload.version) @\(payload.timestamp))")
+                return
             }
-            currentSettings.language = settings.preferredAgentLanguage
-            currentSettings.save()
+            settingsVersions.record(deviceId: payload.deviceId, version: payload.version, timestamp: payload.timestamp)
+            logger.info("Applying settings v\(payload.version) from device \(payload.deviceId)")
+            SettingsSyncApplier.apply(accepted.settings)
+            if let models = accepted.settings.availableModels {
+                availableModels = models
+            }
+            if let defaultModel = accepted.settings.defaultModel {
+                desktopDefaultModel = defaultModel
+            }
+            onSettingsSynced?(accepted.settings)
         }
-        #endif
-
-        // Store available models from desktop for the model picker and persist
-        if let models = settings.availableModels {
-            availableModels = models
-            ModelPreferences.saveAvailableModels(models, defaultModel: settings.defaultModel)
-            logger.info("Synced \(models.count) available models from desktop")
-        }
-        if let defaultModel = settings.defaultModel {
-            desktopDefaultModel = defaultModel
-            logger.info("Desktop default model: \(defaultModel)")
-        }
-
-        // Persist the meta-agent alpha gate from desktop and notify gated UI.
-        let metaAgentEnabled = settings.metaAgentEnabled ?? false
-        FeaturePreferences.setMetaAgentEnabled(metaAgentEnabled)
-        NotificationCenter.default.post(name: .init("MetaAgentEnabledSynced"), object: nil)
-        logger.info("Meta Agent alpha gate from desktop: \(metaAgentEnabled)")
-
-        onSettingsSynced?(settings)
     }
 
     // MARK: - Error Handling
@@ -912,8 +885,10 @@ public final class SyncManager: ObservableObject {
         }
 
         sessionClient.onMessage = { [weak self] data in
+            // Read the room synchronously, on the queue the frame arrived on.
+            guard let sessionId = self?.sessionRoom.sessionId else { return }
             Task { @MainActor in
-                self?.handleSessionMessage(data)
+                self?.handleSessionMessage(data, sessionId: sessionId)
             }
         }
     }
@@ -979,7 +954,7 @@ public final class SyncManager: ObservableObject {
         }
     }
 
-    private func handleSessionMessage(_ data: Data) {
+    func handleSessionMessage(_ data: Data, sessionId: String) {
         guard let envelope = try? decoder.decode(ServerMessage.self, from: data) else {
             let rawPreview = String(data: data.prefix(200), encoding: .utf8) ?? "<binary>"
             logger.warning("Could not decode session message type — raw: \(rawPreview)")
@@ -988,11 +963,11 @@ public final class SyncManager: ObservableObject {
 
         switch envelope.type {
         case "syncResponse":
-            handleSessionSyncResponse(data)
+            handleSessionSyncResponse(data, sessionId: sessionId)
         case "messageBroadcast":
-            handleMessageBroadcast(data)
+            handleMessageBroadcast(data, sessionId: sessionId)
         case "metadataBroadcast":
-            handleMetadataBroadcast(data)
+            handleMetadataBroadcast(data, sessionId: sessionId)
         case "error":
             handleServerError(data)
         default:
@@ -1002,7 +977,7 @@ public final class SyncManager: ObservableObject {
 
     // MARK: - Session Sync Response
 
-    private func handleSessionSyncResponse(_ data: Data) {
+    private func handleSessionSyncResponse(_ data: Data, sessionId: String) {
         let response: SessionSyncResponse
         do {
             response = try decoder.decode(SessionSyncResponse.self, from: data)
@@ -1010,13 +985,12 @@ public final class SyncManager: ObservableObject {
         } catch {
             let rawPreview = String(data: data.prefix(500), encoding: .utf8) ?? "<binary>"
             logger.error("Failed to decode session syncResponse: \(error.localizedDescription) — raw: \(rawPreview)")
-            if let sessionId = activeSessionId {
-                emitSessionSyncDiagnostic(sessionId, SessionSyncDiagnostic(
-                    totalServerMessages: 0, decryptedCount: 0, storedCount: 0,
-                    failedMessageIds: [], failedSequences: [],
-                    error: "Sync response decode failed: \(error.localizedDescription)"
-                ))
-            }
+            emitSessionSyncDiagnostic(sessionId, SessionSyncDiagnostic(
+                totalServerMessages: 0, decryptedCount: 0, storedCount: 0,
+                failedMessageIds: [], failedSequences: [],
+                error: "Sync response decode failed: \(error.localizedDescription)"
+            ))
+            report(SyncError(kind: .transport, message: "Part of this transcript could not be loaded."))
             return
         }
 
@@ -1029,17 +1003,15 @@ public final class SyncManager: ObservableObject {
             let request = SessionSyncRequest(sinceSeq: sinceSeq)
             if let data = try? JSONEncoder().encode(request),
                let json = String(data: data, encoding: .utf8) {
-                sessionClient.sendRaw(json)
+                requests.send(kind: .sessionSyncPage, channel: .session, json: json)
             }
         } else {
             // All pages received - decrypt and store
-            commitSessionMessages()
+            commitSessionMessages(sessionId: sessionId)
         }
     }
 
-    private func commitSessionMessages() {
-        guard let sessionId = activeSessionId else { return }
-
+    private func commitSessionMessages(sessionId: String) {
         let totalCount = sessionSyncBuffer.count
         var failedIds: [String] = []
         var failedSeqs: [Int] = []
@@ -1119,9 +1091,8 @@ public final class SyncManager: ObservableObject {
 
     // MARK: - Real-time Session Messages
 
-    private func handleMessageBroadcast(_ data: Data) {
-        guard let broadcast = try? decoder.decode(MessageBroadcast.self, from: data),
-              let sessionId = activeSessionId else {
+    private func handleMessageBroadcast(_ data: Data, sessionId: String) {
+        guard let broadcast = try? decoder.decode(MessageBroadcast.self, from: data) else {
             let rawPreview = String(data: data.prefix(200), encoding: .utf8) ?? "<binary>"
             logger.error("Failed to decode messageBroadcast — raw: \(rawPreview)")
             return
@@ -1129,30 +1100,46 @@ public final class SyncManager: ObservableObject {
 
         guard let message = decryptServerMessage(broadcast.message, sessionId: sessionId) else {
             // decryptServerMessage already logs the specific error
+            report(SyncError(kind: .decrypt, message: "A message in this transcript could not be read with this device's key."))
             return
         }
 
         do {
             try database.appendMessage(message)
 
-            // Update sync watermark
-            let now = Int(Date().timeIntervalSince1970 * 1000)
-            let syncState = SyncState(
+            // #NIM-5924: the watermark only moves forward. A broadcast that
+            // arrives late, or out of order after a reconnect, used to rewind
+            // it, and the next delta request then re-fetched from the lower
+            // sequence -- or skipped everything above it on the next advance.
+            let lastSequence = (try? database.syncState(forRoom: sessionId))?.lastSequence ?? 0
+            guard message.sequence > lastSequence else { return }
+            try database.updateSyncState(SyncState(
                 roomId: sessionId,
                 lastCursor: nil,
                 lastSequence: message.sequence,
-                lastSyncedAt: now
-            )
-            try database.updateSyncState(syncState)
+                lastSyncedAt: Int(Date().timeIntervalSince1970 * 1000)
+            ))
         } catch {
             logger.error("Failed to store broadcast message: \(error.localizedDescription)")
+            report(SyncError(kind: .storage, message: "Could not save an incoming message on this device."))
         }
     }
 
-    private func handleMetadataBroadcast(_ data: Data) {
-        guard let broadcast = try? decoder.decode(MetadataBroadcast.self, from: data),
-              let sessionId = activeSessionId else {
+    private func handleMetadataBroadcast(_ data: Data, sessionId: String) {
+        guard let broadcast = try? decoder.decode(MetadataBroadcast.self, from: data) else {
             return
+        }
+
+        // #NIM-5924: `updatedAt` is the only ordering signal this payload
+        // carries. Without comparing it, a replayed executing:true followed by
+        // the already-applied executing:false fired onSessionCompleted twice --
+        // two completion notifications for one turn.
+        if let updatedAt = broadcast.metadata.updatedAt {
+            guard updatedAt > (lastMetadataUpdatedAt[sessionId] ?? Int.min) else {
+                logger.info("Ignoring metadata broadcast for \(sessionId) at \(updatedAt): not newer than what is applied")
+                return
+            }
+            lastMetadataUpdatedAt[sessionId] = updatedAt
         }
 
         // Update session metadata in the database
@@ -1266,50 +1253,43 @@ public final class SyncManager: ObservableObject {
         }
 
         do {
-            let clientMeta = ClientMetadata(
-                currentContext: nil,
-                hasPendingPrompt: nil,
-                phase: session.phase,
-                tags: session.tags.isEmpty ? nil : session.tags,
-                draftInput: draftInput,  // Send "" explicitly when clearing so remote caches update
-                draftUpdatedAt: now
+            let json = try draftIndexUpdate(session: session, draft: draftInput, draftUpdatedAt: now)
+            logger.info("[Draft] Sending indexUpdate via WebSocket, json length=\(json.count)")
+            // The local row is already committed, so a failed send is a
+            // divergence, not a lost edit: park it and re-publish whatever the
+            // row says after the socket comes back.
+            requests.send(
+                kind: .draftPush,
+                channel: .index,
+                json: json,
+                coalesceKey: "draft:\(sessionId)",
+                rebuild: { [weak self] in self?.rebuildDraftIndexUpdate(sessionId: sessionId) }
             )
-            let metaJson = try JSONEncoder().encode(clientMeta)
-            guard let metaString = String(data: metaJson, encoding: .utf8) else { return }
-            let encrypted = try crypto.encrypt(plaintext: metaString)
-
-            let encryptedProjectId = try crypto.encryptProjectId(session.projectId)
-            var indexEntry = IndexUpdateEntry(
-                sessionId: sessionId,
-                encryptedProjectId: encryptedProjectId,
-                projectIdIv: CryptoManager.projectIdIvBase64,
-                encryptedTitle: session.titleEncrypted,
-                titleIv: session.titleIv,
-                provider: session.provider ?? "claude-code",
-                model: session.model,
-                mode: session.mode,
-                messageCount: (try? database.messages(forSession: sessionId).count) ?? 0,
-                lastMessageAt: session.lastMessageAt ?? session.updatedAt,
-                createdAt: session.createdAt,
-                updatedAt: Int(Date().timeIntervalSince1970 * 1000),
-                isExecuting: session.isExecuting,
-                queuedPromptCount: nil,
-                encryptedQueuedPrompts: nil
-            )
-            indexEntry.encryptedClientMetadata = encrypted.encrypted
-            indexEntry.clientMetadataIv = encrypted.iv
-
-            let indexMessage = IndexUpdateMessage(session: indexEntry)
-            if let data = try? JSONEncoder().encode(indexMessage),
-               let json = String(data: data, encoding: .utf8) {
-                logger.info("[Draft] Sending indexUpdate via WebSocket, json length=\(json.count), hasClientMeta=\(indexEntry.encryptedClientMetadata != nil)")
-                indexClient.sendRaw(json)
-            } else {
-                logger.error("[Draft] Failed to encode IndexUpdateMessage to JSON")
-            }
         } catch {
             logger.error("[Draft] Failed to push draft input to sync: \(error.localizedDescription)")
+            report(SyncError(kind: .transport, message: SyncRequestKind.draftPush.failureDescription))
         }
+    }
+
+    private func draftIndexUpdate(session: Session, draft: String, draftUpdatedAt: Int) throws -> String {
+        try SessionIndexUpdates.draft(
+            session: session,
+            draft: draft,
+            draftUpdatedAt: draftUpdatedAt,
+            messageCount: try? database.messages(forSession: session.id).count,
+            crypto: crypto
+        )
+    }
+
+    /// Rebuilds the draft push from the committed row, so a replay publishes
+    /// what the composer holds now rather than the edit that failed to send.
+    private func rebuildDraftIndexUpdate(sessionId: String) -> String? {
+        guard let session = try? database.session(byId: sessionId) else { return nil }
+        return try? draftIndexUpdate(
+            session: session,
+            draft: session.draftInput ?? "",
+            draftUpdatedAt: session.draftUpdatedAt ?? Int(Date().timeIntervalSince1970 * 1000)
+        )
     }
 
     // MARK: - Send Prompt
@@ -1320,11 +1300,11 @@ public final class SyncManager: ObservableObject {
         logger.info("[SendPrompt] Starting: sessionId=\(sessionId), textLength=\(text.count), attachments=\(attachments.count), wsConnected=\(self.indexClient.isConnected), roomOrgId=\(self.orgId ?? "nil")")
         guard indexClient.isConnected else {
             logger.error("[SendPrompt] WebSocket not connected - cannot send prompt")
-            throw SyncError.webSocketSendFailed("Not connected to sync server")
+            throw PromptSendError.webSocketSendFailed("Not connected to sync server")
         }
         guard let session = try database.session(byId: sessionId) else {
             logger.error("[SendPrompt] Session not found: \(sessionId)")
-            throw SyncError.sessionNotFound
+            throw PromptSendError.sessionNotFound
         }
 
         let now = Int(Date().timeIntervalSince1970 * 1000)
@@ -1388,7 +1368,7 @@ public final class SyncManager: ObservableObject {
         let indexMessage = IndexUpdateMessage(session: indexEntry)
         let data = try JSONEncoder().encode(indexMessage)
         guard let json = String(data: data, encoding: .utf8) else {
-            throw SyncError.encodingFailed
+            throw PromptSendError.encodingFailed
         }
 
         // Send via WebSocket with completion handler to detect failures
@@ -1398,7 +1378,7 @@ public final class SyncManager: ObservableObject {
             }
         }
         if let sendError = sendResult {
-            throw SyncError.webSocketSendFailed(sendError.localizedDescription)
+            throw PromptSendError.webSocketSendFailed(sendError.localizedDescription)
         }
 
         // Store the prompt locally for immediate display in transcript
@@ -1424,7 +1404,16 @@ public final class SyncManager: ObservableObject {
     /// Routes to the desktop that owns the session. Without a target the server
     /// broadcasts and every connected desktop acts on the control -- two
     /// desktops both cancelling, or both answering the same prompt.
-    public func sendSessionControlMessage(sessionId: String, messageType: String, payload: [String: Any]? = nil) {
+    ///
+    /// `republish` is opt-in and belongs only to controls that mirror a local
+    /// row (archive). An interactive prompt response must never be replayed on
+    /// reconnect: by then the desktop has moved on and the answer is wrong.
+    public func sendSessionControlMessage(
+        sessionId: String,
+        messageType: String,
+        payload: [String: Any]? = nil,
+        republish: (@MainActor () -> String?)? = nil
+    ) {
         var hostDeviceId: String?
         if let session = try? database.session(byId: sessionId) {
             hostDeviceId = session.hostDeviceId
@@ -1442,11 +1431,20 @@ public final class SyncManager: ObservableObject {
         )
 
         let message = SessionControlMessage(message: controlPayload)
-        if let data = try? JSONEncoder().encode(message),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-            logger.info("Sent session_control: \(messageType) for session \(sessionId)")
+        guard let data = try? JSONEncoder().encode(message),
+              let json = String(data: data, encoding: .utf8) else {
+            logger.error("Failed to encode session_control: \(messageType) for session \(sessionId)")
+            report(SyncError(kind: .transport, message: SyncRequestKind.sessionControl.failureDescription))
+            return
         }
+        requests.send(
+            kind: .sessionControl,
+            channel: .index,
+            json: json,
+            coalesceKey: republish == nil ? nil : "control:\(messageType):\(sessionId)",
+            rebuild: republish
+        )
+        logger.info("Sent session_control: \(messageType) for session \(sessionId)")
     }
 
     /// Append a tool result to the session room for transcript storage.
@@ -1472,12 +1470,15 @@ public final class SyncManager: ObservableObject {
         let request = AppendMessageRequest(message: entry)
         if let data = try? JSONEncoder().encode(request),
            let json = String(data: data, encoding: .utf8) {
-            sessionClient.sendRaw(json)
+            requests.send(kind: .toolResult, channel: .session, json: json)
             logger.info("Appended tool result \(toolResultId) to session room")
         }
     }
 
-    enum SyncError: LocalizedError {
+    /// Thrown by the send paths a caller awaits directly. Distinct from the
+    /// top-level `SyncError`, which is the reportable surface for failures
+    /// nobody is awaiting.
+    enum PromptSendError: LocalizedError {
         case sessionNotFound
         case encodingFailed
         case webSocketSendFailed(String)
@@ -1504,111 +1505,6 @@ public final class SyncManager: ObservableObject {
         public let error: String?
     }
 
-    // MARK: - Session Actions
-
-    // MARK: - Push Token Registration
-
-    private func setupPushTokenForwarding() {
-        NotificationManager.shared.onTokenReceived = { [weak self] token in
-            Task { @MainActor in
-                self?.registerPushToken(token)
-            }
-        }
-        NotificationManager.shared.onPushDisabled = { [weak self] in
-            Task { @MainActor in
-                self?.unregisterPushToken()
-            }
-        }
-        // If a token was already received before SyncManager was created, use it now.
-        // This handles the case where NotificationManager.shared was accessed early
-        // (e.g., from SettingsView) and got a token before the callback was set.
-        if let existingToken = NotificationManager.shared.deviceToken {
-            if NotificationManager.shared.shouldRegisterForPush {
-                registerPushToken(existingToken)
-            } else {
-                unregisterPushToken()
-            }
-        }
-    }
-
-    /// Send the APNs push token to the sync server.
-    public func registerPushToken(_ token: String) {
-        guard NotificationManager.shared.shouldRegisterForPush else {
-            logger.info("Skipping push token registration because push notifications are disabled in app or OS")
-            return
-        }
-
-        let message = NotificationManager.makeRegisterTokenMessage(
-            token: token,
-            deviceId: WebSocketClient.deviceId
-        )
-        if let data = try? JSONEncoder().encode(message),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-            logger.info("Registered push token with server")
-        }
-    }
-
-    public func unregisterPushToken() {
-        let message = NotificationManager.makeUnregisterTokenMessage(
-            deviceId: WebSocketClient.deviceId
-        )
-        if let data = try? JSONEncoder().encode(message),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-            logger.info("Unregistered push token with server")
-        }
-    }
-
-    // MARK: - Live Activity Token Registration
-
-    private func setupLiveActivityForwarding() {
-        FleetActivityController.shared.onTokenReceived = { [weak self] token, kind in
-            Task { @MainActor in
-                self?.registerLiveActivityToken(token, kind: kind)
-            }
-        }
-        FleetActivityController.shared.onTokenInvalidated = { [weak self] kind in
-            Task { @MainActor in
-                self?.unregisterLiveActivityToken(kind: kind)
-            }
-        }
-        FleetActivityController.shared.start()
-    }
-
-    /// Send an ActivityKit token to the sync server.
-    ///
-    /// Kept apart from the APNs device token all the way down: the server stores
-    /// the two kinds under different prefixes because a token in the wrong lane
-    /// fails with an error indistinguishable from a bad token.
-    public func registerLiveActivityToken(_ token: String, kind: LiveActivityTokenKind) {
-        guard FleetActivityController.shared.shouldRegister else { return }
-        let message = RegisterLiveActivityTokenMessage(
-            token: token,
-            kind: kind.rawValue,
-            deviceId: WebSocketClient.deviceId,
-            platform: "ios",
-            environment: "production"
-        )
-        if let data = try? JSONEncoder().encode(message),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-            logger.info("Registered Live Activity \(kind.rawValue) token with server")
-        }
-    }
-
-    public func unregisterLiveActivityToken(kind: LiveActivityTokenKind?) {
-        let message = UnregisterLiveActivityTokenMessage(
-            deviceId: WebSocketClient.deviceId,
-            kind: kind?.rawValue
-        )
-        if let data = try? JSONEncoder().encode(message),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
-            logger.info("Unregistered Live Activity token(s) with server")
-        }
-    }
-
     /// Mark a session as read locally and push lastReadAt through the sync server.
     public func markSessionRead(sessionId: String) {
         let now = Int(Date().timeIntervalSince1970 * 1000)
@@ -1618,46 +1514,30 @@ public final class SyncManager: ObservableObject {
             try database.markSessionRead(sessionId)
         } catch {
             logger.error("Failed to mark session read locally: \(error.localizedDescription)")
+            report(SyncError(kind: .storage, message: "Could not save the read marker on this device."))
         }
 
         // Push lastReadAt through index update to server
         guard let session = try? database.session(byId: sessionId) else { return }
         do {
-            let encryptedProjectId = try crypto.encryptProjectId(session.projectId)
-
-            // Build a minimal index update with lastReadAt
-            var entry: [String: Any] = [
-                "sessionId": session.id,
-                "encryptedProjectId": encryptedProjectId,
-                "projectIdIv": CryptoManager.projectIdIvBase64,
-                "provider": session.provider ?? "unknown",
-                "messageCount": 0,
-                "lastMessageAt": session.lastMessageAt ?? session.updatedAt,
-                "createdAt": session.createdAt,
-                "updatedAt": session.updatedAt,
-                "isExecuting": session.isExecuting,
-                "lastReadAt": now,
-            ]
-
-            // Encrypt title if available
-            if let title = session.titleDecrypted {
-                let result = try crypto.encrypt(plaintext: title)
-                entry["encryptedTitle"] = result.encrypted
-                entry["titleIv"] = result.iv
-            }
-
-            let message: [String: Any] = [
-                "type": "indexUpdate",
-                "session": entry,
-            ]
-
-            if let data = try? JSONSerialization.data(withJSONObject: message),
-               let json = String(data: data, encoding: .utf8) {
-                indexClient.sendRaw(json)
-            }
+            let json = try SessionIndexUpdates.readReceipt(session: session, lastReadAt: now, crypto: crypto)
+            requests.send(
+                kind: .readReceipt,
+                channel: .index,
+                json: json,
+                coalesceKey: "read:\(sessionId)",
+                rebuild: { [weak self] in self?.rebuildReadReceipt(sessionId: sessionId) }
+            )
         } catch {
             logger.error("Failed to push lastReadAt to server: \(error.localizedDescription)")
+            report(SyncError(kind: .transport, message: SyncRequestKind.readReceipt.failureDescription))
         }
+    }
+
+    private func rebuildReadReceipt(sessionId: String) -> String? {
+        guard let session = try? database.session(byId: sessionId),
+              let lastReadAt = session.lastReadAt else { return nil }
+        return try? SessionIndexUpdates.readReceipt(session: session, lastReadAt: lastReadAt, crypto: crypto)
     }
 
     /// Request the desktop to create a new session in a project.
@@ -1686,7 +1566,7 @@ public final class SyncManager: ObservableObject {
                 if let initialDraft { pendingCreationDrafts[requestId] = initialDraft }
             },
             send: { [self] json, completion in
-                if let creationSender { creationSender(json, completion) }
+                if let sender { sender(.index, json, completion) }
                 else { indexClient.sendRaw(json, completion: completion) }
             }
         )
@@ -1694,28 +1574,36 @@ public final class SyncManager: ObservableObject {
     }
 
     /// Request the desktop to create a new git worktree.
-    /// The desktop will create the worktree and the result will arrive via index broadcast.
-    public func createWorktree(projectId: String) throws {
+    /// The worktree session arrives via index broadcast; the tracked request is
+    /// what makes a desktop that never answers distinguishable from a slow one.
+    /// Returns the requestId so a caller can correlate the outcome.
+    @discardableResult
+    public func createWorktree(projectId: String) throws -> String {
         let encryptedProjectId = try crypto.encryptProjectId(projectId)
 
+        let requestId = UUID().uuidString
         let request = CreateWorktreeRequestMessage(
             request: CreateWorktreeRequest(
-                requestId: UUID().uuidString,
+                requestId: requestId,
                 encryptedProjectId: encryptedProjectId,
                 projectIdIv: CryptoManager.projectIdIvBase64,
                 timestamp: Int(Date().timeIntervalSince1970 * 1000)
             )
         )
 
-        if let data = try? JSONEncoder().encode(request),
-           let json = String(data: data, encoding: .utf8) {
-            indexClient.sendRaw(json)
+        guard let data = try? JSONEncoder().encode(request),
+              let json = String(data: data, encoding: .utf8) else {
+            throw PromptSendError.encodingFailed
         }
+        requests.request(kind: .createWorktree, requestId: requestId, channel: .index, json: json)
+        return requestId
     }
 
     /// Update a session's parent (for reparenting into a workstream).
-    /// Updates the local database immediately for instant UI feedback.
-    /// The change will propagate to desktop on the next index sync cycle.
+    ///
+    /// Local first for instant UI feedback, then published. #NIM-5922: this
+    /// used to write locally and send nothing, so the desktop reasserted the
+    /// old parent on the next index page and the move silently undid itself.
     public func updateSessionParent(sessionId: String, parentSessionId: String) throws {
         try database.writer.write { db in
             try db.execute(
@@ -1723,6 +1611,27 @@ public final class SyncManager: ObservableObject {
                 arguments: [parentSessionId, sessionId]
             )
         }
+
+        guard let session = try? database.session(byId: sessionId) else { return }
+        do {
+            let json = try SessionIndexUpdates.parent(session: session, parentSessionId: parentSessionId, crypto: crypto)
+            requests.send(
+                kind: .reparent,
+                channel: .index,
+                json: json,
+                coalesceKey: "parent:\(sessionId)",
+                rebuild: { [weak self] in self?.rebuildParentIndexUpdate(sessionId: sessionId) }
+            )
+        } catch {
+            logger.error("Failed to publish reparent for \(sessionId): \(error.localizedDescription)")
+            report(SyncError(kind: .transport, message: SyncRequestKind.reparent.failureDescription))
+        }
+    }
+
+    private func rebuildParentIndexUpdate(sessionId: String) -> String? {
+        guard let session = try? database.session(byId: sessionId),
+              let parentSessionId = session.parentSessionId else { return nil }
+        return try? SessionIndexUpdates.parent(session: session, parentSessionId: parentSessionId, crypto: crypto)
     }
 
     /// Archive or unarchive a session.
@@ -1739,7 +1648,25 @@ public final class SyncManager: ObservableObject {
         sendSessionControlMessage(
             sessionId: sessionId,
             messageType: "archive",
-            payload: ["isArchived": isArchived]
+            payload: ["isArchived": isArchived],
+            // The row is already flipped locally; a replay re-asserts whatever
+            // it says now rather than the value that failed to send.
+            republish: { [weak self] in self?.rebuildArchiveControl(sessionId: sessionId) }
         )
+    }
+
+    private func rebuildArchiveControl(sessionId: String) -> String? {
+        guard let session = try? database.session(byId: sessionId) else { return nil }
+        let controlPayload = SessionControlPayload(
+            sessionId: sessionId,
+            messageType: "archive",
+            payload: ["isArchived": AnyCodable(session.isArchived)],
+            timestamp: Int(Date().timeIntervalSince1970 * 1000),
+            sentBy: "mobile",
+            sentByDeviceId: WebSocketClient.deviceId,
+            targetDeviceId: session.hostDeviceId
+        )
+        guard let data = try? JSONEncoder().encode(SessionControlMessage(message: controlPayload)) else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 }

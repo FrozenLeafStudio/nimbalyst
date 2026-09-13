@@ -33,13 +33,11 @@ import * as os from 'os';
 import { getProjectFileSyncService } from './ProjectFileSyncService';
 import { startProjectFileSync, stopAllProjectFileSync } from '../file/WorkspaceWatcher';
 import { windowStates } from '../window/WindowManager';
-import { getGitRemoteIdentities } from '../utils/gitUtils';
 import { createProjectConfigSync } from './sync/projectConfigSync';
-import { getAgentWorkflowService } from './AgentWorkflowService';
-import { getActionPromptService } from './ActionPromptService';
+import { projectConfigSources } from './sync/projectConfigSources';
+import { nextMobileSettingsVersion } from './sync/mobileSettingsVersion';
 import { resolveProjectPath } from '../utils/workspaceDetection';
 import { decideMissingSession } from './sync/missingSessionPolicy';
-import { createHash } from 'crypto';
 import { setSleepPreventionMode, setSyncConnected, shutdownSleepPrevention, type PreventSleepMode } from './PowerSaveService';
 import { reconnectAllTrackerSyncs } from './TrackerSyncManager';
 import { BrowserWindow } from 'electron';
@@ -638,6 +636,8 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     const syncedStore = createSyncedSessionStore(baseStore, provider, {
       autoConnect: true,
     });
+    // Config discovery owns its retry/logging and must not delay session startup.
+    void projectConfigSync.refresh();
 
     // Sync existing sessions and projects to index using delta sync
     // logger.main.info('[SyncManager] Setting up incremental sync...');
@@ -686,7 +686,6 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
           logger.main.warn('[SyncManager] Server index coverage is incomplete; skipping reconciliation this cycle');
           return;
         }
-        await projectConfigSync.refresh();
         const tombstonedSessionIds = new Set(serverIndex.deletedSessionIds ?? []);
         // Build a map of server sessions for quick lookup
         const serverSessionMap = new Map(
@@ -804,8 +803,8 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
 
           const { getSessionMessagesForSyncBatch } = await import('./PGLiteSessionStore');
 
-          // logger.main.info(`[SyncManager] Syncing ${sessionsNeedingIndexUpdate.length} sessions (${sessionsNeedingMessageSync.length} need message sync, messages will load lazily)`);
-          provider.syncSessionsToIndex(sessionsNeedingIndexUpdate, {
+          // Reconciliation runs in the background so index publication does not delay startup.
+          void provider.syncSessionsToIndex(sessionsNeedingIndexUpdate, {
             syncMessages: sessionsNeedingMessageSync.length > 0,
             messageSyncRequests,
             getMessagesForSync: getSessionMessagesForSyncBatch,
@@ -828,7 +827,8 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
             .map(s => allLocalSessions.find(ls => ls.id === s.sessionId))
             .filter((s): s is NonNullable<typeof s> => s != null);
           if (staleLocalSessions.length > 0) {
-            provider.syncSessionsToIndex(staleLocalSessions, { syncMessages: false });
+            // Clearing stale flags is background reconciliation and must not delay startup.
+            void provider.syncSessionsToIndex(staleLocalSessions, { syncMessages: false });
           }
         }
 
@@ -850,7 +850,7 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
         // even for agent-only users with no OpenAI key (e.g. Codex). Mobile
         // keeps its stored key when openaiKey is undefined (NIM-976).
         // logger.main.info('[SyncManager] Syncing existing settings to mobile devices');
-        syncSettingsToMobile();
+        await syncSettingsToMobile();
       } catch (error) {
         logger.main.warn('[SyncManager] Failed to sync initial settings:', error);
       }
@@ -872,11 +872,18 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
             // On first callback, add a small delay to ensure WebSocket is fully ready
             // This handles the case where mobile connected before desktop registered the listener
             const delay = isFirstCallback ? 1000 : 0;
-            setTimeout(() => {
+            setTimeout(async () => {
               // Sync settings to the mobile device
               if (state.provider !== provider) return;
-              void syncSettingsToMobile();
-              void projectConfigSync.refresh();
+              try {
+                const results = await Promise.allSettled([syncSettingsToMobile(), projectConfigSync.refresh()]);
+                const operations = ['settings', 'project config'];
+                results.forEach((result, index) => {
+                  if (result.status === 'rejected') logger.main.warn(`[SyncManager] Failed to refresh mobile device ${operations[index]}:`, result.reason);
+                });
+              } catch (error) {
+                logger.main.warn('[SyncManager] Failed to refresh mobile device settings or project config:', error);
+              }
             }, delay);
           }
         }
@@ -1008,6 +1015,7 @@ export function getPersonalDocSyncConfig(): {
  * Shutdown sync and disconnect all sessions.
  */
 export function shutdownSync(): void {
+  projectConfigSync.stop();
   remoteSessions.setProvider(null);
   shutdownSleepPrevention();
 
@@ -1203,8 +1211,8 @@ export async function triggerIncrementalSync(): Promise<void> {
 
       const { getSessionMessagesForSyncBatch } = await import('./PGLiteSessionStore');
 
-      // logger.main.info(`[SyncManager] Syncing ${sessionsNeedingIndexUpdate.length} sessions (${sessionsNeedingMessageSync.length} need message sync, messages will load lazily)`);
-      provider.syncSessionsToIndex(sessionsNeedingIndexUpdate, {
+      // Reconciliation publishes in the background so reconnect work can continue independently.
+      void provider.syncSessionsToIndex(sessionsNeedingIndexUpdate, {
         syncMessages: sessionsNeedingMessageSync.length > 0,
         messageSyncRequests,
         getMessagesForSync: getSessionMessagesForSyncBatch,
@@ -1223,9 +1231,6 @@ export async function triggerIncrementalSync(): Promise<void> {
 // ============================================================================
 // Settings Sync (Desktop -> Mobile)
 // ============================================================================
-
-// Track settings version to avoid re-syncing unchanged settings
-let settingsVersion = 0;
 
 /**
  * Get voice mode settings from the settings store.
@@ -1307,9 +1312,8 @@ export async function syncSettingsToMobile(_legacyOpenaiApiKey?: string): Promis
     return;
   }
 
-  // Increment version to ensure mobile gets the latest
-  settingsVersion++;
-
+  const settingsVersion = nextMobileSettingsVersion();
+  if (settingsVersion === undefined) return;
   // Get voice mode settings
   const voiceModeSettings = await getVoiceModeSettings();
 
@@ -1349,22 +1353,13 @@ export async function syncSettingsToMobile(_legacyOpenaiApiKey?: string): Promis
 // Project Config Sync (commands, etc.)
 // ============================================================================
 
-const projectConfigSync = createProjectConfigSync({
+export const projectConfigSync = createProjectConfigSync({
+  ...projectConfigSources,
   getProvider: () => state.provider,
   getEnabledProjects: () => store.get('sessionSync')?.enabledProjects ?? [],
   isProjectEnabled: path => createEnabledProjectFilter()(path),
-  discoverCommands: path => getAgentWorkflowService(path).listEntries({
-    provider: getDefaultAIModel()?.split(':')[0] || 'claude-code',
-  }),
-  discoverActions: async path => (await getActionPromptService(path).list()).actions,
-  getGitRemoteHash: async (workspacePath) => {
-    const remote = await getGitRemoteIdentities(workspacePath);
-    return remote ? createHash('sha256').update(remote.canonical).digest('hex') : undefined;
-  },
   warn: (message, error) => logger.main.warn(message, error),
 });
-
-export const { syncProjectCommandsToMobile, syncProjectActionsToMobile } = projectConfigSync;
 
 /**
  * Decrypt mobile image attachments and convert to ChatAttachment format.
@@ -1566,4 +1561,4 @@ export async function attemptReconnect(): Promise<void> {
 }
 
 // Reconnect also sends the durable vault tombstone if a clear occurred offline.
-subscribeProviderCredentialChanges(() => { void syncSettingsToMobile(); });
+subscribeProviderCredentialChanges(() => { void syncSettingsToMobile(); /* Credential edits must not wait for network sync. */ });

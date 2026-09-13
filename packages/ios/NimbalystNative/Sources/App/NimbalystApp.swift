@@ -327,6 +327,11 @@ public struct MainNavigationView: View {
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
+            // Beneath the auth banner: a sync failure is the narrower problem,
+            // and re-signing in is the action that fixes both when both show.
+            if let syncManager = appState.syncManager {
+                SyncErrorBannerHost(syncManager: syncManager)
+            }
             WorkspaceNavigationView(navigation: navigation)
         }
         .animation(.easeInOut(duration: 0.25), value: appState.syncAuthDegraded)

@@ -302,6 +302,7 @@
       "import": "./dist/sync/SyncedSessionStore.js",
       "types": "./dist/sync/SyncedSessionStore.d.ts"
     },
+    "./sync/pushOutcome": { "node": { "types": "./dist-node/sync/pushOutcome.d.ts", "import": "./dist-node/sync/pushOutcome.js" }, "import": "./dist/sync/pushOutcome.js", "types": "./dist/sync/pushOutcome.d.ts" },
     "./sync/types": {
       "node": {
         "types": "./dist-node/sync/types.d.ts",

@@ -1,3 +1,4 @@
+import { warnIfUnpublished } from '@nimbalyst/runtime/sync/pushOutcome';
 import { registerAskUserQuestionAnswerHandler } from './registerAskUserQuestionAnswerHandler';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import { configureCodexQuestionDelivery, deliverCodexQuestionAnswer } from '../codexQuestionDelivery';
@@ -67,10 +68,15 @@ export function registerInteractivePromptHandlers(ctx: AIServiceContext): void {
       TrayManager.getInstance().onPromptResolved(sessionId);
       const syncProvider = getSyncProvider();
       if (syncProvider) {
-        syncProvider.pushChange(sessionId, {
-          type: 'metadata_updated',
-          metadata: { hasPendingPrompt: false, updatedAt: Date.now() },
-        });
+        try {
+          const outcome = await syncProvider.pushChange(sessionId, {
+            type: 'metadata_updated',
+            metadata: { hasPendingPrompt: false, updatedAt: Date.now() },
+          });
+          warnIfUnpublished(message => logger.main.warn(message), sessionId, '[AIService] Failed to publish sync change', outcome);
+        } catch (error) {
+          logger.main.warn(`[AIService] Failed to publish sync change for session ${sessionId}:`, error);
+        }
       }
 
       return { success: true };
