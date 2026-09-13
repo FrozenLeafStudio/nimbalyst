@@ -122,6 +122,7 @@ export async function processDescriptor(
       const event = await writer.createToolCall(sessionId, {
         toolName: desc.toolName,
         toolDisplayName: desc.toolDisplayName,
+        description: desc.description,
         arguments: desc.arguments,
         targetFilePath: desc.targetFilePath,
         mcpServer: desc.mcpServer,
