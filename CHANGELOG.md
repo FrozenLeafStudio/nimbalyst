@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
-- Codex sessions continue tracking shell edits after a tool fails.
+- Codex sessions keep tracking shell edits after tool failures and show when file tracking is incomplete.
 - Shared CSVs preserve all rows while opening and retain concurrent edits during synchronization.
 - Custom editors exit review after Keep, Revert, or Keep All, even when a later history snapshot fails.
 - Antigravity's Gemini picker now offers the current Flash generations instead of retired ones, so new sessions no longer fail with "Gemini 3.5 Flash is no longer available".

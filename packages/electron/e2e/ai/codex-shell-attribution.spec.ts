@@ -109,6 +109,13 @@ test('production Codex shell hooks persist sequential owners after a failed MCP 
         },
         { workspace, id: session.id, filePath: path.join(workspace, 'after-failure.ts') }
       );
+      const commitContext = await page.evaluate(async ({ workspace, id }) =>
+        (window as any).electronAPI.invoke('git:get-commit-context', workspace, id), { workspace, id: session.id });
+      expect(commitContext.coverage).toEqual([expect.objectContaining({ sessionId: session.id, state: 'no-detected-fault' })]);
+      const durableCoverage = await page.evaluate(async id =>
+        (window as any).electronAPI.invoke('test:query-db', 'SELECT data FROM shell_tracking_coverage WHERE session_id = $1', [id]), session.id);
+      expect(JSON.parse(durableCoverage.rows[0].data).active).toEqual([]);
+      evidence[marker + 'Coverage'] = commitContext.coverage;
       evidence[marker + 'AfterFailure'] = afterFailure;
       expect(afterFailure).toEqual({ failedLookup: true, owners: [...evidence.owners].sort() });
     }

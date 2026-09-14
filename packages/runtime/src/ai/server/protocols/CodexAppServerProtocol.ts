@@ -2,9 +2,8 @@ import { previewForLog, summarizeNotificationParams, extractNotificationRouting 
 /**
  * OpenAI Codex app-server Protocol Adapter
  *
- * Drives `codex app-server --listen stdio://` directly via JSON-RPC v2, in
- * contrast to the SDK transport which spawns `codex exec --experimental-json`
- * for every turn.
+ * Drives `codex app-server --listen stdio://` directly via JSON-RPC v2;
+ * the SDK transport instead spawns `codex exec --experimental-json` per turn.
  *
  * Why it exists: the app-server protocol's `item/started` and `item/completed`
  * notifications for `fileChange` items carry the full unified-diff text per
@@ -522,6 +521,7 @@ export class CodexAppServerProtocol implements AgentProtocol {
             ...(options.raw?.codexConfigOverrides as Record<string, unknown> ?? {}), ...trust,
           } } };
         } catch (error) {
+          tracking.registration.unavailable?.();
           tracking.registration.dispose();
           console.warn('[CodexShellTracking] Hooks unavailable; shell attribution disabled:', error);
         }
@@ -548,10 +548,9 @@ export class CodexAppServerProtocol implements AgentProtocol {
       cleanupStarted: false,
       shellTracking: tracking?.registration,
     };
-    observeCodexShellTracking(client, raw.shellTracking, () => raw.threadId);
+    observeCodexShellTracking(client, raw.shellTracking, () => raw.threadId, () => raw.activeTurnId);
     return raw;
   }
-
   /**
    * Point codex at Nimbalyst's exported skills (#1253).
    *

@@ -133,10 +133,7 @@ export interface MigrateOptions {
 }
 
 /**
- * Table copy order. Foreign keys are OFF during copy so this only matters for
- * humans reading progress and for deterministic verification ordering. The
- * order roughly follows dependency depth (parents before children) so the
- * progress UI tells a coherent story.
+ * Copy parents before children for readable progress; foreign keys are OFF during copy.
  *
  * `ai_transcript_events` is absent because it no longer exists on either
  * side (Phase 4 of canonical-transcript-deprecation). Canonical events live
@@ -148,6 +145,7 @@ const COPY_TABLES: readonly string[] = [
   'ai_sessions',
   'document_history',
   'session_files',
+  'shell_tracking_coverage',
   'ai_agent_messages',
   'ai_tool_call_file_edits',
   'tool_usage_counters',
@@ -211,6 +209,7 @@ const FULL_COPY_COLUMNS: Record<string, string> = {
   ...CURSOR_COLUMNS,
   ai_sessions: 'id',
   session_files: 'id',
+  shell_tracking_coverage: 'session_id',
 };
 
 const DEFAULT_BATCH_SIZE = 5000;
