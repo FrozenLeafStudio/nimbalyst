@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Antigravity's Gemini picker now offers the current Flash generations instead of retired ones, so new sessions no longer fail with "Gemini 3.5 Flash is no longer available".
 - Accepting large document rewrites preserves paragraph order, and rejecting them restores the original formatting.
 - The Git panel names the signal when a push is killed before it finishes, instead of showing the hook's output as the error.
 - The GitHub panel no longer shows an unrelated AI session when the selected PR or issue has no matching session.
