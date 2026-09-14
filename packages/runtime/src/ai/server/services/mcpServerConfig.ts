@@ -66,6 +66,20 @@ export function isInternalMcpServerEnabled(): boolean {
 }
 
 /**
+ * Read-only view of the port/token pair, for a provider that builds its own
+ * endpoint URL shape rather than going through `McpConfigService` (e.g.
+ * `GeminiAntigravityProvider`'s Cascade `McpEndpointInput[]`, which needs a
+ * bare `{serverName, url, bearerToken}` tuple, not the Claude/Codex SDK's
+ * `{type: 'sse', url, headers}` server-config shape).
+ */
+export function getSharedMcpServerConnection(): {
+  mcpServerPort: number | null;
+  mcpAuthToken: string | null | undefined;
+} {
+  return { mcpServerPort: shared.mcpServerPort, mcpAuthToken: shared.mcpAuthToken };
+}
+
+/**
  * True when tracker agent tools are enabled for the workspace. Providers use
  * this to skip tracker-related system-prompt guidance when the workspace has
  * trackers disabled (no loader wired = enabled, matching McpConfigService).

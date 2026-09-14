@@ -50,6 +50,7 @@ import { AntigravityToolLoopProtocol } from './geminiAntigravity/AntigravityTool
 import { AntigravityCascadeClient } from './geminiAntigravity/AntigravityCascadeClient';
 import { AntigravityCascadeProtocol } from './geminiAntigravity/AntigravityCascadeProtocol';
 import { buildEditSnapshotFromCascadeToolResult } from './geminiAntigravity/cascadeEditSnapshots';
+import type { McpEndpointInput } from './geminiAntigravity/cascadeMcpConfig';
 import { renderAttachments } from './geminiAntigravity/renderAttachments';
 import { buildUserMessageAddition } from './documentContextUtils';
 import {
@@ -168,6 +169,7 @@ function clampCommandOutput(text: string): string {
 export class GeminiAntigravityProvider extends BaseAgentProvider {
   private static toolExecutor: GeminiToolExecutor | null = null;
   private static serverConfigLoader: (() => GeminiServerConfig) | null = null;
+  private static mcpEndpointsLoader: ((workspacePath: string) => McpEndpointInput[]) | null = null;
 
   private readonly sessionStates = new Map<string, SessionState>();
   private readonly server: AntigravityServerManager;
@@ -551,11 +553,16 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     // result step's `metadata.toolSummary` arrives.
     const pendingCalls = new Map<string, { id: string; name: string; args: Record<string, unknown> }>();
 
+    const mcpEndpoints = state.workspacePath
+      ? (GeminiAntigravityProvider.mcpEndpointsLoader?.(state.workspacePath) ?? [])
+      : [];
+
     try {
       for await (const ev of this.cascadeProtocol.run({
         cascadeId,
         modelKeyOrEnum: state.modelKey,
         userMessage: turnMessage,
+        mcpEndpoints,
         timeoutMs: GeminiAntigravityProvider.modelResponseTimeoutMs,
         abortSignal,
       })) {
@@ -797,6 +804,16 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
 
   static setServerConfigLoader(loader: (() => GeminiServerConfig) | null): void {
     GeminiAntigravityProvider.serverConfigLoader = loader;
+  }
+
+  /**
+   * Phase 2A step 6: Nimbalyst MCP endpoints to expose to a Cascade turn.
+   * Electron-specific (port/token live in the Electron main process), so
+   * injected the same way `setServerConfigLoader` is -- this package stays
+   * platform-agnostic (works in Electron and Capacitor/mobile).
+   */
+  static setMcpEndpointsLoader(loader: ((workspacePath: string) => McpEndpointInput[]) | null): void {
+    GeminiAntigravityProvider.mcpEndpointsLoader = loader;
   }
 
   // --- Detection and catalog ----------------------------------------------

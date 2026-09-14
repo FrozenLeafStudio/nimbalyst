@@ -335,6 +335,7 @@ describe('GeminiAntigravityProvider cascade transport routing (Phase 2A steps 1-
 
   afterEach(() => {
     GeminiAntigravityProvider.setServerConfigLoader(null);
+    GeminiAntigravityProvider.setMcpEndpointsLoader(null);
     // The transport flag is a static field, set via applyServerConfig() at
     // initialize() time -- reset it so it can't leak into a later test.
     (GeminiAntigravityProvider as unknown as { transport: string }).transport = 'text-loop';
@@ -521,6 +522,27 @@ describe('GeminiAntigravityProvider cascade transport routing (Phase 2A steps 1-
       2,
       expect.objectContaining({ persistedCascadeId: 'c1' }),
     );
+    provider.destroy();
+  });
+
+  it('passes the injected MCP endpoints loader\'s result into sendUserCascadeMessage (step 6)', async () => {
+    GeminiAntigravityProvider.setServerConfigLoader(() => ({ transport: 'cascade' }));
+    const endpoints = [{ serverName: 'nimbalyst', url: 'http://127.0.0.1:3456/mcp/core', bearerToken: 't' }];
+    const loader = vi.fn().mockReturnValue(endpoints);
+    GeminiAntigravityProvider.setMcpEndpointsLoader(loader);
+    const cascadeClient = fakeCascadeClient();
+    const provider = new GeminiAntigravityProvider({ cascadeClient });
+    await provider.initialize({});
+
+    await collect(provider.sendMessage('hello', undefined, 'ct-mcp', undefined, 'C:\\proj'));
+
+    expect(loader).toHaveBeenCalledWith('C:\\proj');
+    expect(cascadeClient.sendUserCascadeMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ mcpEndpoints: endpoints }),
+      expect.any(Number),
+      expect.anything(),
+    );
+
     provider.destroy();
   });
 

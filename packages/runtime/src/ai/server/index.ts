@@ -25,6 +25,7 @@ export type { McpConfigServiceDeps } from './services/McpConfigService';
 export {
   configureMcpServers,
   getMcpConfigService,
+  getSharedMcpServerConnection,
   isInternalMcpServerEnabled,
 } from './services/mcpServerConfig';
 export type { SharedMcpServerConfig, PerProviderMcpDeps } from './services/mcpServerConfig';

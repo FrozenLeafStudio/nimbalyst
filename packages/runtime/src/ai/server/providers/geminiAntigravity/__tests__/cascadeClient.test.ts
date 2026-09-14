@@ -137,6 +137,46 @@ describe('request builders', () => {
     expect(plannerConfig.completionConfigOverride).toBeUndefined();
     expect(body.blocking).toBe(true);
   });
+
+  // Phase 2A step 6: [LIVE] step3-mcp-results.md -- customizationDiscoveryConfig
+  // is the proven-live path that exposes Nimbalyst's tools to the model.
+  it('includes customizationDiscoveryConfig.mcp.servers when mcpEndpoints are given', () => {
+    const body = buildSendUserCascadeMessageRequest({
+      cascadeId: 'cascade-1',
+      text: 'hello',
+      modelEnum: 'MODEL_PLACEHOLDER_M318',
+      blocking: false,
+      maxGeneratorInvocations: 40,
+      userInteractionTimeoutSeconds: 30,
+      toolOutputMaxBytes: 48_000,
+      mcpEndpoints: [{ serverName: 'nimbalyst', url: 'http://127.0.0.1:3456/mcp/core', bearerToken: 't' }],
+    });
+    const plannerConfig = (body.cascadeConfig as { plannerConfig: Record<string, unknown> }).plannerConfig;
+    expect(plannerConfig.customizationDiscoveryConfig).toEqual({
+      mcp: {
+        servers: [{
+          serverName: 'nimbalyst',
+          serverUrl: 'http://127.0.0.1:3456/mcp/core?token=t',
+          headers: { Authorization: 'Bearer t' },
+        }],
+      },
+    });
+  });
+
+  it('omits customizationDiscoveryConfig entirely when no MCP endpoints are given', () => {
+    const body = buildSendUserCascadeMessageRequest({
+      cascadeId: 'cascade-1',
+      text: 'hello',
+      modelEnum: 'MODEL_PLACEHOLDER_M318',
+      blocking: false,
+      maxGeneratorInvocations: 40,
+      userInteractionTimeoutSeconds: 30,
+      toolOutputMaxBytes: 48_000,
+      mcpEndpoints: [],
+    });
+    const plannerConfig = (body.cascadeConfig as { plannerConfig: Record<string, unknown> }).plannerConfig;
+    expect(plannerConfig.customizationDiscoveryConfig).toBeUndefined();
+  });
 });
 
 describe('AntigravityCascadeClient.sendUserCascadeMessage', () => {

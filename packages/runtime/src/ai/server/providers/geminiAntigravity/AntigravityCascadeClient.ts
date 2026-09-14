@@ -42,6 +42,7 @@
  */
 
 import { AntigravityServerManager } from './AntigravityServerManager';
+import { buildMcpServersConfig, type McpEndpointInput } from './cascadeMcpConfig';
 
 // Confirmed live (step3-results.md, probe a2/a3): StartCascade 400s with
 // "CortexTrajectorySource is unspecified" when `source` is omitted. Both
@@ -147,6 +148,8 @@ export interface SendCascadeMessageParams {
   completionMaxTokens?: number;
   userInteractionTimeoutSeconds: number;
   toolOutputMaxBytes: number;
+  /** [LIVE] Nimbalyst MCP endpoints to expose to this turn (step 6). Omit/empty for none. */
+  mcpEndpoints?: McpEndpointInput[];
 }
 
 export interface EnsureCascadeParams {
@@ -218,6 +221,7 @@ export function buildSendUserCascadeMessageRequest(params: {
   completionMaxTokens?: number;
   userInteractionTimeoutSeconds: number;
   toolOutputMaxBytes: number;
+  mcpEndpoints?: McpEndpointInput[];
 }): Record<string, unknown> {
   const plannerConfig: Record<string, unknown> = {
     // `ModelOrAlias`, a DIFFERENT shape from StartCascade's bare enum string
@@ -237,6 +241,13 @@ export function buildSendUserCascadeMessageRequest(params: {
   // that actually bounds one generation.
   if (typeof params.completionMaxTokens === 'number') {
     plannerConfig.completionConfigOverride = { maxTokens: params.completionMaxTokens };
+  }
+  // [LIVE] step3-mcp-results.md (probes mcp7/mcp8): this is the proven-live
+  // path that puts Nimbalyst's tools in the model's own next-turn tool
+  // listing. `customAgentSpec.launchedMcpServers` (StartCascade) is a
+  // documented dead end -- see cascadeMcpConfig.ts's file header.
+  if (params.mcpEndpoints && params.mcpEndpoints.length > 0) {
+    plannerConfig.customizationDiscoveryConfig = buildMcpServersConfig(params.mcpEndpoints);
   }
   return {
     cascadeId: params.cascadeId,

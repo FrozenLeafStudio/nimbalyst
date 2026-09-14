@@ -40,6 +40,7 @@ import {
   DEFAULT_TOOL_OUTPUT_MAX_BYTES,
   DEFAULT_USER_INTERACTION_TIMEOUT_SECONDS,
 } from './AntigravityCascadeClient';
+import type { McpEndpointInput } from './cascadeMcpConfig';
 
 export const DEFAULT_POLL_INTERVAL_MS = 500;
 // Same order of magnitude as the text loop's MODEL_RESPONSE_TIMEOUT_MS -- a
@@ -103,6 +104,8 @@ export interface CascadeTurnParams {
   completionMaxTokens?: number;
   userInteractionTimeoutSeconds?: number;
   toolOutputMaxBytes?: number;
+  /** [LIVE] Nimbalyst MCP endpoints to expose to this turn (step 6). Omit/empty for none. */
+  mcpEndpoints?: McpEndpointInput[];
   /** Overall wall-clock cap for the turn (send + poll-to-completion). */
   timeoutMs?: number;
   abortSignal?: AbortSignal;
@@ -307,6 +310,7 @@ export class AntigravityCascadeProtocol {
       completionMaxTokens = DEFAULT_COMPLETION_MAX_TOKENS,
       userInteractionTimeoutSeconds = DEFAULT_USER_INTERACTION_TIMEOUT_SECONDS,
       toolOutputMaxBytes = DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+      mcpEndpoints,
       timeoutMs = DEFAULT_TURN_TIMEOUT_MS,
       abortSignal,
     } = params;
@@ -336,6 +340,7 @@ export class AntigravityCascadeProtocol {
           completionMaxTokens,
           userInteractionTimeoutSeconds,
           toolOutputMaxBytes,
+          mcpEndpoints,
         },
         timeoutMs,
         abortSignal,

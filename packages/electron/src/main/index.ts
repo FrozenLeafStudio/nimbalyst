@@ -226,7 +226,7 @@ import {
   GeminiAntigravityProvider,
   configureOpenCodeModelCatalog,
 } from '@nimbalyst/runtime/ai/server';
-import { configureMcpServers } from '@nimbalyst/runtime/ai/server';
+import { configureMcpServers, getSharedMcpServerConnection } from '@nimbalyst/runtime/ai/server';
 import { matchesAllowPattern } from '@nimbalyst/runtime/ai/server/permissions/toolPermissionHelpers';
 import { resolveCodexPreEditHookScriptPath } from './services/ai/codexPreEditHookPath';
 import {configureCodexShellTracking} from './services/ai/codexShellTrackingHost';
@@ -2435,6 +2435,21 @@ app.whenReady().then(async () => {
           ? settings.transport
           : undefined,
       };
+    });
+    // Phase 2A step 6: expose Nimbalyst's core MCP tools to a Cascade turn.
+    // [LIVE] step3-mcp-results.md -- `/mcp/core` is the proven-live endpoint
+    // (capture_editor_screenshot, display_to_user, update_session_meta);
+    // trackers/situational are a later step per the plan's own "Next" note.
+    // Port/token come from the same shared registry `configureMcpServers`
+    // populates below, not a second source of truth.
+    GeminiAntigravityProvider.setMcpEndpointsLoader((workspacePath: string) => {
+      const { mcpServerPort, mcpAuthToken } = getSharedMcpServerConnection();
+      if (mcpServerPort === null || !mcpAuthToken) return [];
+      return [{
+        serverName: 'nimbalyst',
+        url: `http://127.0.0.1:${mcpServerPort}/mcp/core?workspacePath=${encodeURIComponent(workspacePath)}`,
+        bearerToken: mcpAuthToken,
+      }];
     });
 
     // Grok, Cursor and Gemini default to on when their tool is present and
