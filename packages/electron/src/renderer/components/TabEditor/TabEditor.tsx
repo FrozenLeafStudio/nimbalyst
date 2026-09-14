@@ -63,7 +63,7 @@ import { useSuppressedDocumentHeaderProviderIds } from './DocumentHeaderSuppress
 import { createCollectionItem } from '../TrackerMode/createCollectionItem';
 import { loadTrackerTeamMembers } from '../TrackerMode/useTrackerTeamMembers';
 import { assertFileSaveSucceeded, getSaveFailureMessage, resolveSaveFailureType, type FileSaveResult } from '../../utils/fileSaveResult';
-import { resolveSaveAttempt } from './resolveSaveAttempt';
+import { customEditorSaveBaseline, resolveSaveAttempt } from './resolveSaveAttempt';
 import { reloadFromDisk, type ReloadOutcome } from './reloadFromDisk';
 import { resolveDiffResolutionSave } from './resolveDiffResolutionSave';
 import {
@@ -400,6 +400,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
   const editorHostFileChangeCallbackRef = useRef<((newContent: string) => void) | null>(null); // For EditorHost file change subscription
   const diffRequestCallbackRef = useRef<((config: DiffConfig) => void) | null>(null); // For EditorHost diff request subscription
   const customEditorFindCallbackRef = useRef<(() => void) | null>(null); // Custom editor's own find UI (see EditorHost.onFindRequested)
+  const customEditorAPIRef = useRef<unknown>(null);
   const diffClearedCallbackRef = useRef<(() => void) | null>(null); // For EditorHost diff cleared subscription
   const editorHostSaveRequestCallbackRef = useRef<(() => void | Promise<void>) | null>(null); // For EditorHost save request subscription
   const sourceModeChangedCallbackRef = useRef<((isSourceMode: boolean) => void) | null>(null); // For EditorHost source mode subscription
@@ -752,7 +753,9 @@ export const TabEditor: React.FC<TabEditorProps> = ({
       return;
     }
 
-    const expectedDiskContent = lastSavedContentRef.current;
+    const expectedDiskContent = isCustom && !sourceMode
+      ? customEditorSaveBaseline(lastSavedContentRef.current, documentModel.getLastPersistedContent())
+      : lastSavedContentRef.current;
     // Generate a unique save ID to track this specific save operation
     const thisSaveId = ++saveIdRef.current;
     pendingSaveIdsRef.current.add(thisSaveId);
@@ -960,7 +963,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
       isSavingRef.current = false;
       throw error;
     }
-  }, [filePath, fileName, onSaveComplete, hasUnresolvedReview]);
+  }, [filePath, fileName, onSaveComplete, hasUnresolvedReview, isCustom, sourceMode, documentModel]);
 
   /**
    * Push external content into the editor and verify it landed (#3684).
@@ -980,9 +983,17 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     const canUseLexical =
       !!editor && typeof editor.update === 'function' && typeof editor.getEditorState === 'function';
     const canUseSetContent = !!editor && typeof editor.setContent === 'function';
+    const api = customEditorAPIRef.current as { reloadContent?: (text: string) => unknown } | null;
+    let customBuffer: string | null = null;
+    const canReloadCustom = isCustom && !sourceMode && typeof api?.reloadContent === 'function';
 
     let applyToEditor: ((content: string) => void) | null = null;
-    if (canUseLexical && isMarkdown) {
+    if (canReloadCustom) {
+      applyToEditor = content => {
+        const result = api!.reloadContent!(content);
+        customBuffer = typeof result === 'string' ? result : null;
+      };
+    } else if (canUseLexical && isMarkdown) {
       applyToEditor = (content) => {
         const transformers = getEditorTransformers();
         editor!.update(() => {
@@ -1012,6 +1023,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
       {
         applyToEditor,
         readBuffer: () => {
+          if (canReloadCustom) return customBuffer;
           const getContent = getContentFnRef.current;
           if (!getContent) return null;
           try {
@@ -1025,7 +1037,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         },
       },
     );
-  }, [isMarkdown, fileName]);
+  }, [isMarkdown, fileName, isCustom, sourceMode]);
 
   /**
    * Adopt a reload outcome. A verified apply moves the baseline, the buffer and
@@ -2763,6 +2775,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     };
 
     return createEditorHost({
+      onEditorAPIChange: api => { customEditorAPIRef.current = api; },
       filePath,
       fileName,
       // Theme access via function - reads from ref so always current
@@ -3282,7 +3295,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
             data-testid="autosave-conflict-banner"
           >
             <span className="flex-1">
-              File changed on disk. Reload to see new content (your unsaved edits are preserved).
+              File changed on disk. Your unsaved edits are kept until you reload.
             </span>
             <button
               type="button"

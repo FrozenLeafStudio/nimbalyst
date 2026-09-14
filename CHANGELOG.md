@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 <!-- Changes to existing functionality go here -->
+- Canvas boards gain richer editing controls, zoomed-out mockup previews, and screen navigation with editable titles and links to original screenshots.
 - GPT Live voice previews play bundled recordings of the actual voices instantly, without an API key.
 
 ### Fixed
