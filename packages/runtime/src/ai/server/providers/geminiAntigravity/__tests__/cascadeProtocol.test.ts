@@ -12,12 +12,14 @@ import type { AntigravityCascadeClient, CascadeStep, GetCascadeTrajectoryStepsRe
 type FakeClient = {
   getCascadeTrajectorySteps: ReturnType<typeof vi.fn>;
   sendUserCascadeMessage: ReturnType<typeof vi.fn>;
+  cancelInvocation: ReturnType<typeof vi.fn>;
 };
 
 function fakeClient(): FakeClient {
   return {
     getCascadeTrajectorySteps: vi.fn(),
     sendUserCascadeMessage: vi.fn().mockResolvedValue(undefined),
+    cancelInvocation: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -335,7 +337,7 @@ describe('AntigravityCascadeProtocol.run -- polling loop', () => {
     expect(events.some((e) => e.type === 'tool_result')).toBe(true);
   });
 
-  it('surfaces an error and stops, rather than hanging, when a step is WAITING on user interaction', async () => {
+  it('surfaces an error, cancels, and stops (rather than hanging) when a step is WAITING on user interaction', async () => {
     const fake = fakeClient();
     fake.getCascadeTrajectorySteps
       .mockResolvedValueOnce({ steps: [] })
@@ -351,6 +353,44 @@ describe('AntigravityCascadeProtocol.run -- polling loop', () => {
     expect((events[0] as { error: string }).error).toMatch(/waiting on a user interaction/i);
     // Must not have kept polling forever.
     expect(fake.getCascadeTrajectorySteps).toHaveBeenCalledTimes(2);
+    // Phase 2A step 9: a WAITING cascade can't be answered yet, so it must
+    // not be left parked server-side.
+    expect(fake.cancelInvocation).toHaveBeenCalledWith('c1', true, undefined, undefined);
+  });
+
+  it('names the interaction kind in the error when Step.requestedInteraction identifies it', async () => {
+    const fake = fakeClient();
+    fake.getCascadeTrajectorySteps
+      .mockResolvedValueOnce({ steps: [] })
+      .mockResolvedValueOnce({
+        steps: [{
+          type: 'CORTEX_STEP_TYPE_RUN_COMMAND',
+          status: 'CORTEX_STEP_STATUS_WAITING',
+          requestedInteraction: { runCommand: { proposedCommandLine: 'rm -rf /' } },
+        }],
+      });
+
+    const protocol = new AntigravityCascadeProtocol({ cascadeClient: client(fake), pollIntervalMs: 0 });
+    const events = await collect(
+      protocol.run({ cascadeId: 'c1', modelKeyOrEnum: 'MODEL_PLACEHOLDER_M318', userMessage: 'hi' }),
+    );
+
+    expect((events[0] as { error: string }).error).toMatch(/"runCommand" interaction/);
+  });
+
+  it('cancels even when the step carries no identifiable interaction kind', async () => {
+    const fake = fakeClient();
+    fake.getCascadeTrajectorySteps
+      .mockResolvedValueOnce({ steps: [] })
+      .mockResolvedValueOnce({ steps: [{ type: 'CORTEX_STEP_TYPE_GENERIC', status: 'CORTEX_STEP_STATUS_WAITING' }] });
+
+    const protocol = new AntigravityCascadeProtocol({ cascadeClient: client(fake), pollIntervalMs: 0 });
+    const events = await collect(
+      protocol.run({ cascadeId: 'c1', modelKeyOrEnum: 'MODEL_PLACEHOLDER_M318', userMessage: 'hi' }),
+    );
+
+    expect((events[0] as { error: string }).error).not.toMatch(/"/);
+    expect(fake.cancelInvocation).toHaveBeenCalledWith('c1', true, undefined, undefined);
   });
 
   it('surfaces a rejected SendUserCascadeMessage as an error event, not a thrown exception', async () => {

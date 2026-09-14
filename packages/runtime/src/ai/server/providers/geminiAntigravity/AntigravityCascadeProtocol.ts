@@ -131,6 +131,22 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// [DESCRIPTOR-ONLY] Never observed live -- every step3-results.md probe ran
+// with autoAllowAllInteractions: true, so a populated Step.requestedInteraction
+// has not been wire-verified. Best-effort naming for a clearer error only;
+// never trusted for behavior. Variant names per waste-reduction doc 04 §3.1.
+const REQUESTED_INTERACTION_VARIANT_KEYS = [
+  'runCommand', 'filePermission', 'permission', 'askQuestion', 'mcp', 'approvalInteraction',
+] as const;
+
+function describeRequestedInteraction(interaction: unknown): string | null {
+  if (!interaction || typeof interaction !== 'object') return null;
+  for (const key of REQUESTED_INTERACTION_VARIANT_KEYS) {
+    if (key in (interaction as Record<string, unknown>)) return key;
+  }
+  return null;
+}
+
 function describeError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -377,12 +393,23 @@ export class AntigravityCascadeProtocol {
         const status = step.status;
         if (status === STATUS_WAITING) {
           // Hang risk (doc 04 §3.1): a cascade parked in WAITING produces no
-          // further steps and no error on its own. HandleCascadeUserInteraction
-          // wiring is a later step (plan step 4) -- surface it now rather than
-          // silently hang until the wall-clock deadline above.
+          // further steps and no error on its own. Real HandleCascadeUserInteraction
+          // wiring (a genuine permission prompt) needs a trajectoryId this
+          // protocol doesn't resolve and an oneof shape never observed live
+          // (plan step 4, still open) -- cancel rather than leave the cascade
+          // parked server-side indefinitely, and surface what it was waiting
+          // on when that's identifiable.
+          const kind = describeRequestedInteraction(step.requestedInteraction);
+          try {
+            await this.cascadeClient.cancelInvocation(cascadeId, true, undefined, abortSignal);
+          } catch {
+            // Best-effort cleanup -- the error below is what the caller acts on.
+          }
           yield {
             type: 'error',
-            error: 'The Cascade agent is waiting on a user interaction Nimbalyst cannot answer yet.',
+            error: kind
+              ? `The Cascade agent is waiting for a "${kind}" interaction Nimbalyst cannot answer yet; cancelled the turn.`
+              : 'The Cascade agent is waiting on a user interaction Nimbalyst cannot answer yet; cancelled the turn.',
           };
           return;
         }

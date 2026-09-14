@@ -231,7 +231,21 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
   }
 
   abort(): void {
-    for (const state of this.sessionStates.values()) {
+    for (const [sessionId, state] of this.sessionStates.entries()) {
+      // Phase 2A step 9: the abortSignal only stops US from consuming further
+      // steps -- the cascade keeps generating server-side unless explicitly
+      // cancelled. Only for a session with a turn actually in flight
+      // (non-null abortController), and only fired once per abort() (not
+      // re-fired for an already-idle session).
+      if (state.abortController && GeminiAntigravityProvider.transport === 'cascade') {
+        const cascadeId = this.sessions.getSessionId(sessionId);
+        if (cascadeId) {
+          void this.cascadeClient.cancelInvocation(cascadeId).catch(() => {
+            // Best-effort: the client-side abortSignal already stops this
+            // provider from doing anything further with this turn.
+          });
+        }
+      }
       state.abortController?.abort();
       state.toolLoop.abort();
     }

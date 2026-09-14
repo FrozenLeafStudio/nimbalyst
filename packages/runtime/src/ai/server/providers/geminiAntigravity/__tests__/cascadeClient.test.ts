@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AntigravityCascadeClient,
   buildAddTrackedWorkspaceRequest,
+  buildCancelCascadeInvocationRequest,
   buildGetCascadeTrajectoryStepsRequest,
   buildLoadTrajectoryRequest,
   buildSendUserCascadeMessageRequest,
@@ -366,5 +367,38 @@ describe('AntigravityCascadeClient.ensureCascade', () => {
     });
 
     expect(result).toEqual({ cascadeId: 'fresh-cascade', resumed: false });
+  });
+});
+
+describe('buildCancelCascadeInvocationRequest', () => {
+  // [LIVE] step3-results.md probe cancel1: this exact body returned 200.
+  it('defaults killBackgroundTasks to true, matching the live probe', () => {
+    expect(buildCancelCascadeInvocationRequest('cascade-1')).toEqual({
+      cascadeId: 'cascade-1',
+      killBackgroundTasks: true,
+    });
+  });
+
+  it('honours an explicit killBackgroundTasks override', () => {
+    expect(buildCancelCascadeInvocationRequest('cascade-1', false)).toEqual({
+      cascadeId: 'cascade-1',
+      killBackgroundTasks: false,
+    });
+  });
+});
+
+describe('AntigravityCascadeClient.cancelInvocation', () => {
+  it('calls CancelCascadeInvocation with the cascade id', async () => {
+    const server = fakeServer();
+    const c = client(server);
+
+    await c.cancelInvocation('cascade-1');
+
+    expect(server.callRpc).toHaveBeenCalledWith(
+      'CancelCascadeInvocation',
+      { cascadeId: 'cascade-1', killBackgroundTasks: true },
+      expect.any(Number),
+      undefined,
+    );
   });
 });

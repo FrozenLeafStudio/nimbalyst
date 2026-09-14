@@ -319,7 +319,10 @@ describe('GeminiAntigravityProvider cascade transport routing (Phase 2A steps 1-
 
   function fakeCascadeClient(
     overrides: Partial<
-      Record<'ensureCascade' | 'sendUserCascadeMessage' | 'getCascadeTrajectorySteps', ReturnType<typeof vi.fn>>
+      Record<
+        'ensureCascade' | 'sendUserCascadeMessage' | 'getCascadeTrajectorySteps' | 'cancelInvocation',
+        ReturnType<typeof vi.fn>
+      >
     > = {},
   ): AntigravityCascadeClient {
     return {
@@ -329,6 +332,7 @@ describe('GeminiAntigravityProvider cascade transport routing (Phase 2A steps 1-
         .fn()
         .mockResolvedValueOnce({ steps: [] }) // baseline capture
         .mockResolvedValueOnce({ steps: [terminalPlannerResponse] }),
+      cancelInvocation: vi.fn().mockResolvedValue(undefined),
       ...overrides,
     } as unknown as AntigravityCascadeClient;
   }
@@ -542,6 +546,34 @@ describe('GeminiAntigravityProvider cascade transport routing (Phase 2A steps 1-
       expect.any(Number),
       expect.anything(),
     );
+
+    provider.destroy();
+  });
+
+  it('cancels the cascade server-side when abort() fires mid-turn (step 9)', async () => {
+    GeminiAntigravityProvider.setServerConfigLoader(() => ({ transport: 'cascade' }));
+    let releaseSend: (() => void) | undefined;
+    const sendGate = new Promise<void>((resolve) => { releaseSend = resolve; });
+    const cascadeClient = fakeCascadeClient({
+      sendUserCascadeMessage: vi.fn().mockImplementation(async () => {
+        await sendGate;
+      }),
+    });
+    const provider = new GeminiAntigravityProvider({ cascadeClient });
+    await provider.initialize({});
+
+    const chunksPromise = collect(
+      provider.sendMessage('hello', undefined, 'ct-abort', undefined, 'C:\\proj'),
+    );
+    // Let the turn advance past ensureCascade (which sets the session's
+    // persisted cascade id) and into the gated sendUserCascadeMessage call.
+    await vi.waitFor(() => expect(cascadeClient.sendUserCascadeMessage).toHaveBeenCalled());
+
+    provider.abort();
+    releaseSend?.();
+    await chunksPromise;
+
+    expect(cascadeClient.cancelInvocation).toHaveBeenCalledWith('c1');
 
     provider.destroy();
   });

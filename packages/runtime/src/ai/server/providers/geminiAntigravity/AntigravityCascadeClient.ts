@@ -61,6 +61,8 @@ const LOAD_TRAJECTORY_TIMEOUT_MS = 30_000;
 // GetModelResponse, not a short RPC timeout.
 const SEND_USER_CASCADE_MESSAGE_TIMEOUT_MS = 600_000;
 const GET_CASCADE_TRAJECTORY_STEPS_TIMEOUT_MS = 30_000;
+// [LIVE] step3-results.md probe cancel1: 0.01s to accept.
+const CANCEL_CASCADE_INVOCATION_TIMEOUT_MS = 30_000;
 
 // Mirrors AntigravityToolLoopProtocol's `maxIterations ?? 40` default -- same
 // role (iteration cap), different mechanism (server-enforced, not client loop).
@@ -268,6 +270,20 @@ export function buildGetCascadeTrajectoryStepsRequest(
   return { cascadeId, stepOffset };
 }
 
+/**
+ * [LIVE] step3-results.md probe cancel1: `{cascadeId, killBackgroundTasks:
+ * true}` returned 200, and the in-flight step transitioned to `DONE` (not
+ * `CANCELED`) with `stopReason: STOP_REASON_CLIENT_STREAM_ERROR` -- the tell
+ * a poll loop must check, per `AntigravityCascadeProtocol`'s
+ * `STOP_REASON_CLIENT_STREAM_ERROR` export.
+ */
+export function buildCancelCascadeInvocationRequest(
+  cascadeId: string,
+  killBackgroundTasks = true,
+): { cascadeId: string; killBackgroundTasks: boolean } {
+  return { cascadeId, killBackgroundTasks };
+}
+
 export class AntigravityCascadeClient {
   private readonly server: AntigravityServerManager;
   /** Workspace paths already tracked on the CURRENT endpoint, keyed by endpoint epoch. */
@@ -412,6 +428,27 @@ export class AntigravityCascadeClient {
     return this.server.callRpc(
       'GetCascadeTrajectorySteps',
       buildGetCascadeTrajectoryStepsRequest(cascadeId, stepOffset),
+      timeoutMs,
+      abortSignal,
+    );
+  }
+
+  /**
+   * Phase 2A step 9: stop an in-flight generation server-side. [LIVE]
+   * step3-results.md probe cancel1 -- see buildCancelCascadeInvocationRequest.
+   * `SendUserCascadeMessageResponse`-style empty-body response; the caller
+   * must poll for the step's resulting `stopReason`, this call only accepts
+   * the cancellation.
+   */
+  async cancelInvocation(
+    cascadeId: string,
+    killBackgroundTasks = true,
+    timeoutMs = CANCEL_CASCADE_INVOCATION_TIMEOUT_MS,
+    abortSignal?: AbortSignal,
+  ): Promise<void> {
+    await this.server.callRpc(
+      'CancelCascadeInvocation',
+      buildCancelCascadeInvocationRequest(cascadeId, killBackgroundTasks),
       timeoutMs,
       abortSignal,
     );
