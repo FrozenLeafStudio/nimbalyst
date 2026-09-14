@@ -464,18 +464,64 @@ public final class DocumentSyncManager: ObservableObject {
         }
     }
 
+    /// Messages handed to the socket during a replay, keyed by their position in
+    /// the queue they came from. They leave here only when the send lands.
+    private var replayInFlight: [String: [Int: Data]] = [:]
+
     /// Replay all queued messages for a project after reconnect.
-    private func replayOfflineQueue(projectId: String) {
+    ///
+    /// The queue is cleared per message, as each one is accepted. It used to be
+    /// cleared unconditionally before any outcome was known, so a replay that
+    /// raced a socket going down again dropped every queued edit -- the exact
+    /// thing the queue exists to prevent -- with nothing in any log to say so.
+    ///
+    /// `send` is injected only by tests; production uses the project's socket.
+    func replayOfflineQueue(
+        projectId: String,
+        send: ((String, @escaping @MainActor @Sendable (Error?) -> Void) -> Void)? = nil
+    ) {
         guard let queue = offlineQueues[projectId], !queue.isEmpty else { return }
-        guard let client = projectClients[projectId] else { return }
+        let sender: (String, @escaping @MainActor @Sendable (Error?) -> Void) -> Void
+        if let send {
+            sender = send
+        } else if let client = projectClients[projectId] {
+            sender = { client.sendRaw($0, completion: $1) }
+        } else {
+            return
+        }
 
         logger.info("[DocSync] Replaying \(queue.count) queued messages for project \(projectId)")
-        for data in queue {
-            if let json = String(data: data, encoding: .utf8) {
-                client.sendRaw(json)
+        offlineQueues[projectId] = nil
+        replayInFlight[projectId] = Dictionary(uniqueKeysWithValues: queue.enumerated().map { ($0.offset, $0.element) })
+
+        for (index, data) in queue.enumerated() {
+            guard let json = String(data: data, encoding: .utf8) else {
+                replayInFlight[projectId]?.removeValue(forKey: index)
+                continue
+            }
+            sender(json) { [weak self] error in
+                self?.finishReplay(projectId: projectId, index: index, error: error)
             }
         }
-        offlineQueues[projectId] = nil
+    }
+
+    private func finishReplay(projectId: String, index: Int, error: Error?) {
+        guard var inFlight = replayInFlight[projectId], inFlight[index] != nil else { return }
+        guard let error else {
+            inFlight.removeValue(forKey: index)
+            replayInFlight[projectId] = inFlight.isEmpty ? nil : inFlight
+            return
+        }
+
+        // One refusal means the socket is gone again, so everything still in
+        // flight goes back -- in its original order, ahead of anything queued
+        // while the replay was running. At-least-once is the right side to err
+        // on here: the server applies a repeated Yjs update idempotently, and a
+        // dropped one is an edit the user loses.
+        logger.error("[DocSync] Replay failed for project \(projectId), requeueing \(inFlight.count): \(error.localizedDescription)")
+        replayInFlight[projectId] = nil
+        let restored = inFlight.sorted { $0.key < $1.key }.map(\.value)
+        offlineQueues[projectId] = restored + (offlineQueues[projectId] ?? [])
     }
 
     // MARK: - Content Push (Encrypted)

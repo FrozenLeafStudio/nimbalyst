@@ -140,6 +140,29 @@ export interface PushChangeOutcome {
   retryable?: boolean;
 }
 
+/**
+ * What became of a bulk index publish (`syncSessionsToIndex`).
+ *
+ * Separate from `PushChangeOutcome` because a bulk publish covers a batch: it
+ * reports which session rows actually reached the transport, so a caller that
+ * acknowledges a single session (the mobile create-session/create-worktree
+ * responses) can tell "your row is on the wire" from "it is queued for a
+ * reconnect that may never come".
+ */
+export interface IndexPublishOutcome {
+  /** True when every eligible session in the batch was handed to the transport. */
+  published: boolean;
+  /** Why not. Present only when `published` is false. */
+  reason?: string;
+  /**
+   * False when the batch was deliberately not sent -- filtered out of personal
+   * sync, outside index retention -- and re-sending it later would be wrong.
+   */
+  retryable?: boolean;
+  /** Session ids that reached the transport. Empty when nothing was sent. */
+  publishedSessionIds: string[];
+}
+
 export interface SyncProvider {
   /** Connect to sync server for a session */
   connect(sessionId: string): Promise<void>;
@@ -192,7 +215,15 @@ export interface SyncProvider {
     change: SessionChange,
   ): void | Promise<void | PushChangeOutcome>;
 
-  /** Bulk update the sessions index with existing sessions */
+  /**
+   * Bulk update the sessions index with existing sessions.
+   *
+   * Resolves with an `IndexPublishOutcome` once the batch has been handed to
+   * the transport (or refused). The `void` arm keeps the fire-and-forget
+   * callers -- and any provider that does not report -- source-compatible; a
+   * caller that acknowledges the publish to another device awaits it and reads
+   * the outcome instead of acking a row that never left the machine.
+   */
   syncSessionsToIndex?(sessions: SessionIndexData[], options?: {
     syncMessages?: boolean;
     /** Per-session sinceTimestamp for lazy message loading. Provider loads messages
@@ -201,7 +232,7 @@ export interface SyncProvider {
     /** Callback to load messages for a batch of sessions. Called lazily by the provider
      *  so PGLite isn't blocked loading all messages upfront. */
     getMessagesForSync?: (requests: Array<{ sessionId: string; sinceTimestamp: number }>) => Promise<Map<string, any[]>>;
-  }): void;
+  }): void | Promise<IndexPublishOutcome>;
 
   /** Sync projects to the ProjectsIndex (tells mobile which projects exist and are enabled) */
   syncProjectsToIndex?(projects: ProjectIndexEntry[]): void;

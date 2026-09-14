@@ -13,10 +13,41 @@ final class WorkspaceNavigationState: ObservableObject {
     @Published private(set) var project: Project?
     @Published private(set) var selection: WorkspaceSelection?
     @Published var compactColumn: NavigationSplitViewColumn = .sidebar
+    @Published private(set) var hosts: [DeviceInfo] = []
+    private var hostSubscription: AnyCancellable?
+    private weak var hostSource: AnyObject?
     private var composeStates: [String: SessionComposeState] = [:]
 
     init(project: Project? = nil) {
         self.project = project
+    }
+
+    // Own this subscription outside View.body: a fresh AnyPublisher replays
+    // presence on every render, and writing hosts schedules the next render.
+    func observeHosts(source: AnyObject, publisher: AnyPublisher<[DeviceInfo], Never>) {
+        guard hostSource !== source else { return }
+        hostSource = source
+        hostSubscription?.cancel()
+        hostSubscription = publisher.sink { [weak self] devices in
+            guard let self else { return }
+            hosts = devices.filter { $0.type == "desktop" || $0.type == "headless" }
+            adoptDefaultHost(from: hosts)
+        }
+    }
+
+    func stopObservingHosts() {
+        hostSubscription?.cancel()
+        hostSubscription = nil
+        hostSource = nil
+        if !hosts.isEmpty { hosts = [] }
+    }
+
+    func adoptDefaultHost(from hosts: [DeviceInfo]) {
+        // Re-subscribing during layout replays the current roster. Publishing
+        // nil over nil here invalidates navigation and can prevent first paint.
+        guard hostDeviceId == nil,
+              let defaultHost = hosts.first(where: { $0.type == "desktop" }) ?? hosts.first else { return }
+        hostDeviceId = defaultHost.deviceId
     }
 
     func chooseProject(_ project: Project?) {
@@ -62,7 +93,7 @@ final class WorkspaceNavigationState: ObservableObject {
 struct WorkspaceNavigationView: View {
     @EnvironmentObject private var appState: AppState
     @ObservedObject var navigation: WorkspaceNavigationState
-    @State private var hosts: [DeviceInfo] = []
+    private var hosts: [DeviceInfo] { navigation.hosts }
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     private var selection: Binding<WorkspaceSelection?> {
@@ -110,9 +141,12 @@ struct WorkspaceNavigationView: View {
             detail
         }
         .navigationSplitViewStyle(.balanced)
-        .onReceive(appState.syncManager?.$connectedDevices.eraseToAnyPublisher() ?? Just([]).eraseToAnyPublisher()) { devices in
-            hosts = devices.filter { $0.type == "desktop" || $0.type == "headless" }
-            if navigation.hostDeviceId == nil { navigation.hostDeviceId = hosts.first(where: {$0.type == "desktop"})?.deviceId ?? hosts.first?.deviceId }
+        .task(id: appState.syncManager.map(ObjectIdentifier.init)) {
+            if let manager = appState.syncManager {
+                navigation.observeHosts(source: manager, publisher: manager.$connectedDevices.eraseToAnyPublisher())
+            } else {
+                navigation.stopObservingHosts()
+            }
         }
         .onChange(of: appState.databaseManager.map(ObjectIdentifier.init)) { previous, _ in
             // Initial database hydration must retain a cold-launch notification intent.

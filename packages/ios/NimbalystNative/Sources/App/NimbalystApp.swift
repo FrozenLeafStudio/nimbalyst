@@ -327,9 +327,19 @@ public struct MainNavigationView: View {
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
+            // Beneath the auth banner: a sync failure is the narrower problem,
+            // and re-signing in is the action that fixes both when both show.
+            if let syncManager = appState.syncManager {
+                SyncErrorBannerHost(syncManager: syncManager)
+            }
             WorkspaceNavigationView(navigation: navigation)
         }
         .animation(.easeInOut(duration: 0.25), value: appState.syncAuthDegraded)
+        .background {
+            if let requests = appState.syncManager?.sessionCreation {
+                SessionCreationFeedback(requests: requests)
+            }
+        }
         #if os(iOS)
         .overlay(alignment: .bottom) {
             if let voice = appState.voiceAgent, voice.state != .disconnected {
@@ -344,7 +354,7 @@ public struct MainNavigationView: View {
             notificationManager.pendingSessionId = nil
         }
         #if os(iOS)
-        // Voice-created sessions use the same route as notification taps.
+        // Newly created sessions use the same route as notification taps.
         .onChange(of: appState.voiceNavigationRequest) { _, newValue in
             guard let sessionId = newValue else { return }
             navigateToSession(sessionId)

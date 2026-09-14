@@ -551,6 +551,15 @@ export async function handleGitCommitProposal(
 
   const targetSessionId = sessionId || "unknown";
 
+  // Decide before publishing: voice must never request approval for an automatic commit.
+  let isAutoCommit = false;
+  try {
+    const aiSettingsStore = new Store({ name: "ai-settings" });
+    isAutoCommit = aiSettingsStore.get("autoCommitEnabled", false) as boolean;
+  } catch {
+    // If we can't read settings, fall through to manual mode
+  }
+
   // Persist the proposal to database for durability
   try {
     const now = new Date();
@@ -603,6 +612,7 @@ export async function handleGitCommitProposal(
       direction: "output",
       content: JSON.stringify({
         type: "git_commit_proposal",
+        autoApproved: isAutoCommit,
         proposalId,
         toolUseId,
         filesToStage: proposalArgs.filesToStage,
@@ -619,15 +629,10 @@ export async function handleGitCommitProposal(
       hidden: false,
       createdAt: now,
     });
-    // console.log(
-    //   `[MCP Server] Persisted git commit proposal: ${proposalId}, notifying renderer for session: ${targetSessionId}`
-    // );
     if (commitWindow) {
-      // Include proposal data in the IPC so renderer-side consumers (the
-      // GitCommit widget AND the voice forwarding path) can display the
-      // commit message and act on the file list without needing a separate
-      // round-trip to load the persisted proposal from the database.
+      // Include the approval decision and proposal data so voice needs no settings/DB round-trip.
       commitWindow.webContents.send("ai:gitCommitProposal", {
+        autoApproved: isAutoCommit,
         sessionId: targetSessionId,
         proposalId,
         commitMessage: proposalArgs.commitMessage,
@@ -638,20 +643,11 @@ export async function handleGitCommitProposal(
       console.warn("[MCP Server] No commitWindow found to send IPC event");
     }
 
-    // Persist pending-prompt bit + push to mobile (this also notifies the tray)
-    void setSessionPendingPrompt(targetSessionId, true);
+    // An automatic commit is running work, not a request for user input.
+    if (!isAutoCommit) void setSessionPendingPrompt(targetSessionId, true);
   } catch (error) {
     console.error("[MCP Server] Failed to persist git commit proposal:", error);
     // Continue anyway - worst case is no durability
-  }
-
-  // Check if auto-commit is enabled
-  let isAutoCommit = false;
-  try {
-    const aiSettingsStore = new Store({ name: "ai-settings" });
-    isAutoCommit = aiSettingsStore.get("autoCommitEnabled", false) as boolean;
-  } catch {
-    // If we can't read settings, fall through to manual mode
   }
 
   if (isAutoCommit) {

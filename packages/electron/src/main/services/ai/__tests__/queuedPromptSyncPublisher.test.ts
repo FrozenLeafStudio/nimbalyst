@@ -48,6 +48,27 @@ describe('publishQueuedPromptsToSync', () => {
     });
   });
 
+  it('waits for async publication and reports an unpublished outcome', async () => {
+    const { pushChange, deps } = makeDeps([]);
+    let finish!: (outcome: { published: boolean; reason: string; retryable: boolean }) => void;
+    pushChange.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const settled = vi.fn();
+    const publishing = publishQueuedPromptsToSync(deps, 'session-1').then(settled);
+    await vi.waitFor(() => expect(pushChange).toHaveBeenCalled());
+    expect(settled).not.toHaveBeenCalled();
+    finish({ published: false, reason: 'not connected', retryable: true });
+    await publishing;
+    expect(settled).toHaveBeenCalledWith(null);
+    expect(deps.logWarn).toHaveBeenCalledWith(expect.stringContaining('not connected'));
+  });
+
+  it('handles a rejected async send without interrupting queue execution', async () => {
+    const { pushChange, deps } = makeDeps([]);
+    pushChange.mockRejectedValue(new Error('socket closed'));
+    expect(await publishQueuedPromptsToSync(deps, 'session-1')).toBeNull();
+    expect(deps.logWarn).toHaveBeenCalledWith(expect.stringContaining('socket closed'));
+  });
+
   it('no-ops without reading the queue when sync is unavailable', async () => {
     const listPending = vi.fn();
     const published = await publishQueuedPromptsToSync(

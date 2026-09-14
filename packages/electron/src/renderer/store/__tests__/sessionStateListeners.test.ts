@@ -758,6 +758,14 @@ describe('direct prompt events: ToolPermission', () => {
 });
 
 describe('direct prompt events: GitCommitProposal', () => {
+  it('does not request user input for a proposal already approved automatically', () => {
+    const sid = uniqueSessionId('gcp-auto');
+    handlers.get('ai:gitCommitProposal')!({ sessionId: sid, proposalId: 'auto-1', autoApproved: true });
+
+    expect(store.get(sessionHasPendingInteractivePromptAtom(sid))).toBe(false);
+    expect(store.get(sessionPendingPromptsAtom(sid))).toHaveLength(0);
+  });
+
   it('ai:gitCommitProposal sets pending true and pushes prompt', () => {
     const sid = uniqueSessionId('gcp-set');
     const pid = 'gcp-1';

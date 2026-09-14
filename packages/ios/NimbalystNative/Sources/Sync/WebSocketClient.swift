@@ -228,12 +228,12 @@ final class WebSocketClient: @unchecked Sendable {
         }
     }
 
-    /// Send raw JSON string.
-    func sendRaw(_ json: String) {
-        sendRaw(json, completion: nil)
-    }
-
     /// Send raw JSON string with completion handler to detect send failures.
+    ///
+    /// There is deliberately no overload without a completion. A send whose
+    /// outcome nobody reads is the shape behind the mobile-sync bugs that kept
+    /// recurring; passing `nil` is still possible but has to be written out, and
+    /// `SyncRequestRegistry` is the right home for anything a user waits on.
     func sendRaw(_ json: String, completion: (@MainActor @Sendable (Error?) -> Void)?) {
         guard let task = task else {
             logger.warning("Cannot send raw: not connected")
@@ -402,7 +402,11 @@ final class WebSocketClient: @unchecked Sendable {
         let encoder = JSONEncoder()
         if let data = try? encoder.encode(message),
            let json = String(data: data, encoding: .utf8) {
-            sendRaw(json)
+            // Silence is correct here and nowhere else on this path: the
+            // announce repeats every 30s and the next one carries the same
+            // state, so a failed frame costs one heartbeat. `sendRaw` already
+            // logs the error.
+            sendRaw(json) { _ in }
         }
     }
 

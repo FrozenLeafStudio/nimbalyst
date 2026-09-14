@@ -12,6 +12,28 @@ final class IndexIngestionTests: XCTestCase {
     private let otherCrypto = CryptoManager(key: SymmetricKey(data: Data(repeating: 8, count: 32)))
     private let projectPath = "/test/ingestion"
 
+    func testCreatedSessionIsReadyOnlyAfterItsRowArrivesAndOnlyForRequester() async throws {
+        let db = try DatabaseManager()
+        let sync = manager(db)
+        var opened: [String] = []
+        sync.onSessionCreated = { _, id in opened.append(id) }
+        let requestId = try sync.createSession(projectId: projectPath)
+        func response(_ request: String, _ session: String) throws -> Data {
+            try JSONSerialization.data(withJSONObject: [
+                "type": "createSessionResponseBroadcast",
+                "response": ["requestId": request, "success": true, "sessionId": session],
+            ])
+        }
+        await sync.receiveIndexMessage(try response("another-phone", "foreign"))
+        XCTAssertTrue(opened.isEmpty, "Another device must not steal navigation")
+        await sync.receiveIndexMessage(try response(requestId, "created"))
+        XCTAssertTrue(opened.isEmpty, "A creation acknowledgement is not yet a locally resolvable session")
+        _ = try await receive(sync, sessions: [try entry("created", updatedAt: 10)])
+        XCTAssertEqual(opened, ["created"])
+        await sync.receiveIndexMessage(try response(requestId, "created"))
+        XCTAssertEqual(opened, ["created"], "A replay must not reopen the session")
+    }
+
     func testActionDraftWaitsForMatchingCreationAndIndexRow() async throws {
         let db = try DatabaseManager()
         let sync = manager(db)
@@ -23,8 +45,101 @@ final class IndexIngestionTests: XCTestCase {
         XCTAssertFalse(try db.session(byId: "created")?.isExecuting ?? true)
     }
 
-    private func manager(_ db: DatabaseManager) -> SyncManager {
-        SyncManager(crypto: crypto, database: db, serverUrl: "https://invalid.example", userId: "test", registerDeviceCallbacks: false)
+    func testCreationObservesLiveIngestionWithoutAFullIndexResponse() async throws {
+        let db = try DatabaseManager()
+        let sync = manager(db)
+        let ready = expectation(description: "Live row opens the session")
+        sync.onSessionCreated = { _, id in
+            XCTAssertEqual(id, "live-created")
+            ready.fulfill()
+        }
+        let requestId = try sync.createSession(projectId: projectPath)
+        await sync.receiveIndexMessage(try JSONSerialization.data(withJSONObject: [
+            "type": "createSessionResponseBroadcast",
+            "response": ["requestId": requestId, "success": true, "sessionId": "live-created"],
+        ]))
+        await sync.receiveIndexMessage(try JSONSerialization.data(withJSONObject: [
+            "type": "indexBroadcast", "session": try entry("live-created", updatedAt: 20),
+        ]))
+        await fulfillment(of: [ready], timeout: 3)
+    }
+
+    func testCreationLookupExistingRowFailureAndCancellation() async throws {
+        let db = try DatabaseManager()
+        try db.upsertProject(Project(id: projectPath, name: "Test"))
+        var lookups: [String] = []
+        var opened: [String] = []
+        let tracker = SessionCreationTracker(database: db, timeout: .milliseconds(40), lookup: { lookups.append($0) }, onReady: { _, id in opened.append(id) })
+        tracker.register("missing")
+        tracker.receive(CreateSessionResponse(requestId: "missing", success: true, sessionId: "new", error: nil))
+        XCTAssertEqual(lookups, ["new"], "A normal request without a draft still fetches its returned ID")
+        try db.upsertSession(Session(id: "cached", projectId: projectPath, createdAt: 1, updatedAt: 1))
+        tracker.register("cached-request")
+        tracker.receive(CreateSessionResponse(requestId: "cached-request", success: true, sessionId: "cached", error: nil))
+        XCTAssertEqual(opened, ["cached"])
+        tracker.register("failure")
+        tracker.receive(CreateSessionResponse(requestId: "failure", success: false, sessionId: nil, error: "No desktop connected"))
+        XCTAssertEqual(tracker.completion?.error, "No desktop connected")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(tracker.completion?.requestId, "missing")
+        XCTAssertNotNil(tracker.completion?.error)
+        tracker.register("cancelled")
+        tracker.receive(CreateSessionResponse(requestId: "cancelled", success: true, sessionId: "late", error: nil))
+        tracker.cancel()
+        try db.upsertSession(Session(id: "late", projectId: projectPath, createdAt: 1, updatedAt: 1))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(tracker.completion)
+        XCTAssertEqual(opened, ["cached"], "Retired account observations cannot navigate")
+    }
+
+    /// NIM-5925: when the acknowledgement beats index ingestion, the row can
+    /// still arrive on its own -- a v2 lookup page writes it straight to GRDB
+    /// with no ingestion outcome behind it. The draft used to sit in memory
+    /// until some unrelated bulk response happened along.
+    func testPendingCreationDraftIsAppliedWhenTheRowArrivesWithoutAnIndexResponse() async throws {
+        let db = try DatabaseManager()
+        try db.upsertProject(Project(id: projectPath, name: "Test"))
+        let sync = manager(db)
+        let requestId = try sync.createSession(projectId: projectPath, initialDraft: "Carry me across")
+        await sync.receiveIndexMessage(try JSONSerialization.data(withJSONObject: [
+            "type": "createSessionResponseBroadcast",
+            "response": ["requestId": requestId, "success": true, "sessionId": "created"],
+        ]))
+        XCTAssertNil(try db.session(byId: "created"), "The acknowledgement arrived before the row")
+
+        try db.upsertSession(Session(id: "created", projectId: projectPath, createdAt: 1, updatedAt: 1))
+
+        let applied = expectation(description: "The pending draft lands on the row")
+        for _ in 0..<50 {
+            if try db.session(byId: "created")?.draftInput == "Carry me across" {
+                applied.fulfill()
+                break
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        await fulfillment(of: [applied], timeout: 2)
+    }
+
+    func testCreationSendFailureCompletesRegisteredRequestImmediately() throws {
+        let sync = manager(try DatabaseManager(), sendError: NSError(domain: "test", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Send failed"]))
+        let requestId = try sync.createSession(projectId: projectPath, initialDraft: "Preserve me")
+        XCTAssertEqual(sync.sessionCreations.completion?.requestId, requestId)
+        XCTAssertEqual(sync.sessionCreations.completion?.error, "Send failed")
+        XCTAssertEqual(sync.sessionCreation.pendingCount, 0)
+    }
+
+    private func manager(_ db: DatabaseManager, sendError: Error? = nil) -> SyncManager {
+        let sync = SyncManager(crypto: crypto, database: db, serverUrl: "https://invalid.example", userId: "test", registerDeviceCallbacks: false,
+            sender: { _, _, completion in completion(sendError) })
+        sync.isConnected = true
+        sync.connectedDevices = [
+            DeviceInfo(deviceId: "desktop", name: "Mac", type: "desktop", platform: "macos", appVersion: nil,
+                connectedAt: 1, lastActiveAt: 1, isFocused: false, status: "away"),
+            DeviceInfo(deviceId: "sandbox-one", name: "Sandbox", type: "headless", platform: "linux", appVersion: nil,
+                connectedAt: 1, lastActiveAt: 2, isFocused: false, status: "active"),
+        ]
+        return sync
     }
 
     /// A session entry. `valid: false` encrypts the project id under a key this
@@ -36,6 +151,7 @@ final class IndexIngestionTests: XCTestCase {
         title: String? = nil,
         phase: String? = nil,
         draft: String? = nil,
+        draftUpdatedAt: Int? = nil,
         isExecuting: Bool? = nil,
         valid: Bool = true
     ) throws -> [String: Any] {
@@ -55,7 +171,7 @@ final class IndexIngestionTests: XCTestCase {
         if phase != nil || draft != nil {
             let meta = ClientMetadata(
                 currentContext: nil, hasPendingPrompt: nil, phase: phase,
-                tags: nil, draftInput: draft, draftUpdatedAt: draft == nil ? nil : updatedAt
+                tags: nil, draftInput: draft, draftUpdatedAt: draft == nil ? nil : (draftUpdatedAt ?? updatedAt)
             )
             let json = String(data: try JSONEncoder().encode(meta), encoding: .utf8)!
             let encrypted = try crypto.encrypt(plaintext: json)
@@ -250,8 +366,40 @@ final class IndexIngestionTests: XCTestCase {
         XCTAssertEqual(try db.session(byId: "s1")?.draftInput, "unsent local text")
         XCTAssertEqual(try db.session(byId: "s1")?.lastReadAt, readAt)
 
-        try await receive(sync, sessions: [try entry("s1", updatedAt: 12, title: "T", draft: "")])
-        XCTAssertNil(try db.session(byId: "s1")?.draftInput, "An explicit empty draft is a clear, not an omission")
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 12, title: "T", draft: "", draftUpdatedAt: 51)])
+        XCTAssertNil(try db.session(byId: "s1")?.draftInput, "A newer explicit empty draft is a clear, not an omission")
+    }
+
+    /// NIM-5923: `draftUpdatedAt` is the field that orders drafts, and it was
+    /// never compared. A page built before the user's last keystroke -- a
+    /// reconnect replay, or one already in flight -- overwrote the composer.
+    func testOlderRemoteDraftCannotOverwriteANewerLocalOne() async throws {
+        let db = try DatabaseManager()
+        let sync = manager(db)
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 10, title: "T")])
+        try db.updateSessionDraftInput(sessionId: "s1", draftInput: "what the user is typing", draftUpdatedAt: 500)
+
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 11, title: "T",
+                                                     draft: "stale remote text", draftUpdatedAt: 400)])
+        XCTAssertEqual(try db.session(byId: "s1")?.draftInput, "what the user is typing")
+        XCTAssertEqual(try db.session(byId: "s1")?.draftUpdatedAt, 500)
+
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 12, title: "T",
+                                                     draft: "newer remote text", draftUpdatedAt: 600)])
+        XCTAssertEqual(try db.session(byId: "s1")?.draftInput, "newer remote text", "A newer remote draft still wins")
+    }
+
+    /// An older clear is still an older write. Without the stamp comparison a
+    /// replayed clear silently emptied the composer.
+    func testOlderRemoteClearCannotEmptyANewerLocalDraft() async throws {
+        let db = try DatabaseManager()
+        let sync = manager(db)
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 10, title: "T")])
+        try db.updateSessionDraftInput(sessionId: "s1", draftInput: "unsent", draftUpdatedAt: 500)
+
+        try await receive(sync, sessions: [try entry("s1", updatedAt: 11, title: "T",
+                                                     draft: "", draftUpdatedAt: 400)])
+        XCTAssertEqual(try db.session(byId: "s1")?.draftInput, "unsent")
     }
 
     // MARK: - Generations

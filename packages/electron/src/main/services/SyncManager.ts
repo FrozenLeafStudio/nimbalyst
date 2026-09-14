@@ -33,16 +33,11 @@ import * as os from 'os';
 import { getProjectFileSyncService } from './ProjectFileSyncService';
 import { startProjectFileSync, stopAllProjectFileSync } from '../file/WorkspaceWatcher';
 import { windowStates } from '../window/WindowManager';
-import { getGitRemoteIdentities } from '../utils/gitUtils';
-import {
-  composeProjectConfig,
-  toSyncedActionPrompts,
-  type ProjectConfigSlices,
-} from './sync/projectConfigComposer';
-import type { ActionPrompt } from './ActionPromptParser';
+import { createProjectConfigSync } from './sync/projectConfigSync';
+import { projectConfigSources } from './sync/projectConfigSources';
+import { nextMobileSettingsVersion } from './sync/mobileSettingsVersion';
 import { resolveProjectPath } from '../utils/workspaceDetection';
 import { decideMissingSession } from './sync/missingSessionPolicy';
-import { createHash } from 'crypto';
 import { setSleepPreventionMode, setSyncConnected, shutdownSleepPrevention, type PreventSleepMode } from './PowerSaveService';
 import { reconnectAllTrackerSyncs } from './TrackerSyncManager';
 import { BrowserWindow } from 'electron';
@@ -641,6 +636,8 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     const syncedStore = createSyncedSessionStore(baseStore, provider, {
       autoConnect: true,
     });
+    // Config discovery owns its retry/logging and must not delay session startup.
+    void projectConfigSync.refresh();
 
     // Sync existing sessions and projects to index using delta sync
     // logger.main.info('[SyncManager] Setting up incremental sync...');
@@ -806,8 +803,8 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
 
           const { getSessionMessagesForSyncBatch } = await import('./PGLiteSessionStore');
 
-          // logger.main.info(`[SyncManager] Syncing ${sessionsNeedingIndexUpdate.length} sessions (${sessionsNeedingMessageSync.length} need message sync, messages will load lazily)`);
-          provider.syncSessionsToIndex(sessionsNeedingIndexUpdate, {
+          // Reconciliation runs in the background so index publication does not delay startup.
+          void provider.syncSessionsToIndex(sessionsNeedingIndexUpdate, {
             syncMessages: sessionsNeedingMessageSync.length > 0,
             messageSyncRequests,
             getMessagesForSync: getSessionMessagesForSyncBatch,
@@ -830,7 +827,8 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
             .map(s => allLocalSessions.find(ls => ls.id === s.sessionId))
             .filter((s): s is NonNullable<typeof s> => s != null);
           if (staleLocalSessions.length > 0) {
-            provider.syncSessionsToIndex(staleLocalSessions, { syncMessages: false });
+            // Clearing stale flags is background reconciliation and must not delay startup.
+            void provider.syncSessionsToIndex(staleLocalSessions, { syncMessages: false });
           }
         }
 
@@ -852,7 +850,7 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
         // even for agent-only users with no OpenAI key (e.g. Codex). Mobile
         // keeps its stored key when openaiKey is undefined (NIM-976).
         // logger.main.info('[SyncManager] Syncing existing settings to mobile devices');
-        syncSettingsToMobile();
+        await syncSettingsToMobile();
       } catch (error) {
         logger.main.warn('[SyncManager] Failed to sync initial settings:', error);
       }
@@ -874,9 +872,18 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
             // On first callback, add a small delay to ensure WebSocket is fully ready
             // This handles the case where mobile connected before desktop registered the listener
             const delay = isFirstCallback ? 1000 : 0;
-            setTimeout(() => {
+            setTimeout(async () => {
               // Sync settings to the mobile device
-              void syncSettingsToMobile();
+              if (state.provider !== provider) return;
+              try {
+                const results = await Promise.allSettled([syncSettingsToMobile(), projectConfigSync.refresh()]);
+                const operations = ['settings', 'project config'];
+                results.forEach((result, index) => {
+                  if (result.status === 'rejected') logger.main.warn(`[SyncManager] Failed to refresh mobile device ${operations[index]}:`, result.reason);
+                });
+              } catch (error) {
+                logger.main.warn('[SyncManager] Failed to refresh mobile device settings or project config:', error);
+              }
             }, delay);
           }
         }
@@ -1008,6 +1015,7 @@ export function getPersonalDocSyncConfig(): {
  * Shutdown sync and disconnect all sessions.
  */
 export function shutdownSync(): void {
+  projectConfigSync.stop();
   remoteSessions.setProvider(null);
   shutdownSleepPrevention();
 
@@ -1203,8 +1211,8 @@ export async function triggerIncrementalSync(): Promise<void> {
 
       const { getSessionMessagesForSyncBatch } = await import('./PGLiteSessionStore');
 
-      // logger.main.info(`[SyncManager] Syncing ${sessionsNeedingIndexUpdate.length} sessions (${sessionsNeedingMessageSync.length} need message sync, messages will load lazily)`);
-      provider.syncSessionsToIndex(sessionsNeedingIndexUpdate, {
+      // Reconciliation publishes in the background so reconnect work can continue independently.
+      void provider.syncSessionsToIndex(sessionsNeedingIndexUpdate, {
         syncMessages: sessionsNeedingMessageSync.length > 0,
         messageSyncRequests,
         getMessagesForSync: getSessionMessagesForSyncBatch,
@@ -1223,9 +1231,6 @@ export async function triggerIncrementalSync(): Promise<void> {
 // ============================================================================
 // Settings Sync (Desktop -> Mobile)
 // ============================================================================
-
-// Track settings version to avoid re-syncing unchanged settings
-let settingsVersion = 0;
 
 /**
  * Get voice mode settings from the settings store.
@@ -1307,9 +1312,8 @@ export async function syncSettingsToMobile(_legacyOpenaiApiKey?: string): Promis
     return;
   }
 
-  // Increment version to ensure mobile gets the latest
-  settingsVersion++;
-
+  const settingsVersion = nextMobileSettingsVersion();
+  if (settingsVersion === undefined) return;
   // Get voice mode settings
   const voiceModeSettings = await getVoiceModeSettings();
 
@@ -1349,94 +1353,13 @@ export async function syncSettingsToMobile(_legacyOpenaiApiKey?: string): Promis
 // Project Config Sync (commands, etc.)
 // ============================================================================
 
-/**
- * Latest known value of each project-config slice, per workspace.
- *
- * The blob is a whole-object replace on the wire, but its two producers (slash
- * commands and action prompts) fire independently. Main cannot recompute the
- * command list on demand -- `listEntries` needs the provider-native commands
- * that only the running provider knows -- so the last reported value is cached
- * and every publish sends both slices together.
- */
-const projectConfigSlices = new Map<string, ProjectConfigSlices>();
-
-function getProjectConfigSlices(workspacePath: string): ProjectConfigSlices {
-  let slices = projectConfigSlices.get(workspacePath);
-  if (!slices) {
-    slices = { commands: [], lastCommandsUpdate: 0, actions: [], lastActionsUpdate: 0 };
-    projectConfigSlices.set(workspacePath, slices);
-  }
-  return slices;
-}
-
-/** Compose both slices and send the whole blob. The only send site. */
-async function publishProjectConfig(workspacePath: string): Promise<void> {
-  const provider = state.provider;
-  if (!provider?.syncProjectConfig) {
-    return; // Sync not initialized or unsupported, silently skip
-  }
-
-  try {
-    // Compute gitRemoteHash from the workspace's git remote URL. This is a
-    // freshly written identity, so it uses the canonical (credential-free) form.
-    let gitRemoteHash: string | undefined;
-    const gitRemote = await getGitRemoteIdentities(workspacePath);
-    if (gitRemote) {
-      gitRemoteHash = createHash('sha256').update(gitRemote.canonical).digest('hex');
-    }
-
-    const slices = getProjectConfigSlices(workspacePath);
-    await provider.syncProjectConfig(
-      workspacePath,
-      composeProjectConfig({ ...slices, gitRemoteHash })
-    );
-  } catch (error) {
-    logger.main.error('[SyncManager] Failed to sync project config:', error);
-  }
-}
-
-/**
- * Update the slash-command slice and republish.
- * @param workspacePath The workspace path (used as project ID)
- * @param commands Array of slash commands to sync (name + description + source only)
- */
-export async function syncProjectCommandsToMobile(
-  workspacePath: string,
-  commands: Array<{ name: string; description?: string; source: string }>
-): Promise<void> {
-  const slices = getProjectConfigSlices(workspacePath);
-  slices.commands = commands.map(cmd => ({
-    name: cmd.name,
-    description: cmd.description,
-    source: cmd.source as 'builtin' | 'project' | 'user' | 'plugin',
-  }));
-  slices.lastCommandsUpdate = Date.now();
-  await publishProjectConfig(workspacePath);
-}
-
-/**
- * Update the action-prompt slice and republish.
- *
- * Unlike commands, these carry their body: mobile pastes the prompt into its
- * composer for the user to edit, which it cannot do from a name alone.
- */
-export async function syncProjectActionsToMobile(
-  workspacePath: string,
-  actions: ActionPrompt[]
-): Promise<void> {
-  const slices = getProjectConfigSlices(workspacePath);
-  const projected = toSyncedActionPrompts(actions);
-  if (projected.droppedForCount > 0 || projected.droppedForSize > 0 || projected.truncatedCount > 0) {
-    logger.main.warn(
-      `[SyncManager] ai-actions.md exceeded the sync budget for ${workspacePath}: ` +
-        `${projected.droppedForCount} over the count cap, ${projected.droppedForSize} over the size budget, ` +
-        `${projected.truncatedCount} truncated`
-    );
-  }
-  slices.actions = projected.actions;
-  slices.lastActionsUpdate = Date.now();
-  await publishProjectConfig(workspacePath);
-}
+export const projectConfigSync = createProjectConfigSync({
+  ...projectConfigSources,
+  getProvider: () => state.provider,
+  getEnabledProjects: () => store.get('sessionSync')?.enabledProjects ?? [],
+  isProjectEnabled: path => createEnabledProjectFilter()(path),
+  warn: (message, error) => logger.main.warn(message, error),
+});
 
 /**
  * Decrypt mobile image attachments and convert to ChatAttachment format.
@@ -1603,6 +1526,7 @@ export async function attemptReconnect(): Promise<void> {
     // message stays until the index decrypts in full (GitHub #1117).
     updateSyncStatus({ connected: true, error: personalSyncGateMessage });
     logger.main.info('[SyncManager] Successfully reconnected after network change');
+    await projectConfigSync.refresh();
 
     // 3. Fan out: all other sync providers get an immediate reconnect now that
     //    we know the network is good. TrackerSync lives in main; TeamSync and
@@ -1637,4 +1561,4 @@ export async function attemptReconnect(): Promise<void> {
 }
 
 // Reconnect also sends the durable vault tombstone if a clear occurred offline.
-subscribeProviderCredentialChanges(() => { void syncSettingsToMobile(); });
+subscribeProviderCredentialChanges(() => { void syncSettingsToMobile(); /* Credential edits must not wait for network sync. */ });
