@@ -2442,12 +2442,19 @@ app.whenReady().then(async () => {
     // trackers/situational are a later step per the plan's own "Next" note.
     // Port/token come from the same shared registry `configureMcpServers`
     // populates below, not a second source of truth.
-    GeminiAntigravityProvider.setMcpEndpointsLoader((workspacePath: string) => {
+    GeminiAntigravityProvider.setMcpEndpointsLoader((sessionId: string, workspacePath: string) => {
       const { mcpServerPort, mcpAuthToken } = getSharedMcpServerConnection();
       if (mcpServerPort === null || !mcpAuthToken) return [];
+      // sessionId is required, not cosmetic: update_session_meta and every
+      // other tool resolve their target session from it. Without it in the
+      // query string the server can't tell which session to act on and the
+      // call quietly no-ops -- caught 2026-09-14 live (a rename that "worked"
+      // and did nothing). Same query-string shape McpConfigService uses for
+      // every other provider's /mcp/core URL.
+      const query = `workspacePath=${encodeURIComponent(workspacePath)}&sessionId=${encodeURIComponent(sessionId)}`;
       return [{
         serverName: 'nimbalyst',
-        url: `http://127.0.0.1:${mcpServerPort}/mcp/core?workspacePath=${encodeURIComponent(workspacePath)}`,
+        url: `http://127.0.0.1:${mcpServerPort}/mcp/core?${query}`,
         bearerToken: mcpAuthToken,
       }];
     });

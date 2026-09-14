@@ -540,7 +540,11 @@ describe('GeminiAntigravityProvider cascade transport routing (Phase 2A steps 1-
 
     await collect(provider.sendMessage('hello', undefined, 'ct-mcp', undefined, 'C:\\proj'));
 
-    expect(loader).toHaveBeenCalledWith('C:\\proj');
+    // sessionId is required, not decorative: Nimbalyst's MCP tools (e.g.
+    // update_session_meta) resolve their target session from it -- omitting
+    // it from the endpoint URL made a "successful" rename a silent no-op,
+    // caught live 2026-09-14.
+    expect(loader).toHaveBeenCalledWith('ct-mcp', 'C:\\proj');
     expect(cascadeClient.sendUserCascadeMessage).toHaveBeenCalledWith(
       expect.objectContaining({ mcpEndpoints: endpoints }),
       expect.any(Number),

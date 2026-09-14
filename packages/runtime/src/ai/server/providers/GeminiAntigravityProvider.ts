@@ -169,7 +169,9 @@ function clampCommandOutput(text: string): string {
 export class GeminiAntigravityProvider extends BaseAgentProvider {
   private static toolExecutor: GeminiToolExecutor | null = null;
   private static serverConfigLoader: (() => GeminiServerConfig) | null = null;
-  private static mcpEndpointsLoader: ((workspacePath: string) => McpEndpointInput[]) | null = null;
+  private static mcpEndpointsLoader:
+    | ((sessionId: string, workspacePath: string) => McpEndpointInput[])
+    | null = null;
 
   private readonly sessionStates = new Map<string, SessionState>();
   private readonly server: AntigravityServerManager;
@@ -567,8 +569,12 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     // result step's `metadata.toolSummary` arrives.
     const pendingCalls = new Map<string, { id: string; name: string; args: Record<string, unknown> }>();
 
+    // sessionId is required: `update_session_meta` and every other Nimbalyst
+    // MCP tool resolve their target session from this id -- an endpoint URL
+    // without it silently no-ops (the tool call succeeds, nothing happens),
+    // caught 2026-09-14 live: the session never actually renamed.
     const mcpEndpoints = state.workspacePath
-      ? (GeminiAntigravityProvider.mcpEndpointsLoader?.(state.workspacePath) ?? [])
+      ? (GeminiAntigravityProvider.mcpEndpointsLoader?.(sessionId, state.workspacePath) ?? [])
       : [];
 
     try {
@@ -826,7 +832,9 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
    * injected the same way `setServerConfigLoader` is -- this package stays
    * platform-agnostic (works in Electron and Capacitor/mobile).
    */
-  static setMcpEndpointsLoader(loader: ((workspacePath: string) => McpEndpointInput[]) | null): void {
+  static setMcpEndpointsLoader(
+    loader: ((sessionId: string, workspacePath: string) => McpEndpointInput[]) | null,
+  ): void {
     GeminiAntigravityProvider.mcpEndpointsLoader = loader;
   }
 
