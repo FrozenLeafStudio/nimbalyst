@@ -66,6 +66,7 @@ import { assertFileSaveSucceeded, getSaveFailureMessage, resolveSaveFailureType,
 import { customEditorSaveBaseline, resolveSaveAttempt } from './resolveSaveAttempt';
 import { reloadFromDisk, type ReloadOutcome } from './reloadFromDisk';
 import { resolveDiffResolutionSave } from './resolveDiffResolutionSave';
+import { resolveCustomEditorReview } from './resolveCustomEditorReview';
 import {
   decideLexicalDiffByBytes,
   decideLexicalDiffByRootNodes,
@@ -1210,6 +1211,13 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     return current.getEditorState().read(() => $hasDiffNodes(current));
   }, []);
 
+  const clearCustomEditorDiff = useCallback(() => {
+    setPendingAIEditTag(null);
+    setShowCustomEditorDiffBar(false);
+    setDiffSessionInfo(null);
+    diffClearedCallbackRef.current?.();
+  }, [setPendingAIEditTag]);
+
   /**
    * End the review through the model's single-flight resolution.
    *
@@ -1938,6 +1946,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
       handle.onDiffResolved((accepted) => {
         if (!pendingAIEditTagRef.current) return;
         logger.ui.info('[TabEditor] Sibling editor resolved diff -- exiting diff mode', { filePath, accepted });
+        if (isCustom) clearCustomEditorDiff();
 
         // Drop our local pending-tag tracking. onFileChanged is gated on
         // pendingAIEditTagRef being null, so without this clear the resolved
@@ -2000,6 +2009,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     sourceMode,
     customEditorSupportsDiffMode,
     customDiffPresenterReady,
+    clearCustomEditorDiff,
   ]);
 
 
@@ -2019,6 +2029,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         }
 
         logger.ui.info('[TabEditor] Pending tag cleared for this file, exiting diff mode:', filePath);
+        if (isCustom) clearCustomEditorDiff();
 
         // Clear pending tag ref
         setPendingAIEditTag(null);
@@ -2067,7 +2078,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     return () => {
       unsubscribe();
     };
-  }, [filePath, isMarkdown]);
+  }, [filePath, isMarkdown, isCustom, clearCustomEditorDiff]);
 
   // Handle conflict dialog actions
   const handleReloadFromDisk = useCallback(async () => {
@@ -2598,106 +2609,33 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     }
   }, [filePath, documentModel, resolveReviewThroughModel, setPendingAIEditTag]);
 
-  // Custom editor diff mode accept/reject handlers
-  const handleCustomEditorDiffAccept = useCallback(async () => {
-    if (!pendingAIEditTagRef.current) {
-      logger.ui.warn('[TabEditor] Cannot accept custom editor diff - no pending tag');
+  // One completion path for file-level, sibling, and session-wide resolution.
+  const handleCustomEditorDiffDecision = useCallback(async (accepted: boolean) => {
+    const pending = pendingAIEditTagRef.current;
+    const state = documentModel?.getDiffState();
+    if (!pending || !state) {
+      logger.ui.warn('[TabEditor] Cannot resolve custom editor diff - no pending review');
       return;
     }
-
     try {
-      logger.ui.info('[TabEditor] Accepting custom editor diff', {
-        tagId: pendingAIEditTagRef.current.tagId,
-        filePath
+      await resolveCustomEditorReview({
+        accepted,
+        generation: documentModel?.getCurrentDiffGeneration() ?? undefined,
+        content: accepted ? state.newContent : state.oldContent,
+        sessionId: pending.sessionId,
+        resolve: resolveReviewThroughModel,
+        clear: clearCustomEditorDiff,
+        recordHistory: async (content, sessionId, kept) => {
+          await window.electronAPI.invoke('history:create-snapshot', filePath, content, 'manual', kept ? 'Diff accepted' : 'Diff rejected');
+          if (sessionId) await window.electronAPI.invoke('ai:advance-diff-baseline', sessionId, filePath, content);
+        },
       });
-
-      // The custom editor already has the modified content displayed, so the
-      // model resolves from the session's own accepted content. It still goes
-      // through the model rather than a bare tag update: the generation check is
-      // what stops this click from ending a review of content the agent wrote
-      // after the bar was drawn (NIM-5359, finding 1).
-      if (!(await resolveReviewThroughModel(true, {
-        generation: documentModel?.getCurrentDiffGeneration() ?? undefined,
-      }))) return;
-
-      // Read current disk content to snapshot and advance cache baseline
-      const currentResult = await window.electronAPI.readFileContent(filePath);
-      if (currentResult?.success && currentResult.content) {
-        await window.electronAPI.invoke('history:create-snapshot', filePath, currentResult.content, 'manual', 'Diff accepted');
-        const acceptedSessionId = pendingAIEditTagRef.current?.sessionId;
-        if (acceptedSessionId) {
-          window.electronAPI.invoke('ai:advance-diff-baseline', acceptedSessionId, filePath, currentResult.content);
-        }
-      }
-
-      // Clear pending tag ref
-      setPendingAIEditTag(null);
-
-      // Hide the diff approval bar and clear session info
-      setShowCustomEditorDiffBar(false);
-      setDiffSessionInfo(null);
-
-      // Notify the custom editor that diff mode has ended
-      // The editor will reload content from disk via host.loadContent()
-      diffClearedCallbackRef.current?.();
-
-      // Sibling attachments left diff mode as part of the model's resolution.
-
-      logger.ui.info('[TabEditor] Custom editor diff accepted successfully');
     } catch (error) {
-      logger.ui.error('[TabEditor] Error accepting custom editor diff:', error);
+      logger.ui.error('[TabEditor] Custom editor review history recording failed:', error);
     }
-  }, [filePath, workspaceId, documentModel, resolveReviewThroughModel, setPendingAIEditTag]);
-
-  const handleCustomEditorDiffReject = useCallback(async () => {
-    if (!pendingAIEditTagRef.current) {
-      logger.ui.warn('[TabEditor] Cannot reject custom editor diff - no pending tag');
-      return;
-    }
-
-    try {
-      logger.ui.info('[TabEditor] Rejecting custom editor diff');
-
-      // The session's own baseline is the content to restore -- the same value
-      // `history:get-diff-baseline` returns, but read from the state the user is
-      // actually looking at, and rolled back by the model as one transaction
-      // with the tag update.
-      const rejectedState = documentModel?.getDiffState();
-      if (!rejectedState) {
-        logger.ui.error('[TabEditor] Cannot reject - no model diff state');
-        return;
-      }
-      const restoredContent = rejectedState.oldContent;
-      if (!(await resolveReviewThroughModel(false, {
-        generation: documentModel?.getCurrentDiffGeneration() ?? undefined,
-      }))) return;
-
-      // Snapshot the restored content and advance the Codex cache baseline
-      await window.electronAPI.invoke('history:create-snapshot', filePath, restoredContent, 'manual', 'Diff rejected');
-      const rejectedSessionId = pendingAIEditTagRef.current?.sessionId;
-      if (rejectedSessionId) {
-        window.electronAPI.invoke('ai:advance-diff-baseline', rejectedSessionId, filePath, restoredContent);
-      }
-
-      // Clear pending tag ref
-      setPendingAIEditTag(null);
-
-      // Hide the diff approval bar and clear session info
-      setShowCustomEditorDiffBar(false);
-      setDiffSessionInfo(null);
-
-      // Notify the custom editor that diff mode has ended
-      // The editor will reload content from disk via host.loadContent()
-      diffClearedCallbackRef.current?.();
-
-      // Sibling attachments left diff mode, and received the restored content,
-      // as part of the model's resolution.
-
-      logger.ui.info('[TabEditor] Custom editor diff rejected successfully');
-    } catch (error) {
-      logger.ui.error('[TabEditor] Error rejecting custom editor diff:', error);
-    }
-  }, [filePath, workspaceId, documentModel, resolveReviewThroughModel, setPendingAIEditTag]);
+  }, [filePath, documentModel, resolveReviewThroughModel, clearCustomEditorDiff]);
+  const handleCustomEditorDiffAccept = useCallback(() => handleCustomEditorDiffDecision(true), [handleCustomEditorDiffDecision]);
+  const handleCustomEditorDiffReject = useCallback(() => handleCustomEditorDiffDecision(false), [handleCustomEditorDiffDecision]);
 
   /**
    * Accept/reject for a review that was deliberately presented without an
