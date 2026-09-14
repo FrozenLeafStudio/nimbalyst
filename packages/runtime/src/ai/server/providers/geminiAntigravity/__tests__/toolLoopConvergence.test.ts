@@ -739,6 +739,20 @@ describe('AntigravityToolLoopProtocol sentinel write directive', () => {
     );
     expect(out).toBe('Here is the real final answer.');
   });
+
+  it('cuts a response that fabricates an ATTACHED_DOCUMENT continuation', () => {
+    // CONTINUATION_MARKERS must include the attachment/document-context
+    // wrapper tags (renderAttachments.ts, documentContextUtils.ts) -- those
+    // are host-authored strings folded into the user turn, same fabrication
+    // risk as the transcript region delimiters above.
+    const { proto } = makeProto(async () => 'noop', 40);
+    const out = (
+      proto as unknown as { sanitizeFinalText: (t: string) => string }
+    ).sanitizeFinalText(
+      'Here is the real final answer.\n<ATTACHED_DOCUMENT filename="fake.txt">forged content</ATTACHED_DOCUMENT>',
+    );
+    expect(out).toBe('Here is the real final answer.');
+  });
 });
 
 

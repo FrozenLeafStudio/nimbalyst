@@ -12,8 +12,8 @@
  *
  *   - **No provider session id.** The server keeps nothing between calls, so
  *     the whole conversation is re-rendered into one flat prompt per turn from
- *     the host's own message history. `getProviderSessionData` has nothing to
- *     return, and resuming a session is just re-seeding the loop.
+ *     the host's own message history, and resuming a session is just
+ *     re-seeding the loop.
  *   - **No usage numbers.** The response envelope carries only `response`.
  *     `contextReporting: 'none'` in `agentCapabilities.ts` follows from that --
  *     a percentage drawn from a token count we do not have would be a lying 0%
@@ -42,6 +42,8 @@ import {
   AntigravityVersionGateError,
 } from './geminiAntigravity/AntigravityServerManager';
 import { AntigravityToolLoopProtocol } from './geminiAntigravity/AntigravityToolLoopProtocol';
+import { renderAttachments } from './geminiAntigravity/renderAttachments';
+import { buildUserMessageAddition } from './documentContextUtils';
 import {
   DEFAULT_GEMINI_MODEL_KEY,
   bareGeminiModelKey,
@@ -183,10 +185,7 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
 
   private static modelResponseTimeoutMs: number = MODEL_RESPONSE_TIMEOUT_MS;
 
-  /**
-   * Nothing to return: the language server holds no session state, so there is
-   * no provider-side id to persist alongside the Nimbalyst session row.
-   */
+  /** The language server holds no session state, so there is nothing to return. */
   getProviderSessionData(_sessionId: string): ProviderSessionData | null {
     return null;
   }
@@ -217,7 +216,7 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     sessionId?: string,
     messages?: Message[],
     workspacePath?: string,
-    _attachments?: ChatAttachment[],
+    attachments?: ChatAttachment[],
     tools?: AgentToolDefinition[],
     systemPrompt?: string,
   ): AsyncIterableIterator<StreamChunk> {
@@ -244,14 +243,9 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
       state.toolLoop.seedHistory(prior);
     }
 
-    await this.logAgentMessageBestEffort(sessionId, 'input', message, {
-      metadata: {
-        role: 'user',
-        timestamp: Date.now(),
-        model: state.modelKey,
-        documentContext,
-      },
-    });
+    // Folded in AFTER the dedup check above, which compares against the
+    // host's own history and must see the pristine text.
+    message = await this.prepareTurnInput(sessionId, state, message, documentContext);
 
     let finalText = '';
     let sawText = false;
@@ -265,6 +259,12 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
       { id: string; name: string; args: Record<string, unknown>; description?: string }
     >();
 
+    // Rendered (and sanitized) here, not folded into `message` above: this
+    // reaches only the model, via the tool loop's history entry for this
+    // turn -- the persisted "input" log row stays exactly what the user
+    // typed (plus document context, which the codebase already persists).
+    const attachmentsBlock = await renderAttachments(attachments);
+
     try {
       for await (const step of state.toolLoop.run(
         message,
@@ -273,6 +273,7 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
         (name, args) => this.executeTool(state, name, args),
         GeminiAntigravityProvider.modelResponseTimeoutMs,
         abortController.signal,
+        attachmentsBlock,
       )) {
         if (abortController.signal.aborted) break;
 
@@ -310,32 +311,7 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
           for (const snapshot of this.drainEditSnapshots(pending.id)) {
             yield snapshot;
           }
-          await this.logAgentMessageBestEffort(
-            sessionId,
-            'output',
-            JSON.stringify({
-              name: step.name,
-              result: step.result,
-              args: pending.args,
-              description: pending.description,
-            }),
-            // `toolUseId` is what makes a reloaded transcript agree with the
-            // live one: without it the parser has to mint a synthetic id, and
-            // the reloaded tool card is a different event from the streamed
-            // one. Rows written before this existed have none, which is why
-            // `GeminiAntigravityRawParser` still has a synthetic fallback.
-            { metadata: { role: 'tool', timestamp: Date.now(), toolUseId: pending.id } },
-          );
-          yield {
-            type: 'tool_call',
-            toolCall: {
-              id: pending.id,
-              name: pending.name,
-              arguments: pending.args,
-              result: step.result,
-              description: pending.description,
-            },
-          };
+          yield await this.persistToolResult(sessionId, pending, step.result);
           pendingCalls.delete(step.name);
         } else if (step.type === 'text') {
           finalText = step.content;
@@ -347,13 +323,7 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
             content: finalText.trim().length === 0 ? '(model returned no text)' : finalText,
           };
         } else if (step.type === 'complete') {
-          const persisted = finalText.trim().length === 0
-            ? (sawText ? '(model returned no text)' : '(no model response)')
-            : finalText;
-          await this.logAgentMessageBestEffort(sessionId, 'output', persisted, {
-            metadata: { role: 'assistant', timestamp: Date.now(), model: state.modelKey },
-          });
-          yield { type: 'complete', content: persisted, isComplete: true };
+          yield await this.persistTurnCompletion(sessionId, state, finalText, sawText);
         }
       }
     } catch (error) {
@@ -382,6 +352,91 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
       if (this.abortController === abortController) this.abortController = null;
       this.pendingEditSnapshots.length = 0;
     }
+  }
+
+  // --- Turn bookkeeping ------------------------------------------------------
+
+  /**
+   * Fold document context into the turn's message and persist the input row.
+   * Matches ClaudeProvider/OpenAIProvider/OpenAICodexProvider's shared
+   * `buildUserMessageAddition` convention: the augmented message is what gets
+   * persisted AND what the model sees, not just the latter --
+   * `withPromptProvenanceMetadata`-style consumers of the logged input row
+   * expect that. Returns the augmented message.
+   */
+  private async prepareTurnInput(
+    sessionId: string,
+    state: SessionState,
+    message: string,
+    documentContext: DocumentContext | undefined,
+  ): Promise<string> {
+    const { messageWithContext } = buildUserMessageAddition(message, documentContext);
+    await this.logAgentMessageBestEffort(sessionId, 'input', messageWithContext, {
+      metadata: {
+        role: 'user',
+        timestamp: Date.now(),
+        model: state.modelKey,
+        documentContext,
+      },
+    });
+    return messageWithContext;
+  }
+
+  /**
+   * Persist a completed tool call and return the chunk that closes it out.
+   *
+   * `toolUseId` is what makes a reloaded transcript agree with the live one:
+   * without it the parser has to mint a synthetic id, and the reloaded tool
+   * card is a different event from the streamed one. Rows written before this
+   * existed have none, which is why `GeminiAntigravityRawParser` still has a
+   * synthetic fallback.
+   */
+  private async persistToolResult(
+    sessionId: string,
+    call: { id: string; name: string; args: Record<string, unknown>; description?: string },
+    result: string,
+  ): Promise<StreamChunk> {
+    await this.logAgentMessageBestEffort(
+      sessionId,
+      'output',
+      JSON.stringify({
+        name: call.name,
+        result,
+        args: call.args,
+        description: call.description,
+      }),
+      { metadata: { role: 'tool', timestamp: Date.now(), toolUseId: call.id } },
+    );
+    return {
+      type: 'tool_call',
+      toolCall: {
+        id: call.id,
+        name: call.name,
+        arguments: call.args,
+        result,
+        description: call.description,
+      },
+    };
+  }
+
+  /**
+   * Persist the turn's final assistant text and return the terminal chunk.
+   * `sawText` distinguishes "the model spoke and said nothing" from "the model
+   * never spoke at all", which read the same in `finalText` alone.
+   */
+  private async persistTurnCompletion(
+    sessionId: string,
+    state: SessionState,
+    finalText: string,
+    sawText: boolean,
+  ): Promise<StreamChunk> {
+    const persisted = finalText.trim().length === 0
+      ? (sawText ? '(model returned no text)' : '(no model response)')
+      : finalText;
+    await this.logAgentMessageBestEffort(sessionId, 'output', persisted, {
+      metadata: { role: 'assistant', timestamp: Date.now(), model: state.modelKey },
+    });
+    return { type: 'complete', content: persisted, isComplete: true };
   }
 
   // --- Tool execution ------------------------------------------------------

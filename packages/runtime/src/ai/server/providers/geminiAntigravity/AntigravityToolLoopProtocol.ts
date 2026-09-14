@@ -139,6 +139,12 @@ const CONTINUATION_MARKERS = [
   '\n[end of assistant message]',
   '\n' + TRANSCRIPT_OPEN,
   '\n' + TRANSCRIPT_CLOSE,
+  // Attachment/document-context wrappers (renderAttachments.ts,
+  // documentContextUtils.ts) are host-authored too, folded into the user
+  // turn rather than a tool result -- same continuation risk.
+  '\n<ATTACHED_DOCUMENT',
+  '\n<UNAVAILABLE_ATTACHMENTS>',
+  '\n<NIMBALYST_SYSTEM_MESSAGE>',
 ];
 
 /** Offset of the earliest continuation marker, or -1 when there is none. */
@@ -250,7 +256,13 @@ export class AntigravityToolLoopProtocol {
     // cuts a runaway sooner; getModelResponse then retries once (a fresh
     // generation usually does not run away), keeping ~2x90s worst case.
     timeoutMs = 90_000,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    // Rendered by renderAttachments.ts (already sanitized via
+    // neutralizeUntrustedText) and folded into the history entry for THIS
+    // turn only -- kept out of `userMessage` itself so the host's persisted
+    // "input" log row stays exactly what the user typed, not what was shown
+    // to the model.
+    attachmentsBlock?: string
   ): AsyncGenerator<
     | { type: 'text'; content: string }
     | {
@@ -264,7 +276,8 @@ export class AntigravityToolLoopProtocol {
   > {
     this.aborted = false;
     this.currentAbortSignal = abortSignal;
-    this.history.push({ role: 'user', content: userMessage });
+    const turnContent = attachmentsBlock ? `${userMessage}\n\n${attachmentsBlock}` : userMessage;
+    this.history.push({ role: 'user', content: turnContent });
     this.toolCallLedger = [];
     this.seenReadKeys.clear();
     this.mutationEpoch = 0;
@@ -1332,25 +1345,36 @@ export class AntigravityToolLoopProtocol {
         `assume the omitted middle; re-read a specific line range if you need it.]\n\n` +
         capped.slice(-tailLen);
     }
-    // Neutralize tool_call token by inserting a zero-width-ish marker between
-    // the underscore and "call". The model still reads it as plain text; the
-    // parser's `response.includes('tool_call')` short-circuit no longer fires
-    // on the embedded form. We use ascii-only since the prompt is rendered as
-    // utf-8 plain text.
-    const neutralized = capped.replace(/tool_call/g, 'tool_<<escaped>>_call');
-    // Also strip pre-existing wrapping tags so we don't double-wrap on resume.
-    // The transcript region delimiters are stripped too -- since a real result
-    // is rendered INSIDE that region, a tool that emitted either literal
-    // string could otherwise close the region early or open a fake one from
-    // inside supposedly-inert data. (Contains parentheses, so split/join
-    // instead of a RegExp to avoid escaping.)
-    const stripped = neutralized
-      .replace(new RegExp(TOOL_OUTPUT_OPEN, 'g'), '')
-      .replace(new RegExp(TOOL_OUTPUT_CLOSE, 'g'), '')
-      .split(TRANSCRIPT_OPEN)
-      .join('')
-      .split(TRANSCRIPT_CLOSE)
-      .join('');
-    return `${TOOL_OUTPUT_OPEN}${stripped}${TOOL_OUTPUT_CLOSE}`;
+    return `${TOOL_OUTPUT_OPEN}${neutralizeUntrustedText(capped)}${TOOL_OUTPUT_CLOSE}`;
   }
+}
+
+/**
+ * Strip/neutralize host-only markers from text that did not come from the
+ * model but is folded into the same flat prompt the model's own output is
+ * parsed out of (a `{"tool_call":...}` envelope, `<<<WRITE_FILE:...>>>`, the
+ * transcript region delimiters). Anything the model didn't author -- a tool
+ * result, a pasted document, an attachment -- goes through this before it
+ * enters `history`, so there is exactly one place this escaping happens
+ * rather than one per caller.
+ *
+ * Neutralizes `tool_call` by inserting a marker between the underscore and
+ * "call": the model still reads it as plain text, but the parser's
+ * `response.includes('tool_call')` short-circuit no longer fires on the
+ * embedded form. Ascii-only since the prompt is rendered as utf-8 plain text.
+ * Also strips the transcript region delimiters and the tool-output wrap tags
+ * -- a real tool result is rendered INSIDE the transcript region, so
+ * untrusted text containing either literal string could otherwise close the
+ * region early or open a fake one from inside supposedly-inert data.
+ * (Contains parentheses, so split/join instead of a RegExp to avoid escaping.)
+ */
+export function neutralizeUntrustedText(text: string): string {
+  const neutralized = text.replace(/tool_call/g, 'tool_<<escaped>>_call');
+  return neutralized
+    .replace(new RegExp(TOOL_OUTPUT_OPEN, 'g'), '')
+    .replace(new RegExp(TOOL_OUTPUT_CLOSE, 'g'), '')
+    .split(TRANSCRIPT_OPEN)
+    .join('')
+    .split(TRANSCRIPT_CLOSE)
+    .join('');
 }
