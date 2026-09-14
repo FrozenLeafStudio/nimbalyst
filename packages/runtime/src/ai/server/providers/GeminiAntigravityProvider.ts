@@ -49,8 +49,6 @@ import {
 } from './geminiAntigravity/geminiAntigravityModels';
 import type { ProviderSessionData } from './ProviderSessionManager';
 import type { ProviderCatalogHealth } from '../types';
-// LOCAL DEBUG ONLY -- drop with the debug commit.
-import { beginTurn, endTurn, logEvent, started } from './geminiAntigravity/debugLog';
 import { reportCatalogHealth } from './catalogHealthRegistry';
 import type {
   AgentToolDefinition,
@@ -267,15 +265,6 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
       { id: string; name: string; args: Record<string, unknown>; description?: string }
     >();
 
-    beginTurn(`${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
-    const turnElapsed = started();
-    logEvent('turn_start', {
-      model: state.modelKey, tools: (tools ?? []).length,
-      timeoutMs: GeminiAntigravityProvider.modelResponseTimeoutMs,
-      messageBytes: message.length,
-    });
-    let turnOutcome = 'ok';
-
     try {
       for await (const step of state.toolLoop.run(
         message,
@@ -368,7 +357,6 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
         }
       }
     } catch (error) {
-      turnOutcome = error instanceof Error ? error.message : String(error);
       if (abortController.signal.aborted) return;
       const errorMessage = error instanceof Error ? error.message : String(error);
       if (/not found at |Install Antigravity/i.test(errorMessage)) {
@@ -390,8 +378,6 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
         yield { type: 'error', error: errorMessage };
       }
     } finally {
-      logEvent('turn_end', { ms: turnElapsed(), outcome: turnOutcome });
-      endTurn();
       state.abortController = null;
       if (this.abortController === abortController) this.abortController = null;
       this.pendingEditSnapshots.length = 0;

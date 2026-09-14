@@ -33,8 +33,6 @@
  */
 
 import { AntigravityServerManager } from './AntigravityServerManager';
-// LOCAL DEBUG ONLY -- drop with the debug commit.
-import { setIteration, logEvent, started, clampPayload } from './debugLog';
 
 interface OpenAITool {
   type: 'function';
@@ -288,24 +286,12 @@ export class AntigravityToolLoopProtocol {
     for (let iteration = 0; iteration < this.maxIterations; iteration++) {
       if (this.aborted) return;
 
-      setIteration(iteration);
       const prompt = this.renderPrompt(fullSystemPrompt);
-      // Prompt growth across iterations is the thing to watch: a turn that
-      // times out late may simply be re-sending an ever-larger transcript.
-      logEvent('iteration', {
-        promptBytes: prompt.length, historyMessages: this.history.length,
-        softMisses, dupHits, jsonRetries, writeClaimNudges,
-      });
       const response = await this.server.getModelResponse(prompt, this.modelKey, timeoutMs, this.currentAbortSignal);
 
       if (this.aborted) return;
 
       const toolCall = this.parseToolCall(response);
-      logEvent('parse', {
-        responseBytes: response.length,
-        toolCall: toolCall ? toolCall.name : null,
-        response: toolCall ? undefined : clampPayload(response),
-      });
       if (!toolCall) {
         const text = this.sanitizeFinalText(this.stripToolCallJson(response));
         // A write directive is present but did not parse into a write_file call
@@ -525,17 +511,7 @@ export class AntigravityToolLoopProtocol {
 
       let resultText: string;
       try {
-        const toolElapsed = started();
-        logEvent('tool_call', {
-          name: toolCall.name, argBytes: JSON.stringify(toolCall.arguments ?? {}).length,
-        });
         const rawResult = await executeToolCall(toolCall.name, toolCall.arguments);
-        logEvent('tool_result', {
-          name: toolCall.name, ms: toolElapsed(),
-          resultBytes: typeof rawResult === 'string'
-            ? rawResult.length
-            : JSON.stringify(rawResult ?? null).length,
-        });
         resultText = typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult);
       } catch (err) {
         resultText = JSON.stringify({
