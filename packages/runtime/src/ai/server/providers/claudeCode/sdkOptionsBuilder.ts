@@ -17,6 +17,7 @@ import type { Options as ClaudeAgentSdkOptions, SettingSource } from '@anthropic
 import path from 'path';
 import { getHostEnvironment } from '../../../../host/hostEnvironment';
 import { ClaudeCodeDeps } from './dependencyInjection';
+import { CLAUDE_TASK_TOOLS, createClaudeSystemPrompt } from './sdkCompatibility';
 import { resolveClaudeAgentCliPath } from './cliPathResolver';
 import { hasEnterpriseManagedMcpConfig } from './enterpriseMcpConfig';
 import { type ThinkingMode } from '../../effortLevels';
@@ -253,13 +254,9 @@ export async function buildSdkOptions(
     // session's turns — any per-turn variation (e.g. a naming section that flips
     // once the agent names the session) forces a system_changed cache miss on
     // the whole prefix. See ClaudeCodeProvider.buildSystemPrompt / NIM-1988.
-    systemPrompt: isMetaAgent
-      ? systemPrompt  // Plain string — fully replaces CC system prompt
-      : {
-          type: 'preset',
-          preset: 'claude_code',
-          append: systemPrompt
-        },
+    systemPrompt: createClaudeSystemPrompt(systemPrompt, isMetaAgent),
+    // Meta-agent tool availability is restricted by its profile in turnPrologue.
+    ...(!isMetaAgent && { allowedTools: [...CLAUDE_TASK_TOOLS] }),
     settingSources: explicitOnly ? [] : settingSources,
     // Headless provisioned servers must not be merged with repository or user discovery.
     ...(explicitOnly ? { strictMcpConfig: true } : {}),
