@@ -12,7 +12,8 @@ import { DataModelCanvas, type DataModelCanvasRef } from './DataModelCanvas';
 import { DataModelToolbar } from './DataModelToolbar';
 import { createDataModelStore, type DataModelStoreApi } from '../store';
 import { createEmptyDataModel, type DataModelFile } from '../types';
-import { parsePrismaSchema, serializeToPrismaSchema } from '../prismaParser';
+import { parsePrismaSchema } from '../prismaParser';
+import { createLayoutSerializer } from '../layout/serialization';
 import { captureDataModelCanvas, copyScreenshotToClipboard } from '../utils/screenshotUtils';
 import {
   useEditorLifecycle,
@@ -26,6 +27,7 @@ import { buildEntitySelectionContextItem, buildRelationshipSelectionContextItem 
 
 export function DatamodelLMEditor({ host }: EditorHostProps) {
   const { filePath } = host;
+  const layoutSerializer = useMemo(() => createLayoutSerializer(), [filePath]);
 
   // Reactive read-only state. In read-only mode (inline embeds, share
   // viewer) we hide the toolbar so the schema graph reads cleanly.
@@ -60,7 +62,9 @@ export function DatamodelLMEditor({ host }: EditorHostProps) {
     parse: (raw: string): DataModelFile => {
       if (!raw) return createEmptyDataModel();
       try {
-        return parsePrismaSchema(raw);
+        const parsed = parsePrismaSchema(raw);
+        layoutSerializer.capture(raw, parsed);
+        return parsed;
       } catch (err) {
         // console.error('[DatamodelLM] Failed to parse Prisma schema:', err);
         return createEmptyDataModel();
@@ -68,7 +72,7 @@ export function DatamodelLMEditor({ host }: EditorHostProps) {
     },
 
     serialize: (data: DataModelFile): string => {
-      return serializeToPrismaSchema(data);
+      return layoutSerializer.serialize(data);
     },
 
     // Push: load data into the Zustand store
