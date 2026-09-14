@@ -141,8 +141,8 @@ describe('CodexAppServerProtocol', () => {
   });
 
   it.each(['start','resume'])('binds host hooks to %s and trusts only the exact session hook hashes',async(kind)=>{
-    const dispose=vi.fn(),endTurn=vi.fn();
-    const host=vi.fn(async()=>({command:'owned-hook',env:{NIMBALYST_SHELL_HOOK_URL:'http://fixture'},dispose,endTurn}));setCodexShellTrackingHost(host);
+    const dispose=vi.fn(),endTurn=vi.fn(),toolCompleted=vi.fn();
+    const host=vi.fn(async()=>({command:'owned-hook',env:{NIMBALYST_SHELL_HOOK_URL:'http://fixture'},dispose,endTurn,toolCompleted}));setCodexShellTrackingHost(host);
     const protocol=new CodexAppServerProtocol();const options={workspacePath:'/tmp/ws',raw:{nimbalystSessionId:'owner'}};
     const promise=kind==='start'?protocol.createSession(options):protocol.resumeSession('thread-hook',options);
     const init=await nextWrittenMatching(child,'initialize');child.emitLine({id:init.id,result:{}});
@@ -155,6 +155,18 @@ describe('CodexAppServerProtocol', () => {
     expect(host).toHaveBeenCalledWith('owner','/tmp/ws');
     expect(spawnMock.mock.calls[0][2].env.NIMBALYST_SHELL_HOOK_URL).toBe('http://fixture');
     child.emitLine({id:request.id,result:{thread:{id:'thread-hook'}}});const session=await promise;
+    // Failed MCP tools omit PostToolUse. Terminal notifications must retire the
+    // window even without an active sendMessage iterator; yielded shells stay open.
+    const completed = (threadId: string, item: Record<string, unknown>) =>
+      child.emitLine({method:'item/completed',params:{threadId,turnId:'t',item}});
+    completed('another-thread',{type:'mcpToolCall',id:'foreign',status:'failed'});
+    completed('thread-hook',{type:'commandExecution',id:'running',status:'completed',exitCode:null});
+    completed('thread-hook',{type:'mcpToolCall',id:'pending',status:'inProgress'});
+    expect(toolCompleted).not.toHaveBeenCalled();
+    completed('thread-hook',{type:'mcpToolCall',id:'failed-lookup',status:'failed'});
+    completed('thread-hook',{type:'fileChange',id:'failed-patch',status:'failed'});
+    completed('thread-hook',{type:'commandExecution',id:'exited-shell',status:'completed',exitCode:0});
+    expect(toolCompleted.mock.calls).toEqual([['failed-lookup'],['failed-patch'],['exited-shell']]);
     child.emitLine({method:'turn/completed',params:{threadId:'thread-hook',turn:{id:'t',status:'completed'}}});expect(endTurn).toHaveBeenCalled();
     protocol.cleanupSession(session);expect(dispose).toHaveBeenCalled();
   });

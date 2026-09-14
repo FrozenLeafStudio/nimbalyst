@@ -41,7 +41,7 @@ import {
   ToolResult,
 } from './ProtocolInterface';
 import { JsonRpcClient } from './codexAppServer/jsonRpcClient';
-import { prepareCodexShellTracking, type CodexShellTrackingRegistration } from './codexAppServer/shellTracking';
+import { observeCodexShellTracking, prepareCodexShellTracking, type CodexShellTrackingRegistration } from './codexAppServer/shellTracking';
 import {
   getCodexVendorPathEntries,
   resolveCodexBinaryPath,
@@ -548,12 +548,7 @@ export class CodexAppServerProtocol implements AgentProtocol {
       cleanupStarted: false,
       shellTracking: tracking?.registration,
     };
-    client.onNotification((method, params) => {
-      if ((method === 'turn/completed' || method === 'turn/failed') &&
-          extractNotificationRouting(params).threadId === raw.threadId) {
-        tracking?.registration.endTurn();
-      }
-    });
+    observeCodexShellTracking(client, raw.shellTracking, () => raw.threadId);
     return raw;
   }
 

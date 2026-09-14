@@ -2,7 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ShellFileAttribution, type ShellFileState, type ShellFileEvidence } from '../ShellFileAttribution';
 
-function fixture() {
+function fixture(beforeRead?: () => Promise<void>) {
   let now = 1000;
   let emit: (file: string) => void = () => {};
   const state = new Map<string, ShellFileState>();
@@ -14,7 +14,10 @@ function fixture() {
       emit = fn;
       return unsubscribe;
     },
-    read: async (f) => state.get(f) ?? null,
+    read: async (f) => {
+      await beforeRead?.();
+      return state.get(f) ?? null;
+    },
     knownWrite: (f, s) => known.has(f) && known.get(f) === s?.fingerprint,
     otherSessions: () => [],
     persist,
@@ -36,6 +39,46 @@ function fixture() {
   };
 }
 describe('shell hook attribution', () => {
+  it('waits for terminal cleanup that arrives while the next pre-hook is flushing', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reads = 0;
+    const f = fixture(() => ++reads === 1 ? gate : Promise.resolve());
+    const a = await f.service.register('A', '/workspace');
+    await f.service.pre(a, 'lookup', 'mcp__fixture__fail_lookup');
+    f.write('/workspace/during-lookup.ts', 'ambiguous');
+    const next = f.service.pre(a, 'next-shell', 'Bash');
+    await Promise.resolve();
+    const completed = f.service.post(a, 'lookup');
+    release();
+    await next;
+    f.write('/workspace/next.ts', 'owned');
+    await f.service.post(a, 'next-shell');
+    await completed;
+    expect(f.persist.mock.calls.map(([e]) => e.filePath)).toEqual(['/workspace/next.ts']);
+    await f.service.release(a);
+  });
+
+  it('drains a terminal MCP window before the next shell pre-hook, retaining real overlap', async () => {
+    const f = fixture(), a = await f.service.register('A', '/workspace');
+    await f.service.pre(a, 'lookup', 'mcp__fixture__fail_lookup');
+    await f.service.pre(a, 'overlapping-shell', 'Bash');
+    f.write('/workspace/overlap.ts', 'ambiguous');
+    await f.service.post(a, 'overlapping-shell');
+    // The protocol receives completion but cannot await it before the next hook.
+    const completed = f.service.post(a, 'lookup');
+    const duplicate = f.service.post(a, 'lookup');
+    await f.service.pre(a, 'next-shell', 'Bash');
+    f.write('/workspace/next.ts', 'owned');
+    await f.service.post(a, 'next-shell');
+    await Promise.all([completed, duplicate]);
+    expect(f.persist.mock.calls.map(([e]) => [e.filePath, e.toolUseId])).toEqual([
+      ['/workspace/next.ts', 'next-shell'],
+    ]);
+    expect(f.service.getStats().ambiguous).toBe(1);
+    await f.service.release(a);
+  });
+
   it('records sequential owners without using a dirty Git baseline or inventing a diff', async () => {
     const f = fixture(),
       a = await f.service.register('A', '/workspace'),

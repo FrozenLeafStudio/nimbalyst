@@ -118,6 +118,9 @@ export async function prepareShellTracking(sessionId: string, workspace: string)
         .map((value) => (process.platform === 'win32' ? `"${value}"` : `'${value.replace(/'/g, `'"'"'`)}'`))
         .join(' '),
     env: { NIMBALYST_SHELL_HOOK_URL: `http://127.0.0.1:${address.port}/${token}` },
+    toolCompleted: (id: string) => {
+      void shellFileAttribution.post(generation, id);
+    },
     endTurn: () => {
       shellFileAttribution.endTurn(generation);
       const stats = shellFileAttribution.getStats();

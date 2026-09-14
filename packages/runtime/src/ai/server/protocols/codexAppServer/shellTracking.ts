@@ -1,9 +1,11 @@
 import type { SessionOptions } from '../ProtocolInterface';
 import type { JsonRpcClient } from './jsonRpcClient';
+import { extractNotificationRouting } from './notificationDiagnostics';
 
 export interface CodexShellTrackingRegistration {
   command: string;
   env: Record<string, string>;
+  toolCompleted(id: string): void;
   endTurn(): void;
   dispose(): void;
 }
@@ -12,6 +14,33 @@ let host: Host | undefined;
 /** Electron supplies observation; runtime never imports Electron services. */
 export function setCodexShellTrackingHost(value: Host | undefined): void {
   host = value;
+}
+
+/** PostToolUse is omitted on tool failure and some yielded shell completions. */
+export function observeCodexShellTracking(
+  client: JsonRpcClient,
+  registration: CodexShellTrackingRegistration | undefined,
+  getThreadId: () => string,
+): void {
+  if (!registration) return;
+  client.onNotification((method, params) => {
+    const threadId = getThreadId();
+    if (!threadId || extractNotificationRouting(params).threadId !== threadId) return;
+    if (method === 'turn/completed' || method === 'turn/failed') {
+      registration.endTurn();
+      return;
+    }
+    if (method !== 'item/completed') return;
+    const item = (params as { item?: Record<string, unknown> }).item;
+    if (!item || typeof item.id !== 'string') return;
+    if (!['completed', 'failed', 'declined'].includes(String(item.status))) return;
+    // An exec call yielding a process handle is not process termination. Require
+    // an exit code before retiring a shell window; MCP/patch completion is final.
+    if (item.type === 'mcpToolCall' || item.type === 'fileChange' ||
+        (item.type === 'commandExecution' && typeof (item.exitCode ?? item.exit_code) === 'number')) {
+      registration.toolCompleted(item.id);
+    }
+  });
 }
 
 export async function prepareCodexShellTracking(options: SessionOptions) {

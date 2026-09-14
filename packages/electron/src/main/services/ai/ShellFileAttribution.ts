@@ -28,6 +28,7 @@ export class ShellFileAttribution {
     string,
     { generation: string; id: string; tool: string; start: number; files: Set<string> }
   >();
+  private readonly closing = new Map<string, Promise<void>>();
   private readonly cache = new Map<string, string | null>();
   private readonly stats = { ambiguous: 0, suppressed: 0, overflow: 0 };
   private readonly disabled = new Set<string>();
@@ -57,7 +58,13 @@ export class ShellFileAttribution {
     return generation;
   }
   async pre(generation: string, id: string, tool: string): Promise<void> {
-    await this.flush();
+    // Terminal app-server notifications do not wait for our watcher drain.
+    // Finish retiring those tools before allowing another command to execute.
+    do {
+      await Promise.all(this.closing.values());
+      await this.flush();
+      // A terminal notification can arrive while the filesystem queue drains.
+    } while (this.closing.size > 0);
     if (!this.sessions.has(generation) || !id || id.length > 256) return;
     // A bounded per-generation registry. Missing post hooks never grow it
     // without limit; at the cap tracking abstains until lifecycle cleanup.
@@ -70,13 +77,21 @@ export class ShellFileAttribution {
     if (!this.windows.has(key))
       this.windows.set(key, { generation, id, tool, start: this.now(), files: new Set() });
   }
-  async post(generation: string, id: string): Promise<void> {
+  post(generation: string, id: string): Promise<void> {
     // Shared bus delivery includes atomic-write/debounce delays on Linux.
     // Keep the window open while draining; this is inference, not an OS barrier.
-    if (!this.windows.has(generation + '|' + id)) return;
-    await new Promise((r) => setTimeout(r, this.deps.settleMs ?? 150));
-    await this.flush();
-    this.windows.delete(generation + '|' + id);
+    const key = generation + '|' + id;
+    const closing = this.closing.get(key);
+    if (closing) return closing;
+    const window = this.windows.get(key);
+    if (!window) return Promise.resolve();
+    const drain = (async () => {
+      await new Promise((r) => setTimeout(r, this.deps.settleMs ?? 150));
+      await this.flush();
+      if (this.windows.get(key) === window) this.windows.delete(key);
+    })().finally(() => this.closing.delete(key));
+    this.closing.set(key, drain);
+    return drain;
   }
   async flush(): Promise<void> {
     await this.queue;
