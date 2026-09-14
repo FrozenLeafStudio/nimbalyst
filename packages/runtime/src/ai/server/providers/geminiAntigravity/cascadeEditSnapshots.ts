@@ -113,3 +113,30 @@ export function buildEditSnapshotsFromCodeActionStep(
 
   return { path: edit.absoluteUri, beforeContent, afterContent };
 }
+
+// Both write tools confirmed live in the probes (step3-results.md); gates the
+// JSON.parse below so a non-write tool_result (e.g. a large listDirectory
+// listing) is never parsed for nothing.
+const WRITE_TOOL_NAMES = new Set(['write_to_file', 'replace_file_content']);
+
+/**
+ * Adapter for `AntigravityCascadeProtocol`'s `tool_result` event, whose
+ * `result` field is `JSON.stringify(step.codeAction)` -- the sub-object only,
+ * not the whole typed step (see that module's `extractResultPayload`). Never
+ * throws: an unrecognized tool name, malformed JSON, or a shape
+ * `buildEditSnapshotsFromCodeActionStep` doesn't recognize all fall through
+ * to `null`, same as the text-loop path's watcher fallback.
+ */
+export function buildEditSnapshotFromCascadeToolResult(
+  toolName: string,
+  resultJson: string,
+): EditSnapshotResult | null {
+  if (!WRITE_TOOL_NAMES.has(toolName)) return null;
+  let codeAction: CascadeCodeActionStep['codeAction'];
+  try {
+    codeAction = JSON.parse(resultJson) as CascadeCodeActionStep['codeAction'];
+  } catch {
+    return null;
+  }
+  return buildEditSnapshotsFromCodeActionStep({ type: 'CORTEX_STEP_TYPE_CODE_ACTION', codeAction });
+}

@@ -424,6 +424,64 @@ describe('GeminiAntigravityProvider cascade transport routing (Phase 2A steps 1-
     provider.destroy();
   });
 
+  it('emits pre/post edit snapshots for a write_to_file codeAction result (Phase 2A step 5)', async () => {
+    GeminiAntigravityProvider.setServerConfigLoader(() => ({ transport: 'cascade' }));
+    const announce = {
+      type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
+      status: 'CORTEX_STEP_STATUS_DONE',
+      plannerResponse: {
+        toolCalls: [{ id: 'call_9', name: 'write_to_file', argumentsJson: '{"path":"notes.txt"}' }],
+      },
+    };
+    const codeAction = {
+      actionResult: {
+        edit: {
+          absoluteUri: 'file:///C:/scratch/notes.txt',
+          createFile: true,
+          diff: { unifiedDiff: { lines: [{ type: 'UNIFIED_DIFF_LINE_TYPE_INSERT', text: 'hello' }] } },
+        },
+      },
+    };
+    const result = {
+      type: 'CORTEX_STEP_TYPE_CODE_ACTION',
+      status: 'CORTEX_STEP_STATUS_DONE',
+      metadata: { toolCall: { id: 'call_9', name: 'write_to_file' }, toolSummary: 'Wrote notes.txt' },
+      codeAction,
+    };
+    const cascadeClient = fakeCascadeClient({
+      getCascadeTrajectorySteps: vi
+        .fn()
+        .mockResolvedValueOnce({ steps: [] })
+        .mockResolvedValueOnce({ steps: [announce, result, terminalPlannerResponse] }),
+    });
+    const provider = new GeminiAntigravityProvider({ cascadeClient });
+    await provider.initialize({});
+
+    const chunks = await collect(
+      provider.sendMessage('write the file', undefined, 'ct-edit', undefined, 'C:\\proj'),
+    );
+
+    const pre = chunks.find((c) => c.type === 'pre_edit_snapshot');
+    const post = chunks.find((c) => c.type === 'post_edit_snapshot');
+    expect(pre?.preEditSnapshot?.toolUseId).toBe('call_9');
+    expect(pre?.preEditSnapshot?.entries[0]).toMatchObject({
+      path: 'file:///C:/scratch/notes.txt',
+      content: '',
+      kind: 'add',
+    });
+    expect(post?.postEditSnapshot?.toolUseId).toBe('call_9');
+    expect(post?.postEditSnapshot?.entries[0]).toMatchObject({
+      path: 'file:///C:/scratch/notes.txt',
+      content: 'hello',
+    });
+    // The snapshot chunks must arrive before the terminal tool_call chunk,
+    // which closes the attribution window (same ordering as the text-loop path).
+    const resultChunkIndex = chunks.findIndex((c) => c.type === 'tool_call' && c.toolCall?.result !== undefined);
+    expect(chunks.indexOf(post!)).toBeLessThan(resultChunkIndex);
+
+    provider.destroy();
+  });
+
   it('surfaces a Cascade-reported error as an error chunk', async () => {
     GeminiAntigravityProvider.setServerConfigLoader(() => ({ transport: 'cascade' }));
     const cascadeClient = fakeCascadeClient({

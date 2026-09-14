@@ -49,6 +49,7 @@ import {
 import { AntigravityToolLoopProtocol } from './geminiAntigravity/AntigravityToolLoopProtocol';
 import { AntigravityCascadeClient } from './geminiAntigravity/AntigravityCascadeClient';
 import { AntigravityCascadeProtocol } from './geminiAntigravity/AntigravityCascadeProtocol';
+import { buildEditSnapshotFromCascadeToolResult } from './geminiAntigravity/cascadeEditSnapshots';
 import { renderAttachments } from './geminiAntigravity/renderAttachments';
 import { buildUserMessageAddition } from './documentContextUtils';
 import {
@@ -575,6 +576,23 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
             // No announce chunk to attribute this to (shouldn't happen on a
             // well-formed trajectory) -- drop rather than guess.
             continue;
+          }
+          // Phase 2A step 5: a write tool's result carries the raw codeAction
+          // payload (see AntigravityCascadeProtocol's extractResultPayload),
+          // which reconstructs the same before/after snapshot shape the
+          // text-loop path gets from the injected executor's `fileWrite`.
+          // Emitted BEFORE the terminal tool_call chunk below, same ordering
+          // as the text-loop path (that chunk closes the attribution window).
+          const snapshot = buildEditSnapshotFromCascadeToolResult(ev.name, ev.result);
+          if (snapshot) {
+            this.pendingEditSnapshots.push({
+              absPath: snapshot.path,
+              beforeContent: snapshot.beforeContent,
+              afterContent: snapshot.afterContent,
+            });
+          }
+          for (const snapshotChunk of this.drainEditSnapshots(ev.id)) {
+            yield snapshotChunk;
           }
           // The description arrives with the RESULT, not the announce, so it
           // comes off the event rather than the pending entry.

@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import {
+  buildEditSnapshotFromCascadeToolResult,
   buildEditSnapshotsFromCodeActionStep,
   type CascadeCodeActionStep,
 } from '../cascadeEditSnapshots';
@@ -98,5 +99,32 @@ describe('buildEditSnapshotsFromCodeActionStep', () => {
       codeAction: { actionResult: {} },
     };
     expect(buildEditSnapshotsFromCodeActionStep(step)).toBeNull();
+  });
+});
+
+describe('buildEditSnapshotFromCascadeToolResult', () => {
+  // What AntigravityCascadeProtocol's tool_result event actually carries in
+  // `result`: JSON.stringify(step.codeAction) -- the sub-object, not the
+  // whole typed step (no `type` field alongside it).
+  const codeActionOnly = JSON.stringify(editStep(EDIT_LINES).codeAction);
+
+  it('reconstructs a snapshot from a write_to_file result', () => {
+    const result = buildEditSnapshotFromCascadeToolResult('write_to_file', codeActionOnly);
+    expect(result).not.toBeNull();
+    expect(result!.path).toBe('file:///C:/scratch/notes.txt');
+    expect(result!.afterContent).toContain('temporary file');
+  });
+
+  it('reconstructs a snapshot from a replace_file_content result', () => {
+    const result = buildEditSnapshotFromCascadeToolResult('replace_file_content', codeActionOnly);
+    expect(result).not.toBeNull();
+  });
+
+  it('returns null for a tool name that is not a recognized write', () => {
+    expect(buildEditSnapshotFromCascadeToolResult('list_files', codeActionOnly)).toBeNull();
+  });
+
+  it('returns null rather than throwing on malformed JSON', () => {
+    expect(buildEditSnapshotFromCascadeToolResult('write_to_file', '{not json')).toBeNull();
   });
 });
