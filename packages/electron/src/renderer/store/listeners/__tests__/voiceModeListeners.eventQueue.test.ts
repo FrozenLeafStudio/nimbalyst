@@ -111,6 +111,42 @@ const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve,
 const sentOn = (channel: string): unknown[] =>
   send.mock.calls.filter((call) => call[0] === channel).map((call) => call[1]);
 
+describe('voice transcript refresh cleanup', () => {
+  it.each(['scheduled', 'pending-write'] as const)('cancels %s refreshes when listeners are disposed', async (phase) => {
+    vi.useFakeTimers();
+    const { dispose } = await boot();
+    const aiLoadSession = vi.fn().mockResolvedValue(null);
+    window.electronAPI.aiLoadSession = aiLoadSession;
+    await vi.advanceTimersByTimeAsync(250);
+    aiLoadSession.mockClear();
+    let finishWrite!: () => void;
+    invoke.mockImplementation((channel: string) => channel === 'voice-mode:appendMessage'
+      ? new Promise<void>(resolve => { finishWrite = resolve; })
+      : Promise.resolve({ success: true }));
+    const toolCall = {
+      sessionId: FOCUSED_SESSION,
+      event: { phase: 'started', callId: 'cleanup', name: 'test', displayName: 'Test', args: {} },
+    };
+    try {
+      fire('voice-mode:tool-call', toolCall);
+      if (phase === 'scheduled') { finishWrite(); await Promise.resolve(); }
+      dispose();
+      // A replacement listener must not reactivate the old write's callback.
+      const { initVoiceModeListeners } = await import('../voiceModeListeners');
+      const disposeReplacement = initVoiceModeListeners();
+      try {
+        if (phase === 'pending-write') finishWrite();
+        await vi.advanceTimersByTimeAsync(250);
+        expect(aiLoadSession).not.toHaveBeenCalled();
+        fire('voice-mode:tool-call', toolCall);
+        finishWrite();
+        await vi.advanceTimersByTimeAsync(250);
+        expect(aiLoadSession).toHaveBeenCalledExactlyOnceWith('voice-db-1', '/ws');
+      } finally { disposeReplacement(); }
+    } finally { dispose(); vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+});
+
 describe('voice listen timeout wiring', () => {
   it('sleeps despite continuous silent Live output and a lost speech close', async () => {
     const { store, voice, dispose } = await boot();

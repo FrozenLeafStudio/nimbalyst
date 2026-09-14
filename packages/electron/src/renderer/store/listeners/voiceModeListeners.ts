@@ -38,9 +38,10 @@ import {
 } from '../atoms/voiceModeState';
 import { voiceModeSettingsAtom, type VoiceModeSettings } from '../atoms/appSettings';
 import { VoiceListenWindowController } from './voiceListenWindow';
+import { createVoiceTranscriptRefresh } from './voiceTranscriptRefresh';
 import { hasVoiceAudioSignal } from '../../utils/voiceAudioActivity';
 import { formatGitCommitProposalForVoice } from './voiceInteractivePrompt';
-import { activeSessionIdAtom, agentSessionAttentionAtom, sessionRegistryAtom, sessionHasPendingInteractivePromptAtom, sessionPendingPromptsAtom, sessionProcessingAtom, respondToPromptAtom, refreshSessionListAtom, reloadSessionDataAtom } from '../atoms/sessions';
+import { activeSessionIdAtom, agentSessionAttentionAtom, sessionRegistryAtom, sessionHasPendingInteractivePromptAtom, sessionPendingPromptsAtom, sessionProcessingAtom, respondToPromptAtom, refreshSessionListAtom } from '../atoms/sessions';
 import { windowModeAtom } from '../atoms/windowMode';
 import { buildCommitPrompt } from '@nimbalyst/runtime/ui/AgentTranscript/utils/commitPromptBuilder';
 import {
@@ -229,34 +230,7 @@ export function sleepVoiceListening(): void {
 }
 
 
-/**
- * Refresh the open transcript for the active voice DB session.
- *
- * Voice messages (speech turns, [system] diagnostics, and voiceToolCall
- * entries) are written straight to ai_agent_messages via
- * voice-mode:appendMessage. Unlike provider streaming, that path emits NO
- * `transcript:event`, so the TranscriptStreamAccumulator never sees them and
- * the open transcript wouldn't reflect new entries until the session is
- * reloaded for some other reason. That's why voice tool calls (memory
- * lookups, ask_coding_agent, etc.) "didn't show up" live even though they
- * were persisted correctly and project fine on reload.
- *
- * Reloading from the DB re-runs the same canonical projection (VoiceRawParser
- * -> tool_call_started/completed), so tool widgets and speech appear live.
- * Debounced (trailing edge) so a started+completed tool-call burst that lands
- * a few ms apart coalesces into a single reload that picks up both rows.
- */
-let voiceTranscriptRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleVoiceTranscriptRefresh(): void {
-  if (voiceTranscriptRefreshTimer) return;
-  voiceTranscriptRefreshTimer = setTimeout(() => {
-    voiceTranscriptRefreshTimer = null;
-    const sessionId = store.get(voiceDbSessionIdAtom);
-    const workspacePath = store.get(voiceWorkspacePathAtom);
-    if (!sessionId || !workspacePath) return;
-    void store.set(reloadSessionDataAtom, { sessionId, workspacePath });
-  }, 250);
-}
+let voiceTranscriptRefresh = createVoiceTranscriptRefresh();
 
 /**
  * Write a single transcript entry to the database.
@@ -273,7 +247,7 @@ function writeTranscriptEntry(entry: VoiceTranscriptEntry): void {
     entryId: entry.id,
     timestamp: entry.timestamp,
   })
-    .then(scheduleVoiceTranscriptRefresh)
+    .then(voiceTranscriptRefresh.schedule)
     .catch(error => {
       console.error('[voiceModeListeners] Failed to write transcript entry:', error);
     });
@@ -320,7 +294,7 @@ function writeDiagnosticEntry(message: string): void {
     entryId: `diag-${Date.now()}`,
     timestamp: Date.now(),
   })
-    .then(scheduleVoiceTranscriptRefresh)
+    .then(voiceTranscriptRefresh.schedule)
     .catch(error => {
       console.error('[voiceModeListeners] Failed to write diagnostic entry:', error);
     });
@@ -366,7 +340,7 @@ function writeToolCallEntry(event: VoiceToolCallEvent): void {
     entryId: `tool-${event.phase}-${event.callId}`,
     timestamp: Date.now(),
   })
-    .then(scheduleVoiceTranscriptRefresh)
+    .then(voiceTranscriptRefresh.schedule)
     .catch(error => {
       console.error('[voiceModeListeners] Failed to write tool-call entry:', error);
     });
@@ -840,7 +814,9 @@ function sessionLabel(sessionId: string): string {
  * @returns Cleanup function to call on unmount
  */
 export function initVoiceModeListeners(): () => void {
-  const cleanups: Array<() => void> = [];
+  voiceTranscriptRefresh.dispose();
+  voiceTranscriptRefresh = createVoiceTranscriptRefresh();
+  const cleanups: Array<() => void> = [voiceTranscriptRefresh.dispose];
 
   // Helper: check whether voice is active. Voice is a singleton so we don't
   // need to compare session IDs -- just check that *any* voice session is running.
