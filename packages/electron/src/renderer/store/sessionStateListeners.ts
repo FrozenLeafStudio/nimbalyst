@@ -849,9 +849,10 @@ export function initSessionStateListeners(): () => void {
     commitMessage?: string;
     filesToStage?: Array<string | { path: string; status?: string }>;
     workspacePath?: string;
+    autoApproved?: boolean;
   }) => {
     const { sessionId, proposalId } = data;
-    if (!sessionId) return;
+    if (!sessionId || data.autoApproved) return;
     store.set(sessionHasPendingInteractivePromptAtom(sessionId), true);
     const prompt: PendingPrompt = {
       id: proposalId,

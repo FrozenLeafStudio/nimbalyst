@@ -669,6 +669,32 @@ describe('voice event queue wiring', () => {
 
     const commits = (): unknown[][] => invoke.mock.calls.filter(([channel]) => channel === 'git:commit');
 
+    it.each([['Committed successfully', undefined], [undefined, 'Auto-commit failed']])(
+      'waits for the actual auto-commit outcome instead of asking for approval (%s, %s)',
+      async (summary, error) => {
+        const { store, sessions, dispose } = await boot();
+        try {
+          store.set(sessions.sessionPendingPromptsAtom(ASKING_SESSION), [
+            { ...PROPOSAL, data: { ...PROPOSAL.data, autoApproved: true } },
+          ]);
+          store.set(sessions.sessionHasPendingInteractivePromptAtom(ASKING_SESSION), true);
+          expect(sentOn('voice-mode:interactive-prompt')).toHaveLength(0);
+          expect(sentOn('voice-mode:announce-completion')).toHaveLength(0);
+          approve();
+          expect(commits()).toHaveLength(0);
+          store.set(sessions.sessionPendingPromptsAtom(ASKING_SESSION), []);
+          store.set(sessions.sessionHasPendingInteractivePromptAtom(ASKING_SESSION), false);
+          fire('voice-mode:task-completed', { sessionId: ASKING_SESSION, summary, error });
+          expect(sentOn('voice-mode:announce-completion')).toEqual([
+            expect.objectContaining({ summary: expect.stringContaining(summary || error!) }),
+          ]);
+        } finally {
+          dispose();
+        }
+      },
+    );
+
+
     it('does not commit a proposal that was never presented', async () => {
       const { store, sessions, dispose } = await boot();
       try {

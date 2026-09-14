@@ -1796,16 +1796,9 @@ export function initVoiceModeListeners(): () => void {
   // =========================================================================
   // Cross-Session Questions and Run Tracking
   // =========================================================================
-  // Every eligible agent session, not only the linked one. A question from a
-  // session the user is not looking at is exactly the case this exists for,
-  // and its answer must go back to it rather than to whatever tab is focused.
-  //
-  // We follow agentSessionAttentionAtom (already derived from every session's
-  // prompt/processing state) and then subscribe to the pending-prompt array of
-  // only those sessions that are awaiting input. Subscribing to the array, not
-  // to the has-a-prompt boolean, is deliberate: the boolean flips before the
-  // DB-backed prompt data loads, so reading prompts at that moment finds
-  // nothing, and a boolean set true->true fires no subscription at all.
+  // Follow all sessions awaiting input; answers belong to the asking session, not the focused tab.
+  // Subscribe to prompt arrays because the pending boolean can flip before data arrives,
+  // and setting that boolean true again would not notify subscribers.
 
   const promptSubs = new Map<string, () => void>();
 
@@ -1813,6 +1806,9 @@ export function initVoiceModeListeners(): () => void {
     if (store.get(voiceActiveSessionIdAtom) === null) return;
     const workspacePath = store.get(voiceWorkspacePathAtom) || '';
     for (const prompt of store.get(sessionPendingPromptsAtom(sessionId))) {
+      // Auto-approved proposals are not questions, even if present in pending state.
+      // Let the coding agent's actual result announce success or failure.
+      if (prompt.promptType === 'git_commit_proposal_request' && prompt.data?.autoApproved) continue;
       const eventId = `prompt:${sessionId}:${prompt.promptId}`;
       announceExtras.set(eventId, {
         promptType: prompt.promptType,

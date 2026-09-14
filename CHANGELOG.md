@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Voice mode reports auto-approved commit outcomes without asking for approval again.
 - Editor screenshots use shared native capture, preventing Prisma capture freezes and supporting unopened Markdown, code, image, and extension files.
 - Prisma diagrams use measured card sizes, clearer relationship routing, and automatic or explicit layout directions while preserving source text during layout-only saves.
 - iOS reports sync failures and preserves newer settings and drafts across reconnects.

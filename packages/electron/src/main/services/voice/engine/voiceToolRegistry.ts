@@ -635,7 +635,7 @@ export function buildBuiltinToolSchemas(): VoiceToolSchema[] {
     {
       type: 'function',
       name: 'propose_commit',
-      description: 'Trigger the "Commit with AI" feature. Use this when the user says "propose a commit", "commit with AI", "smart commit", or asks you to summarize and commit their changes. The coding agent will draft a commit message and file list. The proposal arrives shortly as an [INTERACTIVE PROMPT: ... promptType="git_commit_proposal_request"] message -- read only its commit title using the required system-instruction phrasing, then wait for the user to say "approve" or "reject" and call respond_to_interactive_prompt with their answer.',
+      description: 'Trigger the "Commit with AI" feature. Use this when the user says "propose a commit", "commit with AI", "smart commit", or asks you to summarize and commit their changes. The coding agent will draft a commit message and file list. When manual approval is required, the proposal arrives shortly as an [INTERACTIVE PROMPT: ... promptType="git_commit_proposal_request"] message -- read only its commit title using the required system-instruction phrasing, then wait for the user to say "approve" or "reject" and call respond_to_interactive_prompt with their answer. With auto-approve enabled, no approval is needed: wait for the coding agent result and report whether the commit succeeded or failed; never ask to approve or reject an auto-approved commit.',
       parameters: {
         type: 'object',
         properties: {},
