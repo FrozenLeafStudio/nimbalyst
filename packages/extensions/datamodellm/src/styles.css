@@ -812,3 +812,5 @@
 .datamodel-layout-error { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 5; max-width: 80%; padding: 8px 12px; border: 1px solid var(--nim-border); border-radius: 6px; background: var(--nim-bg-secondary); color: var(--nim-text); font-size: 12px; }
 .react-flow__edge-interaction:hover .datamodel-edge { stroke: var(--nim-primary) !important; stroke-width: 5px; }
 .react-flow__edge-interaction:hover line { stroke: var(--nim-primary); stroke-width: 5px; }
+
+.datamodel-screenshot-error { color: var(--nim-text); background: var(--nim-bg-secondary); padding: 8px 12px; border-bottom: 1px solid var(--nim-border); }

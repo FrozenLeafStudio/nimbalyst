@@ -175,17 +175,27 @@ export function DatamodelLMEditor({ host }: EditorHostProps) {
     },
   });
 
+  const screenshotPending = useRef(false);
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [screenshotError, setScreenshotError] = useState<string | null>(null);
+
   // Handle screenshot capture
   const handleScreenshot = useCallback(async () => {
     const canvasElement = canvasRef.current?.getCanvasElement();
-    if (!canvasElement) return;
+    if (!canvasElement || screenshotPending.current) return;
+    screenshotPending.current = true;
+    setIsCapturing(true);
+    setScreenshotError(null);
 
     try {
       const base64Data = await captureDataModelCanvas(canvasElement);
       await copyScreenshotToClipboard(base64Data);
       // console.log('[DatamodelLM] Screenshot copied to clipboard');
     } catch (err) {
-      // console.error('[DatamodelLM] Failed to capture screenshot:', err);
+      setScreenshotError(err instanceof Error ? err.message : 'Screenshot failed.');
+    } finally {
+      screenshotPending.current = false;
+      setIsCapturing(false);
     }
   }, []);
 
@@ -216,9 +226,10 @@ export function DatamodelLMEditor({ host }: EditorHostProps) {
       ref={rootElRef}
     >
       {!readOnly && (
-        <DataModelToolbar store={store} onScreenshot={handleScreenshot} host={host} />
+        <DataModelToolbar store={store} onScreenshot={handleScreenshot} isCapturing={isCapturing} host={host} />
       )}
       <ReactFlowProvider>
+        {screenshotError && <div role="alert" className="datamodel-screenshot-error">{screenshotError}</div>}
         <DataModelCanvas
           ref={canvasRef}
           store={store}

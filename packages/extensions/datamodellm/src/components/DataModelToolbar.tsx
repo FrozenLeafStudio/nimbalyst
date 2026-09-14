@@ -15,6 +15,7 @@ import type { EditorHost } from '@nimbalyst/extension-sdk';
 interface DataModelToolbarProps {
   store: DataModelStoreApi;
   onScreenshot?: () => void;
+  isCapturing?: boolean;
   host?: EditorHost;
 }
 
@@ -24,7 +25,7 @@ const VIEW_MODES: { value: EntityViewMode; label: string }[] = [
   { value: 'full', label: 'Full' },
 ];
 
-export function DataModelToolbar({ store, onScreenshot, host }: DataModelToolbarProps) {
+export function DataModelToolbar({ store, onScreenshot, isCapturing, host }: DataModelToolbarProps) {
   const state = store.getState();
   const { entities, relationships, entityViewMode, database } = state;
 
@@ -164,7 +165,8 @@ export function DataModelToolbar({ store, onScreenshot, host }: DataModelToolbar
             className="datamodel-toolbar-button datamodel-toolbar-icon-button"
             onClick={onScreenshot}
             title="Capture screenshot"
-            disabled={!onScreenshot}
+            disabled={!onScreenshot || isCapturing}
+            aria-busy={isCapturing}
           >
             <MaterialSymbol icon="photo_camera" size={18} />
           </button>
