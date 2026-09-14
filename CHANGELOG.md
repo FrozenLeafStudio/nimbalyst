@@ -10,36 +10,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 <!-- New features go here -->
-- Claude usage shows Fable and other model-specific weekly allowances remaining, with reset times.
-- Run sessions in your own Cloudflare sandbox with machine navigation, the shared composer, attachments and Actions, and profile/account selections remembered per project.
 
 ### Changed
 <!-- Changes to existing functionality go here -->
-- Canvas boards gain richer editing controls, zoomed-out mockup previews, and screen navigation with editable titles and links to original screenshots.
-- GPT Live voice previews play bundled recordings of the actual voices instantly, without an API key.
 
 ### Fixed
 <!-- Bug fixes go here -->
-- Voice mode reports auto-approved commit outcomes without asking for approval again.
-- Editor screenshots use shared native capture, preventing Prisma capture freezes and supporting unopened Markdown, code, image, and extension files.
-- Prisma diagrams use measured card sizes, clearer relationship routing, and automatic or explicit layout directions while preserving source text during layout-only saves.
-- iOS reports sync failures and preserves newer settings and drafts across reconnects.
-- Messages consumed by the desktop no longer reappear in the mobile queue after session updates.
-- Sessions created on iOS open as soon as they sync, without reopening the app.
-- Accepting large document rewrites preserves paragraph order, and rejecting them restores the original formatting.
-- The Git panel reports SSH disconnects and termination signals instead of showing passing hook output as the failure.
-- The GitHub panel no longer shows an unrelated AI session when the selected PR or issue has no matching session.
-- Open files recover from missed disk changes without reloading the app, preserve unsaved edits, and refuse saves when the disk version cannot be verified.
-- Slash-command search ranks exact matches first, then prefixes, with alphabetical ordering among equally relevant matches.
-- SQLite migrations retain progress across navigation, verify the switch after restart, and preserve recovery copies when history rows cannot be copied.
-- Cursor Agent no longer copies your global MCP server settings, including any secrets, into the project folder.
-- Repository-provided MCP servers no longer start for Grok Build or Cursor Agent in a workspace you have not trusted.
-- The macOS menu bar strip and the panel below it now agree on their status colors: running sessions are green, unread ones blue.
-- iOS session creation defaults to the desktop and reports failures instead of silently stopping.
-- Mobile slash commands sync automatically when the desktop or phone reconnects, without requiring an iOS update.
 
 ### Removed
 <!-- Removed features go here -->
+
+## [0.78.0] - 2026-09-14
+
+
+### Added
+- Run remote sessions in your own Cloudflare sandbox with attachments, Actions, and saved account preferences.
+- Claude usage shows model-specific weekly allowances remaining and reset times, including Fable.
+- Active transcript turns show elapsed time.
+
+### Changed
+- Canvas boards gain richer editing controls, zoomed-out previews, and screen navigation with editable titles and screenshot links.
+- GPT Live voice previews play instantly offline without an API key.
+- Prisma diagrams gain clearer relationship routing and layout controls while preserving source text during layout-only saves.
+
+### Fixed
+- Voice mode starts more reliably, communicates with coding agents, sleeps through silent audio, and reports auto-approved commits.
+- Editor screenshots avoid freezes and support unopened Markdown, code, image, and extension files.
+- Open files recover from missed disk changes, preserve unsaved edits, and block saves when the disk version cannot be verified.
+- Accepting large document rewrites preserves paragraph order; rejecting them restores the original formatting.
+- SQLite migrations retain progress, verify the switch after restart, and preserve recovery copies when history cannot be copied.
+- Git pushes stay connected during long checks and report SSH disconnects and termination signals clearly.
+- The GitHub panel clears unrelated AI sessions when the selected PR or issue has no matching session.
+- Slash-command search ranks exact matches first, then prefixes, with alphabetical ordering among equal matches.
+- Menu bar status colors match the panel: green for running sessions and blue for unread sessions.
+- iOS avoids launch hangs, reports sync failures, and preserves newer settings and drafts across reconnects.
+- Mobile-created sessions target the desktop, open without restarting, and report creation failures.
+- Consumed messages stay out of the mobile queue, and slash commands sync automatically after reconnecting.
+- Removing a Cloudflare sandbox also removes its container application.
 
 ## [0.77.5] - 2026-09-09
 
