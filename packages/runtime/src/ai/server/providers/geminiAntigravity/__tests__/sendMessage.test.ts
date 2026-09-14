@@ -27,6 +27,7 @@ import {
   type GeminiToolExecutorArgs,
 } from '../../GeminiAntigravityProvider';
 import { AntigravityServerManager } from '../AntigravityServerManager';
+import type { AntigravityCascadeClient } from '../AntigravityCascadeClient';
 import type { ChatAttachment, DocumentContext, StreamChunk } from '../../../types';
 
 async function collect(stream: AsyncIterableIterator<StreamChunk>): Promise<StreamChunk[]> {
@@ -298,6 +299,184 @@ describe('GeminiAntigravityProvider.sendMessage', () => {
     const secondPrompt = String(getModelResponse.mock.calls[1][0]);
     expect(secondPrompt).toContain('OUTPUT TRUNCATED');
     expect(secondPrompt).not.toContain('X'.repeat(30_000));
+  });
+});
+
+// Phase 2A (gemini-power-parity.md section 6): the transport switch that lets
+// this provider run turns through Cascade instead of the text loop. Step 1
+// covered routing + id persistence; step 2/3 (below) cover actual turn
+// execution through AntigravityCascadeProtocol. Mocked at the
+// sendUserCascadeMessage/getCascadeTrajectorySteps boundary on a fake
+// cascade client, never at ensureRunning -- per the plan's evidence-mocking
+// rule, this exercises the REAL AntigravityCascadeProtocol polling loop and
+// the REAL provider event-to-StreamChunk mapping.
+describe('GeminiAntigravityProvider cascade transport routing (Phase 2A steps 1-3)', () => {
+  const terminalPlannerResponse = {
+    type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
+    status: 'CORTEX_STEP_STATUS_DONE',
+    plannerResponse: { response: 'Hello from cascade.', toolCalls: [] },
+  };
+
+  function fakeCascadeClient(
+    overrides: Partial<
+      Record<'ensureCascade' | 'sendUserCascadeMessage' | 'getCascadeTrajectorySteps', ReturnType<typeof vi.fn>>
+    > = {},
+  ): AntigravityCascadeClient {
+    return {
+      ensureCascade: vi.fn().mockResolvedValue({ cascadeId: 'c1', resumed: false }),
+      sendUserCascadeMessage: vi.fn().mockResolvedValue(undefined),
+      getCascadeTrajectorySteps: vi
+        .fn()
+        .mockResolvedValueOnce({ steps: [] }) // baseline capture
+        .mockResolvedValueOnce({ steps: [terminalPlannerResponse] }),
+      ...overrides,
+    } as unknown as AntigravityCascadeClient;
+  }
+
+  afterEach(() => {
+    GeminiAntigravityProvider.setServerConfigLoader(null);
+    // The transport flag is a static field, set via applyServerConfig() at
+    // initialize() time -- reset it so it can't leak into a later test.
+    (GeminiAntigravityProvider as unknown as { transport: string }).transport = 'text-loop';
+  });
+
+  it('never touches the cascade client on the default text-loop transport', async () => {
+    const cascadeClient = fakeCascadeClient();
+    const provider = new GeminiAntigravityProvider({ cascadeClient });
+    await provider.initialize({});
+    const gmr = vi
+      .spyOn(AntigravityServerManager.prototype, 'getModelResponse')
+      .mockResolvedValue('hi');
+
+    await collect(provider.sendMessage('hello', undefined, 'ct1', undefined, 'C:\\proj'));
+
+    expect(cascadeClient.ensureCascade).not.toHaveBeenCalled();
+    gmr.mockRestore();
+    provider.destroy();
+  });
+
+  it('starts a cascade, persists the id, and runs the turn through to completion', async () => {
+    GeminiAntigravityProvider.setServerConfigLoader(() => ({ transport: 'cascade' }));
+    const cascadeClient = fakeCascadeClient();
+    const provider = new GeminiAntigravityProvider({ cascadeClient });
+    await provider.initialize({});
+
+    const chunks = await collect(
+      provider.sendMessage('hello', undefined, 'ct2', undefined, 'C:\\proj'),
+    );
+
+    expect(cascadeClient.ensureCascade).toHaveBeenCalledWith(
+      expect.objectContaining({ workspacePath: 'C:\\proj', persistedCascadeId: undefined }),
+    );
+    expect(cascadeClient.sendUserCascadeMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ cascadeId: 'c1', blocking: false }),
+      expect.any(Number),
+      expect.anything(),
+    );
+    expect(chunks.find((c) => c.type === 'text')?.content).toBe('Hello from cascade.');
+    const last = chunks[chunks.length - 1];
+    expect(last.type).toBe('complete');
+    expect(last.isComplete).toBe(true);
+    expect(provider.getProviderSessionData('ct2')).toEqual({ providerSessionId: 'c1' });
+
+    provider.destroy();
+  });
+
+  it('announces a tool call with its cascade-assigned id, then attaches the result to the same id', async () => {
+    GeminiAntigravityProvider.setServerConfigLoader(() => ({ transport: 'cascade' }));
+    const announce = {
+      type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
+      status: 'CORTEX_STEP_STATUS_DONE',
+      plannerResponse: {
+        toolCalls: [{ id: 'call_1', name: 'list_dir', argumentsJson: '{"DirectoryPath":"."}' }],
+      },
+    };
+    const result = {
+      type: 'CORTEX_STEP_TYPE_LIST_DIRECTORY',
+      status: 'CORTEX_STEP_STATUS_DONE',
+      // toolSummary is confirmed-live as the title source; the announce
+      // step above deliberately carries no such field, since the title
+      // isn't known until this result step arrives.
+      metadata: { toolCall: { id: 'call_1', name: 'list_dir' }, toolSummary: 'Listed the project directory' },
+      listDirectory: { results: [] },
+    };
+    const cascadeClient = fakeCascadeClient({
+      getCascadeTrajectorySteps: vi
+        .fn()
+        .mockResolvedValueOnce({ steps: [] })
+        .mockResolvedValueOnce({ steps: [announce, result, terminalPlannerResponse] }),
+    });
+    const provider = new GeminiAntigravityProvider({ cascadeClient });
+    await provider.initialize({});
+
+    const chunks = await collect(
+      provider.sendMessage('list files', undefined, 'ct2b', undefined, 'C:\\proj'),
+    );
+
+    const announceChunk = chunks.find((c) => c.type === 'tool_call' && c.toolCall?.result === undefined);
+    const resultChunk = chunks.find((c) => c.type === 'tool_call' && c.toolCall?.result !== undefined);
+    expect(announceChunk?.toolCall?.id).toBe('call_1');
+    expect(announceChunk?.toolCall?.description).toBeUndefined();
+    expect(resultChunk?.toolCall?.id).toBe('call_1');
+    expect(resultChunk?.toolCall?.result).toBe(JSON.stringify({ results: [] }));
+    expect(resultChunk?.toolCall?.description).toBe('Listed the project directory');
+
+    provider.destroy();
+  });
+
+  it('surfaces a Cascade-reported error as an error chunk', async () => {
+    GeminiAntigravityProvider.setServerConfigLoader(() => ({ transport: 'cascade' }));
+    const cascadeClient = fakeCascadeClient({
+      sendUserCascadeMessage: vi.fn().mockRejectedValue(new Error('neither PlanModel nor RequestedModel specified')),
+      getCascadeTrajectorySteps: vi.fn().mockResolvedValueOnce({ steps: [] }),
+    });
+    const provider = new GeminiAntigravityProvider({ cascadeClient });
+    await provider.initialize({});
+
+    const chunks = await collect(
+      provider.sendMessage('hello', undefined, 'ct2c', undefined, 'C:\\proj'),
+    );
+
+    expect(chunks.some((c) => c.type === 'error' && String(c.error).includes('RequestedModel'))).toBe(true);
+
+    provider.destroy();
+  });
+
+  it('passes the persisted cascade id from a prior turn into the next turn', async () => {
+    GeminiAntigravityProvider.setServerConfigLoader(() => ({ transport: 'cascade' }));
+    // Two turns, each: baseline capture (empty) then one terminal poll.
+    const cascadeClient = fakeCascadeClient({
+      getCascadeTrajectorySteps: vi
+        .fn()
+        .mockResolvedValueOnce({ steps: [] })
+        .mockResolvedValueOnce({ steps: [terminalPlannerResponse] })
+        .mockResolvedValueOnce({ steps: [] })
+        .mockResolvedValueOnce({ steps: [terminalPlannerResponse] }),
+    });
+    const provider = new GeminiAntigravityProvider({ cascadeClient });
+    await provider.initialize({});
+
+    await collect(provider.sendMessage('hello', undefined, 'ct3', undefined, 'C:\\proj'));
+    await collect(provider.sendMessage('again', undefined, 'ct3', undefined, 'C:\\proj'));
+
+    expect(cascadeClient.ensureCascade).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ persistedCascadeId: 'c1' }),
+    );
+    provider.destroy();
+  });
+
+  it('errors clearly instead of starting a cascade when no workspace is bound', async () => {
+    GeminiAntigravityProvider.setServerConfigLoader(() => ({ transport: 'cascade' }));
+    const cascadeClient = fakeCascadeClient();
+    const provider = new GeminiAntigravityProvider({ cascadeClient });
+    await provider.initialize({});
+
+    const chunks = await collect(provider.sendMessage('hello', undefined, 'ct4'));
+
+    expect(cascadeClient.ensureCascade).not.toHaveBeenCalled();
+    expect(String(chunks[0].error)).toMatch(/needs an open workspace/i);
+    provider.destroy();
   });
 });
 

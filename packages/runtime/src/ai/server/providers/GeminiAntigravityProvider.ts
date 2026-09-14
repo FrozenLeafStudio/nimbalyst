@@ -10,10 +10,15 @@
  *
  * Three consequences of that transport, each declared rather than assumed:
  *
- *   - **No provider session id.** The server keeps nothing between calls, so
- *     the whole conversation is re-rendered into one flat prompt per turn from
- *     the host's own message history, and resuming a session is just
- *     re-seeding the loop.
+ *   - **No provider session id on the text-loop transport.** The server keeps
+ *     nothing between calls there, so the whole conversation is re-rendered
+ *     into one flat prompt per turn from the host's own message history, and
+ *     resuming a session is just re-seeding the loop. The Cascade transport
+ *     (Phase 2A, `gemini-power-parity.md` section 6; feature-flagged, default
+ *     off) is the opposite: the server owns the trajectory, so
+ *     `getProviderSessionData` returns the persisted cascade id and a later
+ *     turn reattaches via `AntigravityCascadeClient.ensureCascade` instead of
+ *     starting over.
  *   - **No usage numbers.** The response envelope carries only `response`.
  *     `contextReporting: 'none'` in `agentCapabilities.ts` follows from that --
  *     a percentage drawn from a token count we do not have would be a lying 0%
@@ -42,6 +47,8 @@ import {
   AntigravityVersionGateError,
 } from './geminiAntigravity/AntigravityServerManager';
 import { AntigravityToolLoopProtocol } from './geminiAntigravity/AntigravityToolLoopProtocol';
+import { AntigravityCascadeClient } from './geminiAntigravity/AntigravityCascadeClient';
+import { AntigravityCascadeProtocol } from './geminiAntigravity/AntigravityCascadeProtocol';
 import { renderAttachments } from './geminiAntigravity/renderAttachments';
 import { buildUserMessageAddition } from './documentContextUtils';
 import {
@@ -99,6 +106,16 @@ export interface GeminiServerConfig {
   spawnPortCandidates?: number[];
   /** Per-call ceiling for one GetModelResponse round trip, in ms. */
   modelResponseTimeoutMs?: number;
+  /**
+   * Which turn transport to use. `'text-loop'` (default) is the existing
+   * `GetModelResponse` + prompt-embedded tool calls. `'cascade'` is Phase 2A
+   * (`gemini-power-parity.md` section 6): a session gets a real, resumable
+   * Cascade trajectory and turns run through `AntigravityCascadeProtocol`
+   * (native step polling, server-executed tools). MCP tool registration and
+   * permission-prompt wiring (plan steps 4 and 6) are not yet built, so a
+   * cascade turn runs with `autoAllowAllInteractions` and no host tools.
+   */
+  transport?: 'cascade' | 'text-loop';
 }
 
 interface SessionState {
@@ -153,10 +170,14 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
 
   private readonly sessionStates = new Map<string, SessionState>();
   private readonly server: AntigravityServerManager;
+  private readonly cascadeClient: AntigravityCascadeClient;
+  private readonly cascadeProtocol: AntigravityCascadeProtocol;
 
-  constructor(deps?: { server?: AntigravityServerManager }) {
+  constructor(deps?: { server?: AntigravityServerManager; cascadeClient?: AntigravityCascadeClient }) {
     super();
     this.server = deps?.server ?? AntigravityServerManager.shared();
+    this.cascadeClient = deps?.cascadeClient ?? new AntigravityCascadeClient(this.server);
+    this.cascadeProtocol = new AntigravityCascadeProtocol({ cascadeClient: this.cascadeClient });
   }
 
   getProviderName(): AIProviderType {
@@ -180,14 +201,24 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
       if (typeof t === 'number' && Number.isFinite(t) && t > 0) {
         GeminiAntigravityProvider.modelResponseTimeoutMs = t;
       }
+      if (serverConfig.transport === 'cascade' || serverConfig.transport === 'text-loop') {
+        GeminiAntigravityProvider.transport = serverConfig.transport;
+      }
     }
   }
 
   private static modelResponseTimeoutMs: number = MODEL_RESPONSE_TIMEOUT_MS;
+  private static transport: 'cascade' | 'text-loop' = 'text-loop';
 
-  /** The language server holds no session state, so there is nothing to return. */
-  getProviderSessionData(_sessionId: string): ProviderSessionData | null {
-    return null;
+  /**
+   * On the text-loop transport there is nothing to return -- the language
+   * server holds no session state. On the Cascade transport this returns the
+   * persisted cascade id, which is what lets a later turn reattach instead of
+   * starting a fresh trajectory.
+   */
+  getProviderSessionData(sessionId: string): ProviderSessionData | null {
+    const { providerSessionId } = this.sessions.getProviderSessionData(sessionId);
+    return providerSessionId ? { providerSessionId } : null;
   }
 
   registerToolHandler(_handler: ToolHandler): void {
@@ -229,6 +260,16 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     const abortController = new AbortController();
     state.abortController = abortController;
     this.abortController = abortController;
+
+    if (GeminiAntigravityProvider.transport === 'cascade') {
+      try {
+        yield* this.runCascadeTransportTurn(sessionId, state, message, documentContext, abortController.signal);
+      } finally {
+        state.abortController = null;
+        if (this.abortController === abortController) this.abortController = null;
+      }
+      return;
+    }
 
     // Re-seed the loop from the host's canonical history. The turn's own user
     // message is appended by run(), so a trailing duplicate of it is dropped
@@ -354,7 +395,14 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
     }
   }
 
-  // --- Turn bookkeeping ------------------------------------------------------
+  // --- Shared turn bookkeeping (both transports) ---------------------------
+  //
+  // The text loop and the Cascade protocol are different state machines --
+  // different event shapes in, different error semantics, different
+  // pendingCalls key spaces -- but the transcript rows and StreamChunks they
+  // hand the host are the canonical ones and must be byte-identical whichever
+  // transport produced them. These three helpers are that canonical half; the
+  // machine-specific half stays inline in each turn method.
 
   /**
    * Fold document context into the turn's message and persist the input row.
@@ -437,6 +485,128 @@ export class GeminiAntigravityProvider extends BaseAgentProvider {
       metadata: { role: 'assistant', timestamp: Date.now(), model: state.modelKey },
     });
     return { type: 'complete', content: persisted, isComplete: true };
+  }
+
+  /**
+   * Phase 2A steps 2-3: attach/track/start-or-resume (step 1, unchanged) then
+   * actually run the turn through `AntigravityCascadeProtocol` -- send the
+   * message, poll trajectory steps to a terminal signal, and map each event
+   * to the same `StreamChunk` shapes the text-loop path already produces
+   * (tool_call announce, tool_call+result, text, complete), so downstream
+   * consumers (transcript persistence, file-attribution, the UI) don't need
+   * to know which transport produced them. Bounds
+   * (`completionConfigOverride.maxTokens`, `maxGeneratorInvocations`,
+   * `userInteractionTimeoutSeconds`) use the protocol's documented defaults;
+   * MCP tool registration and permission-prompt wiring are later steps in the
+   * same plan (steps 4 and 6) and are not attempted here.
+   *
+   * Unlike the text loop's `pendingCalls` map (keyed by tool NAME, because
+   * `GetModelResponse` mints no id), this keys by the id the cascade itself
+   * assigns to each tool call -- confirmed populated on the wire
+   * (step3-results.md b'), not just in the offline SQLite decode doc 04
+   * flagged as unverified.
+   */
+  private async *runCascadeTransportTurn(
+    sessionId: string,
+    state: SessionState,
+    message: string,
+    documentContext: DocumentContext | undefined,
+    abortSignal: AbortSignal,
+  ): AsyncIterableIterator<StreamChunk> {
+    if (!state.workspacePath) {
+      yield {
+        type: 'error',
+        error: 'Cascade transport needs an open workspace; none is bound to this session.',
+      };
+      return;
+    }
+
+    let cascadeId: string;
+    try {
+      const persistedCascadeId = this.sessions.getSessionId(sessionId);
+      const result = await this.cascadeClient.ensureCascade({
+        workspacePath: state.workspacePath,
+        modelKeyOrEnum: state.modelKey,
+        persistedCascadeId,
+        abortSignal,
+      });
+      cascadeId = result.cascadeId;
+      this.sessions.captureSessionId(sessionId, cascadeId);
+    } catch (error) {
+      yield { type: 'error', error: error instanceof Error ? error.message : String(error) };
+      return;
+    }
+
+    // Attachments are NOT folded in here -- `TextOrScopeItem`'s non-text
+    // `item` variant (ContextScopeItem) was not exercised by the live probe,
+    // so its shape would be guessed rather than evidenced; that stays on the
+    // text-loop transport for now.
+    const turnMessage = await this.prepareTurnInput(sessionId, state, message, documentContext);
+
+    let finalText = '';
+    let sawText = false;
+    // No `description` field here (unlike the text-loop path's pendingCalls):
+    // Cascade never knows a call's title at announce time, only once the
+    // result step's `metadata.toolSummary` arrives.
+    const pendingCalls = new Map<string, { id: string; name: string; args: Record<string, unknown> }>();
+
+    try {
+      for await (const ev of this.cascadeProtocol.run({
+        cascadeId,
+        modelKeyOrEnum: state.modelKey,
+        userMessage: turnMessage,
+        timeoutMs: GeminiAntigravityProvider.modelResponseTimeoutMs,
+        abortSignal,
+      })) {
+        if (abortSignal.aborted) break;
+
+        if (ev.type === 'tool_call') {
+          // No description yet: Cascade doesn't know the title until the
+          // result step's `metadata.toolSummary` arrives (see
+          // AntigravityCascadeProtocol's tool_result/tool_error events).
+          pendingCalls.set(ev.id, { id: ev.id, name: ev.name, args: ev.args });
+          yield {
+            type: 'tool_call',
+            toolCall: { id: ev.id, name: ev.name, arguments: ev.args },
+          };
+        } else if (ev.type === 'tool_result') {
+          const pending = pendingCalls.get(ev.id);
+          if (!pending) {
+            // No announce chunk to attribute this to (shouldn't happen on a
+            // well-formed trajectory) -- drop rather than guess.
+            continue;
+          }
+          // The description arrives with the RESULT, not the announce, so it
+          // comes off the event rather than the pending entry.
+          yield await this.persistToolResult(
+            sessionId,
+            { id: ev.id, name: ev.name, args: pending.args, description: ev.description },
+            ev.result,
+          );
+          pendingCalls.delete(ev.id);
+        } else if (ev.type === 'tool_error') {
+          const pending = pendingCalls.get(ev.id);
+          yield {
+            type: 'tool_error',
+            toolError: { name: ev.name, arguments: pending?.args, error: ev.error },
+          };
+          pendingCalls.delete(ev.id);
+        } else if (ev.type === 'text') {
+          finalText = ev.content;
+          sawText = true;
+          yield {
+            type: 'text',
+            content: finalText.trim().length === 0 ? '(model returned no text)' : finalText,
+          };
+        } else if (ev.type === 'error') {
+          yield { type: 'error', error: ev.error };
+        } else if (ev.type === 'complete') {
+          yield await this.persistTurnCompletion(sessionId, state, finalText, sawText);
+        }
+      }
+    } catch (error) {
+      yield { type: 'error', error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   // --- Tool execution ------------------------------------------------------

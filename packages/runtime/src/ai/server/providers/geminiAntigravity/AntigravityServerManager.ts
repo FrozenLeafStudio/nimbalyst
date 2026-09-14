@@ -312,6 +312,37 @@ export class AntigravityServerManager {
 
   // ---- RPC ---------------------------------------------------------------
 
+  /**
+   * Generic Cascade-family RPC call: ensures a server is running, then posts
+   * to the given method on the same Connect-RPC service `GetModelResponse`
+   * already uses (`exa.language_server_pb.LanguageServerService` -- Cascade
+   * has no separate service, only different method names/bodies). Callers
+   * that cache anything keyed to "the current server" (e.g. tracked
+   * workspaces) should read `endpointEpoch()` right after this resolves.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async callRpc<T = any>(
+    method: string,
+    body: unknown,
+    timeoutMs = 120_000,
+    abortSignal?: AbortSignal,
+  ): Promise<T> {
+    const ep = await this.ensureRunning();
+    return this.rpc<T>(method, body, ep, timeoutMs, abortSignal);
+  }
+
+  /**
+   * Opaque token identifying the current endpoint incarnation; changes across
+   * a respawn or when discovery attaches to a different hub process. Cascade
+   * state (tracked workspaces, live trajectories) lives in the server's
+   * memory, not ours, so anything cached against "the current server" must be
+   * keyed on this and dropped when it changes. Null when no endpoint has been
+   * established yet.
+   */
+  endpointEpoch(): string | null {
+    return this.endpoint?.csrf ?? null;
+  }
+
   /** Low-level Connect-RPC POST returning parsed JSON. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private rpc<T = any>(method: string, body: unknown, ep: AntigravityEndpoint,

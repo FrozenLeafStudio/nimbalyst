@@ -2411,6 +2411,7 @@ app.whenReady().then(async () => {
         overrideIdeVersion?: unknown;
         spawnPortCandidates?: unknown;
         modelResponseTimeoutMs?: unknown;
+        transport?: unknown;
       }>)['antigravity-gemini-agent'] ?? {};
       return {
         overrideIdeVersion: typeof settings.overrideIdeVersion === 'string'
@@ -2426,6 +2427,12 @@ app.whenReady().then(async () => {
           ? settings.spawnPortCandidates.filter(
             (port): port is number => typeof port === 'number' && Number.isFinite(port) && port > 0,
           )
+          : undefined,
+        // No settings UI yet (Phase 2A, step 1 of gemini-power-parity.md
+        // section 6) -- an escape hatch via ai-settings.json only, same
+        // pattern as overrideIdeVersion above.
+        transport: settings.transport === 'cascade' || settings.transport === 'text-loop'
+          ? settings.transport
           : undefined,
       };
     });
