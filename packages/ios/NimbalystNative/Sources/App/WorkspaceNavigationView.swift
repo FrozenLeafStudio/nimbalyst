@@ -124,17 +124,10 @@ struct WorkspaceNavigationView: View {
                     }
                 }
             }
-            .safeAreaInset(edge: .top) {
-                Picker("Machine", selection: Binding(get: {navigation.hostDeviceId}, set: { navigation.hostDeviceId = $0; navigation.select(nil) })) {
-                    Text("Choose a machine").tag(String?.none)
-                    ForEach(hosts, id: \.deviceId) { device in
-                        Text(device.name).tag(Optional(device.deviceId))
-                    }
-                    if let host = navigation.hostDeviceId, !hosts.contains(where: { $0.deviceId == host }) {
-                        Text("Remote machine · Offline").tag(Optional(host))
-                    }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    computerMenu
                 }
-                .padding(.horizontal)
             }
             .navigationSplitViewColumnWidth(min: 240, ideal: 300, max: 360)
         } detail: {
@@ -152,6 +145,39 @@ struct WorkspaceNavigationView: View {
             // Initial database hydration must retain a cold-launch notification intent.
             if previous != nil { navigation.clearAccount() }
         }
+    }
+
+    private var isDesktopConnected: Bool {
+        if appState.screenshotMode { return true }
+        return appState.syncManager?.connectedDevices.contains(where: { $0.type == "desktop" }) ?? false
+    }
+
+    private var computerMenu: some View {
+        Menu {
+            Picker("Machine", selection: Binding(
+                get: { navigation.hostDeviceId },
+                set: { navigation.hostDeviceId = $0; navigation.select(nil) }
+            )) {
+                Text("Choose a machine").tag(String?.none)
+                ForEach(hosts, id: \.deviceId) { device in
+                    Text(device.name).tag(Optional(device.deviceId))
+                }
+                if let host = navigation.hostDeviceId, !hosts.contains(where: { $0.deviceId == host }) {
+                    Text("Remote machine · Offline").tag(Optional(host))
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "desktopcomputer")
+                    .font(.system(size: 14))
+                    .foregroundStyle(appState.isConnected ? .primary : .secondary)
+                Circle()
+                    .fill(isDesktopConnected ? Color.green : (appState.isConnected ? Color.orange : Color.gray))
+                    .frame(width: 8, height: 8)
+            }
+        }
+        .accessibilityLabel("Switch computer")
+        .accessibilityIdentifier("Switch Computer")
     }
 
     @ViewBuilder

@@ -188,7 +188,6 @@ public struct SessionListView: View {
                 if selectedTab == .sessions && model.facets.hasArchived {
                     archiveToggle
                 }
-                connectionIndicator
                 if selectedTab == .sessions {
                     creationMenu
                 }
@@ -557,24 +556,6 @@ public struct SessionListView: View {
             deleteSession(item.parent)
         } label: {
             Label("Delete", systemImage: "trash")
-        }
-    }
-
-    // MARK: - Connection Indicator
-
-    private var isDesktopConnected: Bool {
-        if appState.screenshotMode { return true }
-        return appState.syncManager?.connectedDevices.contains(where: { $0.type == "desktop" }) ?? false
-    }
-
-    private var connectionIndicator: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "desktopcomputer")
-                .font(.system(size: 14))
-                .foregroundStyle(appState.isConnected ? .primary : .secondary)
-            Circle()
-                .fill(isDesktopConnected ? Color.green : (appState.isConnected ? Color.orange : Color.gray))
-                .frame(width: 8, height: 8)
         }
     }
 
