@@ -630,6 +630,48 @@ describe('CodexAppServerProtocol', () => {
     protocol.cleanupSession(session);
   });
 
+  it('keeps streaming after a retryable error until the turn completes (#1523)', async () => {
+    const protocol = new CodexAppServerProtocol();
+    const sessionPromise = protocol.createSession({ workspacePath: '/tmp/ws' });
+    const initReq = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: initReq.id, result: { codexHome: '/fake', platformFamily: 'unix', platformOs: 'macos', userAgent: 'fake/0' } });
+    const startReq = await nextWrittenMatching(child, 'thread/start');
+    child.emitLine({ id: startReq.id, result: { thread: { id: 't-1' } } });
+    const session = await sessionPromise;
+
+    const events: ProtocolEvent[] = [];
+    const collector = (async () => {
+      for await (const ev of protocol.sendMessage(session, { content: 'recover please' })) {
+        events.push(ev);
+      }
+    })();
+
+    const turnReq = await nextWrittenMatching(child, 'turn/start');
+    child.emitLine({ id: turnReq.id, result: { turn: { id: 'turn-1', items: [], status: 'inProgress' } } });
+    child.emitLine({
+      method: 'error',
+      params: {
+        threadId: 't-1',
+        turnId: 'turn-1',
+        error: { message: 'Reconnecting... 2/5' },
+        willRetry: true,
+      },
+    });
+    child.emitLine({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 't-1', turnId: 'turn-1', itemId: 'msg-1', delta: 'Recovered' },
+    });
+    child.emitLine({ method: 'turn/completed', params: { threadId: 't-1', turn: { id: 'turn-1', status: 'completed' } } });
+
+    await collector;
+
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'text', content: 'Recovered' }));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'complete', content: 'Recovered' }));
+
+    protocol.cleanupSession(session);
+  });
+
   it('passes MCP server config through ThreadStartParams.config', async () => {
     const protocol = new CodexAppServerProtocol();
     const sessionPromise = protocol.createSession({

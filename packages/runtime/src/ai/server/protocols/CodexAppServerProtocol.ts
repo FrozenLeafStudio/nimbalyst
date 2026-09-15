@@ -925,6 +925,11 @@ export class CodexAppServerProtocol implements AgentProtocol {
       case 'turn/failed':
       case 'error': {
         const n = params as unknown as ErrorNotification;
+        // Codex emits the same notification while it retries a transient
+        // transport failure. `willRetry: true` explicitly means the turn is
+        // still active, so keep the iterator subscribed for the eventual
+        // recovery, terminal error, or turn completion (#1523).
+        if (method === 'error' && n.willRetry === true) return;
         const msg = n?.error?.message ?? 'codex app-server error';
         this.sweepOrphanedMcpCalls(push, undefined, undefined);
         push({ kind: 'fail', error: new Error(msg) });
