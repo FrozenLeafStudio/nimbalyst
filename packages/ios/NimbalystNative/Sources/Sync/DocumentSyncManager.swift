@@ -35,6 +35,7 @@ public final class DocumentSyncManager: ObservableObject {
     private var transfers: [String: DocumentSyncTransfer] = [:]
     private var transferTimeouts: [String: Task<Void, Never>] = [:]
     private let transferTimeout: Duration
+    private var isForeground = true
 
     public func state(for projectId: String) -> DocumentSyncState {
         loadStates[projectId] ?? .connecting
@@ -95,12 +96,12 @@ public final class DocumentSyncManager: ObservableObject {
     // MARK: - Connection
 
     /// Store auth credentials for connecting to project rooms.
-    public func setAuth(authToken: String, authUserId: String?, orgId: String) {
+    public func setAuth(authToken: String, authUserId: String?, orgId: String, reconnect: Bool = false) {
         let changed = self.authToken != authToken || self.authUserId != authUserId || self.orgId != orgId
         self.authToken = authToken
         self.authUserId = authUserId
         self.orgId = orgId
-        if changed {
+        if changed || reconnect {
             let active = activeProjectId
             for projectId in Array(projectClients.keys) { retryProject(projectId) }
             activeProjectId = active
@@ -132,6 +133,7 @@ public final class DocumentSyncManager: ObservableObject {
         isConnected = false
         scheduleTransferTimeout(projectId)
         let client = WebSocketClient()
+        client.setAppInForeground(isForeground)
         projectClients[projectId] = client
         let roomId = "org:\(orgId):user:\(effectiveUserId):project:\(hashProjectId(projectId))"
 
@@ -191,6 +193,11 @@ public final class DocumentSyncManager: ObservableObject {
         offlineQueues.removeAll()
         activeProjectId = nil
         isConnected = false
+    }
+
+    public func setAppInForeground(_ foreground: Bool) {
+        isForeground = foreground
+        for client in projectClients.values { client.setAppInForeground(foreground) }
     }
 
     /// Reconnect active project if WebSocket was dropped (e.g., app returning from background).

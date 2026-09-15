@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- iOS reconnects after backgrounding or network changes and refreshes missing sessions without restarting.
 - Codex turns remain active through transient reconnect attempts and HTTPS fallback.
 - Codex sessions keep tracking shell edits after tool failures and show when file tracking is incomplete.
 - Shared CSVs preserve all rows while opening and retain concurrent edits during synchronization.

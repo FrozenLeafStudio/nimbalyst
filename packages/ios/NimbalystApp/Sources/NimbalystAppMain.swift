@@ -95,10 +95,11 @@ struct NimbalystAppMain: App {
             NSLog("[ScenePhase] changed to: \(String(describing: newPhase))")
             switch newPhase {
             case .active:
-                appState.syncManager?.setAppInForeground(true)
-                appState.documentSyncManager?.reconnectIfNeeded()
-            case .inactive, .background:
-                appState.syncManager?.setAppInForeground(false)
+                appState.setAppInForeground(true)
+            case .background:
+                appState.setAppInForeground(false)
+            case .inactive:
+                break
             @unknown default:
                 break
             }

@@ -343,6 +343,11 @@ public final class SyncManager: ObservableObject {
                 self?.requestIndexSync()
             }
         )
+        replication?.onRequestTimeout = { [weak self] in
+            guard let self else { return }
+            if let recover = self.onReconnectNeeded { recover() }
+            else { self.indexClient.reconnect() }
+        }
     }
 
     // MARK: - Versioned Replication Handling
@@ -408,48 +413,30 @@ public final class SyncManager: ObservableObject {
         indexClient.reportActivity()
     }
 
-    /// Update whether the app is in the foreground.
-    /// Coming to foreground counts as user activity.
-    /// When returning to foreground, reconnects WebSockets if they were dropped while backgrounded.
-    public func setAppInForeground(_ inForeground: Bool) {
+    /// AppState coordinates credentials before recovery. Direct callers retain
+    /// foreground recovery for standalone sync clients and transport tests.
+    public func setAppInForeground(_ inForeground: Bool, recover: Bool = true) {
         indexClient.setAppInForeground(inForeground)
-        // History backfill pauses while backgrounded; navigation lookups and
-        // delta catch-up continue.
+        sessionClient.setAppInForeground(inForeground)
         replication?.setForeground(inForeground)
-        if inForeground {
-            reconnectIfNeeded()
-            // Defense in depth: even if the reconnect's onConnectionStateChanged
-            // callback fires the sync request, also trigger one explicitly
-            // here. Two sync requests are harmless (database appends are
-            // idempotent on message ID), and this guarantees a catch-up
-            // happens even if the reconnect callback chain ever changes.
-            if activeSessionId != nil {
-                requestSessionSync()
-            }
+        if inForeground && recover {
+            indexClient.reconnect()
+            if activeSessionId != nil { sessionClient.reconnect() }
         }
     }
 
-    /// Reconnect the index WebSocket if it was dropped (e.g., by iOS suspending the app).
-    /// Also reconnects the active session room if one was open.
-    ///
-    /// The session client is reconnected unconditionally (not gated on
-    /// `isConnected`) because URLSessionWebSocketTask can hold a backgrounded
-    /// task in `.running` state long after the underlying TCP connection has
-    /// died, so `isConnected` would lie and the user would be left with a
-    /// silently-dead transcript channel until they navigate away and back.
-    /// Forcing a fresh socket here is cheap; missing transcript broadcasts
-    /// is not. The session client also re-issues `requestSessionSync` on
-    /// reconnect (via `onConnectionStateChanged`), so any broadcasts dropped
-    /// while we were backgrounded are caught up via the syncResponse cursor.
-    private func reconnectIfNeeded() {
-        if !indexClient.isConnected {
-            logger.info("[Reconnect] Index client disconnected, reconnecting...")
-            indexClient.reconnect()
-        }
-        if let sessionId = activeSessionId {
-            logger.info("[Reconnect] Forcing session client reconnect for \(sessionId)")
-            sessionClient.reconnect()
-        }
+    /// The app owns index retries so credentials are refreshed before connecting.
+    public var onReconnectNeeded: (@MainActor () -> Void)? {
+        didSet { indexClient.onReconnectNeeded = onReconnectNeeded }
+    }
+
+    func waitForConnection() async -> Bool { await indexClient.waitForReady() }
+
+    /// Retire transport before awaiting auth, so creation cannot use a stale
+    /// connected flag. Keep the selected session, cache and navigation intents.
+    func prepareForRecovery() {
+        indexClient.disconnect()
+        sessionClient.disconnect()
     }
 
     // MARK: - Connection
@@ -467,7 +454,6 @@ public final class SyncManager: ObservableObject {
         // previous one must never reach this account's database.
         if roomId != connectedIndexRoomId {
             connectedIndexRoomId = roomId
-            startIndexIngestionGeneration()
         }
         logger.info("[Connect] IndexRoom roomId=\(roomId), orgId=\(orgId), effectiveUserId=\(self.effectiveUserId), authUserId=\(authUserId ?? "nil"), pairingUserId=\(self.userId)")
         indexClient.connect(serverUrl: serverUrl, roomId: roomId, authToken: authToken)
@@ -560,29 +546,33 @@ public final class SyncManager: ObservableObject {
     // MARK: - Index Client Setup
 
     private func setupIndexClient() {
+        indexClient.onWillConnect = { [weak self] in
+            guard let self else { return }
+            let lookups = self.replication?.pendingNavigationIds ?? []
+            self.startIndexIngestionGeneration()
+            self.replication?.restoreNavigation(lookups)
+        }
         indexClient.onConnectionStateChanged = { [weak self] connected in
-            Task { @MainActor in
-                self?.isConnected = connected
-                if !connected {
-                    self?.sessionCreation.disconnect()
-                    self?.requests.disconnect()
-                    self?.connectedDevices = []
-                }
-                if connected {
-                    // Re-publish the optimistic local writes whose send never
-                    // landed, from the rows as they read now.
-                    self?.requests.reconnect()
-                    // Versioned replication probes first; the probe's
-                    // unknown_message_type answer is what falls back to the
-                    // legacy index request (see IndexReplicationClient).
-                    self?.indexLoadState = .loading
-                    self?.replication?.start()
-                    // ActivityKit hands out a push-to-start token once per
-                    // launch, which is routinely before the socket is up. A
-                    // token that only existed while we were disconnected is a
-                    // card that never appears, with nothing to see in any log.
-                    self?.registerDeviceTokensOnConnect()
-                }
+            self?.isConnected = connected
+            if !connected {
+                self?.sessionCreation.disconnect()
+                self?.requests.disconnect()
+                self?.connectedDevices = []
+            }
+            if connected {
+                // Re-publish the optimistic local writes whose send never
+                // landed, from the rows as they read now.
+                self?.requests.reconnect()
+                // Versioned replication probes first; the probe's
+                // unknown_message_type answer is what falls back to the
+                // legacy index request (see IndexReplicationClient).
+                self?.indexLoadState = .loading
+                self?.replication?.start()
+                // ActivityKit hands out a push-to-start token once per
+                // launch, which is routinely before the socket is up. A
+                // token that only existed while we were disconnected is a
+                // card that never appears, with nothing to see in any log.
+                self?.registerDeviceTokensOnConnect()
             }
         }
 
@@ -875,12 +865,10 @@ public final class SyncManager: ObservableObject {
 
     private func setupSessionClient() {
         sessionClient.onConnectionStateChanged = { [weak self] connected in
-            Task { @MainActor in
-                guard let self = self else { return }
-                self.logger.info("sessionClient connection state: \(connected) (activeSessionId=\(self.activeSessionId ?? "nil"))")
-                if connected {
-                    self.requestSessionSync()
-                }
+            guard let self = self else { return }
+            self.logger.info("sessionClient connection state: \(connected) (activeSessionId=\(self.activeSessionId ?? "nil"))")
+            if connected {
+                self.requestSessionSync()
             }
         }
 

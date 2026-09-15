@@ -56,6 +56,8 @@ final class IndexReplicationClient {
     /// chain must not turn a single tap into unbounded fetching.
     static let maxAncestorHops = 5
 
+    var onRequestTimeout: (() -> Void)?
+
     private let logger = Logger(subsystem: "com.nimbalyst.app", category: "IndexReplication")
     private let generation: Int
     private let timeout: TimeInterval
@@ -155,6 +157,16 @@ final class IndexReplicationClient {
     }
 
     // MARK: - Lifecycle
+
+    var pendingNavigationIds: [String] {
+        var seen = Set<String>()
+        let ids = (lookupContinuation?.requestedIds ?? []) + (inFlight?.lookupSessionIds ?? []) + pendingLookupIds
+        return ids.filter { seen.insert($0).inserted }
+    }
+
+    func restoreNavigation(_ ids: [String]) {
+        pendingLookupIds = Array(ids.suffix(Self.maxPendingLookupIds))
+    }
 
     /// Begin replication for a fresh connection.
     ///
@@ -549,6 +561,7 @@ final class IndexReplicationClient {
                 if self.coverage.compatibility == .unknown {
                     self.coverage.compatibility = .unsupported
                 }
+                self.onRequestTimeout?()
             }
         }
     }

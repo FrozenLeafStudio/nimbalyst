@@ -127,12 +127,15 @@ final class IndexReplicationClientTests: XCTestCase {
     /// mistaken for an old server, and must not empty the list.
     func testTimeoutIsAFailureRatherThanALegacyDiagnosis() async throws {
         let client = makeClient(timeout: 0.1)
+        var recoveries = 0
+        client.onRequestTimeout = { recoveries += 1 }
         client.start()
         try await Task.sleep(nanoseconds: 400_000_000)
 
         XCTAssertEqual(legacyFallbacks, 0)
         XCTAssertEqual(client.coverage.compatibility, .unsupported)
         XCTAssertFalse(client.coverage.historyComplete)
+        XCTAssertEqual(recoveries, 1, "A silent application channel must trigger transport recovery")
     }
 
     // MARK: - Sequencing
