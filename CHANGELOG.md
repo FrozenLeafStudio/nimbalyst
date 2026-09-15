@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- In-app HTML previews render UTF-8 text correctly even when the document omits a charset declaration.
 - Commit proposals use the session's worktree and reject unsupported checkout overrides instead of committing in the wrong checkout.
 - iOS reconnects after backgrounding or network changes and refreshes missing sessions without restarting.
 - Codex turns remain active through transient reconnect attempts and HTTPS fallback.
