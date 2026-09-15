@@ -259,7 +259,7 @@ export async function buildSdkOptions(
     ...(!isMetaAgent && { allowedTools: [...CLAUDE_TASK_TOOLS] }),
     settingSources: explicitOnly ? [] : settingSources,
     // Headless provisioned servers must not be merged with repository or user discovery.
-    ...(explicitOnly ? { strictMcpConfig: true } : {}),
+    ...(explicitOnly && !mcpLockdown ? { strictMcpConfig: true } : {}),
     // NIM-1988: this is the provider-owned, first-build snapshot, not a live
     // config read. The SDK rebuilds the API tool prefix on resumed turns, so a
     // server appearing/disappearing here would force a tools_changed miss over
