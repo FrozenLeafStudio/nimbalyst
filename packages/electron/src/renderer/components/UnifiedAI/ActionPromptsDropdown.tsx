@@ -45,9 +45,8 @@ export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSess
     constrainHeight: false,
   });
 
-  // First-load fetch when the workspace changes. We always (re)load on mount
-  // for the current workspace so the dropdown reflects fresh state without
-  // relying on a broadcast that only fires on subsequent changes.
+  // Reopening is a recovery boundary for missed native events (#1524).
+  // Keep the initial fetch too, so the button count is populated before opening.
   useEffect(() => {
     if (!workspacePath) return;
     let cancelled = false;
@@ -69,7 +68,7 @@ export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSess
     return () => {
       cancelled = true;
     };
-  }, [workspacePath, setState]);
+  }, [workspacePath, setState, menu.isOpen]);
 
   const actions = state.actions;
   const hasActions = actions.length > 0;

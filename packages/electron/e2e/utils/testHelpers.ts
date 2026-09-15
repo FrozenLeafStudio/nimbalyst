@@ -63,6 +63,8 @@ export const PLAYWRIGHT_TEST_SELECTORS = {
   chatInput: 'textarea.ai-chat-input-field', // DEPRECATED: ambiguous - matches both Files mode and Agent mode. Use filesChatInput or agentChatInput instead.
   filesChatInput: '[data-testid="files-mode-chat-input"]',
   agentChatInput: '[data-testid="agent-mode-chat-input"]',
+  actionPromptsDropdown: '[data-testid="action-prompts-dropdown"]',
+  actionPromptsPanel: '[data-testid="action-prompts-dropdown-panel"]',
   newSessionButton: '[data-testid="new-session-button"]',
   noSessionSelected: 'text="No session selected"',
 
