@@ -143,6 +143,7 @@ export interface MigrateOptions {
 const COPY_TABLES: readonly string[] = [
   'worktrees',
   'ai_sessions',
+  'external_session_cursors',
   'document_history',
   'session_files',
   'shell_tracking_coverage',
@@ -201,7 +202,8 @@ const CURSOR_COLUMNS: Record<string, string> = {
   // Text-ID and composite-PK tables intentionally fall back to safe re-copy:
   // worktrees, ai_sessions, session_files, tracker_items, queued_prompts,
   // ai_session_wakeups, super_loops, super_iterations, tracker_body_cache,
-  // tracker_transactions, collab_local_origins.
+  // tracker_transactions, collab_local_origins, external_session_cursors.
+  // External per-file positions mutate/reset in place, so catch-up must re-copy them.
 };
 
 // Full copies can page TEXT keys; adoption must still re-copy those tables.

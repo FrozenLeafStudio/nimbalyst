@@ -63,6 +63,7 @@ import { registerActionPromptHandlers } from './ipc/ActionPromptHandlers';
 import { registerClaudeCodeHandlers } from './ipc/ClaudeCodeHandlers';
 import { registerCodexAuthHandlers } from './ipc/CodexAuthHandlers';
 import { initializeClaudeCodeSessionHandlers } from './ipc/ClaudeCodeSessionHandlers';
+import { getExternalSessionService, stopExternalSessionService } from './services/externalSessions/ExternalSessionService';
 import { registerNotificationHandlers } from './ipc/NotificationHandlers';
 import { registerPermissionHandlers } from './ipc/PermissionHandlers';
 import { registerGitStatusHandlers } from './ipc/GitStatusHandlers';
@@ -1965,6 +1966,7 @@ app.whenReady().then(async () => {
     registerClaudeCodeHandlers();
     registerCodexAuthHandlers();
     initializeClaudeCodeSessionHandlers();  // Initialize Claude Code session import
+    getExternalSessionService().initialize(); // Explicit opt-in only; waits for first usable before watching.
     registerAnalyticsHandlers();
     registerFeatureUsageHandlers();
     registerNotificationHandlers();
@@ -3494,6 +3496,7 @@ app.on('before-quit', async (event) => {
 
     // If auto-updater is updating, don't prevent quit
     if (AutoUpdaterService.isUpdatingApp()) {
+        void stopExternalSessionService(); // Revoke immediately, including the updater's early-exit path.
         console.log('[QUIT] Auto-updater is updating, allowing quit');
         return;
     }
@@ -3507,6 +3510,7 @@ app.on('before-quit', async (event) => {
     // Check if this is a programmatic restart request (from MCP restart_nimbalyst tool)
     const restartSignalPath = getRestartSignalPath();
     if (fs.existsSync(restartSignalPath)) {
+        const externalSessionDrain = stopExternalSessionService(); // Revoke before this early-exit branch awaits.
         console.log('[QUIT] Restart signal detected, saving session state before restart');
         // Mark as restarting BEFORE saving to prevent window close handlers from overwriting
         isAppRestarting = true;
@@ -3522,6 +3526,7 @@ app.on('before-quit', async (event) => {
         }
         // Save session state so the session is restored after restart
         try {
+            await externalSessionDrain;
             await saveSessionState();
             await flushPendingCollabBackups();
             console.log('[QUIT] Session state saved for restart');
@@ -3578,6 +3583,9 @@ app.on('before-quit', async (event) => {
 
     // Mark app as quitting to prevent interval operations
     isAppQuitting = true;
+
+    // Revoke source readers and drain their commits before database shutdown.
+    await stopExternalSessionService();
 
     // Live collaboration backups are debounced. Flush the latest decrypted
     // snapshots before renderer teardown so a quick quit cannot drop them.
