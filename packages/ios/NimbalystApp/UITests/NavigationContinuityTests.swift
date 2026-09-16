@@ -2,6 +2,33 @@ import XCTest
 
 final class NavigationContinuityTests: XCTestCase {
     @MainActor
+    func testNewSessionOpensTranscriptWithoutReopening() {
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["--screenshot-mode", "--screenshot-screen=sessions", "--session-creation-fixture",
+                               "-hasPromptedForNotifications", "YES"]
+        app.launch()
+        defer { app.terminate() }
+        for number in 1...3 {
+            let create = app.buttons["session-create-menu"]
+            XCTAssertTrue(create.waitForExistence(timeout: 10), app.debugDescription)
+            create.tap()
+            app.buttons["New Session"].tap()
+            XCTAssertTrue(app.navigationBars["Created session \(number)"].waitForExistence(timeout: 10))
+            XCTAssertTrue(app.webViews.firstMatch.waitForExistence(timeout: 10))
+            let loaded = NSPredicate { _, _ in
+                ["Loading transcript...", "Load Timeout", "Display Error", "Sync Failed", "Decryption Failed", "No Messages"]
+                    .allSatisfy { !app.staticTexts[$0].exists }
+            }
+            expectation(for: loaded, evaluatedWith: app)
+            waitForExpectations(timeout: 20)
+            XCTAssertTrue(app.descendants(matching: .any)["session-compose-input"].firstMatch.isHittable)
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+        }
+    }
+
+    @MainActor
     func testFilesDownloadsLargeProjectAndRetriesInterruptedSync() throws {
         continueAfterFailure = false
         guard let server = ProcessInfo.processInfo.environment["NIMBALYST_DOCUMENT_FIXTURE_URL"] else {

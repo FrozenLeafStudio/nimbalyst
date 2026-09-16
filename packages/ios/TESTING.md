@@ -82,6 +82,8 @@ xcodebuild -project NimbalystApp.xcodeproj -scheme NimbalystApp \
 
 The debug launch arguments `--screenshot-mode --screenshot-screen=navigation` use the real navigation shell instead of an isolated screenshot screen. This bypasses pairing and does not connect to sync. The test suppresses the notification prompt through a launch-time UserDefaults override.
 
+`testNewSessionOpensTranscriptWithoutReopening` uses `--session-creation-fixture` with the sessions screen to create three sessions through the real toolbar and creation callbacks. An in-memory account substitutes only the desktop response; it uses the bundled transcript and pooled WKWebView. Creating again after Back must finish loading without reopening the session. This covers premature disappearance of the implicit split-view detail stack after Back, which canceled the visible transcript's observers and timeout. The detail uses an explicit navigation stack to preserve its lifetime during the next selection. It does not verify desktop/server transport or a physical phone.
+
 `testEmptyListsWaitForIndexSync` uses `--loading-fixture` with the projects and sessions screens to hold an empty local database in loading for ten seconds, then complete the index. It verifies that loading appears before the definitive empty state. `SyncIntegrationTests.testIndexLoadCompletesOnlyAfterImportAndRejectsFailedImports` separately feeds encrypted wire responses through the real index handler and verifies that completion follows database writes, failed imports remain failures, and an empty retry completes. These fixtures do not connect to the live sync server.
 
 ## Testing the Session Fleet Live Activity

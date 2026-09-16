@@ -131,7 +131,12 @@ struct WorkspaceNavigationView: View {
             }
             .navigationSplitViewColumnWidth(min: 240, ideal: 300, max: 360)
         } detail: {
-            detail
+            // Keep the detail host stable across repeated programmatic selections.
+            // The implicit split-view stack can disappear during the next push,
+            // canceling the visible transcript's observers before its first load.
+            NavigationStack {
+                detail
+            }
         }
         .navigationSplitViewStyle(.balanced)
         .task(id: appState.syncManager.map(ObjectIdentifier.init)) {

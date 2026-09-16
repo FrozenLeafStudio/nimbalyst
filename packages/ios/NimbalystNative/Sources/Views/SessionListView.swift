@@ -418,6 +418,7 @@ public struct SessionListView: View {
             }
         }
         .disabled(isCreatingSession)
+        .accessibilityIdentifier("session-create-menu")
         .onReceive(NotificationCenter.default.publisher(for: .init("MetaAgentEnabledSynced"))) { _ in
             metaAgentEnabled = FeaturePreferences.metaAgentEnabled
         }

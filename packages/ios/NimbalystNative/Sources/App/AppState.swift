@@ -130,11 +130,15 @@ public final class AppState: ObservableObject {
     }
 
     /// Initialize with pre-built managers (for testing and previews).
-    public init(databaseManager: DatabaseManager, documentSyncManager: DocumentSyncManager? = nil) {
+    public init(databaseManager: DatabaseManager, documentSyncManager: DocumentSyncManager? = nil, syncManager: SyncManager? = nil) {
         self.documentSyncManager = documentSyncManager
         self.databaseManager = databaseManager
+        self.syncManager = syncManager
         self.indexLoadState = .loaded
         self.isPaired = true
+        #if os(iOS)
+        if let syncManager { observeSessionCreation(syncManager) }
+        #endif
         observeAuth()
     }
 
@@ -604,15 +608,7 @@ public final class AppState: ObservableObject {
 
         // SyncManager only delivers successes for this device's pending requests.
         // Open sessions created by the toolbar as well as those created by voice.
-        sync.onSessionCreated = { [weak self, weak voice, weak sync] requestId, sessionId in
-            Task { @MainActor in
-                guard let self, let sync, self.syncManager === sync else { return }
-                if voice?.consumePendingCreateSession(requestId: requestId) == true {
-                    voice?.activeSessionId = sessionId
-                }
-                await self.navigateWhenSessionAvailable(sessionId)
-            }
-        }
+        observeSessionCreation(sync)
 
         // Wire settings sync to update VoiceAgent and model list when settings arrive from desktop
         sync.onSettingsSynced = { [weak self, weak voice] settings in
@@ -676,31 +672,6 @@ public final class AppState: ObservableObject {
         voice.configure(database: database, syncManager: sync, projectId: projectId)
         #endif
     }
-
-    #if os(iOS)
-    /// Publish a navigation request to the just-created session once its row has
-    /// synced into the local database. The `createSessionResponseBroadcast` can
-    /// arrive before the session's `indexBroadcast`, so we briefly wait for the
-    /// row rather than navigate to a session the views can't yet resolve.
-    @MainActor
-    private func navigateWhenSessionAvailable(_ sessionId: String) async {
-        guard let requestedDatabase = databaseManager else {
-            voiceNavigationRequest = sessionId
-            return
-        }
-        syncManager?.requestSessionIndexLookup(sessionId: sessionId)
-        for _ in 0..<25 { // ~5s max (25 * 200ms)
-            guard !Task.isCancelled, databaseManager === requestedDatabase else { return }
-            if let db = databaseManager, (try? db.session(byId: sessionId)) != nil {
-                voiceNavigationRequest = sessionId
-                return
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        // Fall back: navigate anyway; the view retries the row lookup itself.
-        voiceNavigationRequest = sessionId
-    }
-    #endif
 
     // MARK: - Screenshot Mode
 
