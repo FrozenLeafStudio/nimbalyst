@@ -93,6 +93,9 @@ final class WorkspaceNavigationState: ObservableObject {
 struct WorkspaceNavigationView: View {
     @EnvironmentObject private var appState: AppState
     @ObservedObject var navigation: WorkspaceNavigationState
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
     private var hosts: [DeviceInfo] { navigation.hosts }
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
@@ -101,6 +104,29 @@ struct WorkspaceNavigationView: View {
     }
 
     var body: some View {
+        #if os(iOS)
+        GeometryReader { geometry in
+            let isWide = geometry.size.width >= 700
+            // Some iPhones remain compact in landscape despite having room
+            // for both columns. Adapt the existing split view without replacing
+            // its navigation tree or losing the selected session and draft.
+            splitView
+                .environment(\.horizontalSizeClass, isWide ? .regular : horizontalSizeClass)
+                .task(id: isWide) {
+                    guard isWide else { return }
+                    // Let compact adaptation finish writing its collapsed state
+                    // before restoring the wide layout. A newer resize cancels this.
+                    await Task.yield()
+                    guard !Task.isCancelled else { return }
+                    columnVisibility = .all
+                }
+        }
+        #else
+        splitView
+        #endif
+    }
+
+    private var splitView: some View {
         NavigationSplitView(columnVisibility: $columnVisibility, preferredCompactColumn: $navigation.compactColumn) {
             Group {
                 if let project = navigation.project {

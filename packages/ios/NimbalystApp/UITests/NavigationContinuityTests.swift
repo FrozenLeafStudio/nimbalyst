@@ -128,10 +128,12 @@ final class NavigationContinuityTests: XCTestCase {
             XCTAssertTrue(app.navigationBars[title].waitForExistence(timeout: 5), "Rotation must preserve the selected session")
             XCTAssertEqual(compose.value as? String, draft, "Rotation must preserve unsent input")
             if app.frame.width >= 700 {
-                let sidebarSession = app.staticTexts["Fix authentication token refresh"].firstMatch
-                XCTAssertTrue(sidebarSession.waitForExistence(timeout: 5), "Wide screens must keep the session list beside the transcript")
-                XCTAssertTrue(sidebarSession.isHittable)
-                XCTAssertLessThan(sidebarSession.frame.maxX, compose.frame.minX)
+                // The landscape keyboard can cover every session row. The tab
+                // remains visible and proves the sidebar is beside the detail.
+                let sidebarTab = app.buttons["Sessions"].firstMatch
+                XCTAssertTrue(sidebarTab.waitForExistence(timeout: 5), "Wide screens must keep the session sidebar beside the transcript. \(app.debugDescription)")
+                XCTAssertTrue(sidebarTab.isHittable)
+                XCTAssertLessThan(sidebarTab.frame.maxX, compose.frame.minX)
             }
         }
 

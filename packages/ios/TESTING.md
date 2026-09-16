@@ -68,15 +68,16 @@ The test opens Files, sees cached rows after an interrupted download, taps Retry
 
 ## Navigation Continuity
 
-`NimbalystNavigationUITests` exercises the production `MainNavigationView` with an in-memory demo account. It opens a project and session, types an unsent draft, rotates through portrait and both landscape orientations, and verifies the selected session, draft, Back navigation, and that wide screens keep the session list visible beside the transcript. Run it on an iPhone Pro Max (whose horizontal size class changes in landscape) and an iPad:
+`NimbalystNavigationUITests` exercises the production `MainNavigationView` with an in-memory demo account. It opens a project and session, types an unsent draft, rotates through portrait and both landscape orientations, and verifies the selected session, draft, Back navigation, and that wide screens keep the session list visible beside the transcript. The split view uses both columns with at least 700 points of available width, including iPhones whose native horizontal size class stays compact in landscape. Run the rotation test on a regular iPhone Pro, a Pro Max, and an iPad:
 
 ```bash
 cd packages/ios/NimbalystApp
 xcodegen generate
 xcodebuild -project NimbalystApp.xcodeproj -scheme NimbalystApp \
+  -destination 'platform=iOS Simulator,name=iPhone 18 Pro' \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' \
   -destination 'platform=iOS Simulator,name=iPad Pro 11-inch (M5)' \
-  -only-testing:NimbalystNavigationUITests \
+  -only-testing:NimbalystNavigationUITests/NavigationContinuityTests/testSessionDraftAndBackHistorySurviveRotation \
   -parallel-testing-enabled NO -collect-test-diagnostics never test
 ```
 
