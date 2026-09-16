@@ -8,6 +8,26 @@ import Foundation
 /// builder again after a reconnect and publish what the row says *now* rather
 /// than replaying bytes the user has since edited.
 enum SessionIndexUpdates {
+    static func prompt(session: Session, prompt: EncryptedQueuedPrompt, messageCount: Int, crypto: CryptoManager) throws -> String {
+        try encode(IndexUpdateEntry(
+            sessionId: session.id,
+            encryptedProjectId: crypto.encryptProjectId(session.projectId),
+            projectIdIv: CryptoManager.projectIdIvBase64,
+            encryptedTitle: session.titleEncrypted,
+            titleIv: session.titleIv,
+            provider: session.provider ?? "claude-code",
+            model: session.model,
+            mode: session.mode,
+            messageCount: messageCount,
+            lastMessageAt: prompt.timestamp,
+            createdAt: session.createdAt,
+            updatedAt: prompt.timestamp,
+            isExecuting: nil,
+            queuedPromptCount: 1,
+            encryptedQueuedPrompts: [prompt]
+        ))
+    }
+
     /// Publishes the draft the composer holds. An empty `draft` is sent
     /// explicitly rather than omitted, because omitting it means "unchanged"
     /// and the remote cache would keep showing the cleared text.
@@ -86,7 +106,9 @@ enum SessionIndexUpdates {
             lastMessageAt: session.lastMessageAt ?? session.updatedAt,
             createdAt: session.createdAt,
             updatedAt: updatedAt ?? session.updatedAt,
-            isExecuting: session.isExecuting,
+            // Execution belongs to the desktop; the phone's cached value may
+            // predate the turn that just started while this edit was sending.
+            isExecuting: nil,
             queuedPromptCount: nil,
             encryptedQueuedPrompts: nil
         )

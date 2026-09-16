@@ -813,6 +813,17 @@ public final class SyncManager: ObservableObject {
         await voiceTools.call(toolName: toolName, argsJson: argsJson, projectId: projectId)
     }
 
+    func callLiveVoiceTool(toolName: String, argsJson: String, scope: VoiceRelayScope) async -> VoiceToolCallResult {
+        guard connectedDevices.contains(where: { $0.deviceId == scope.hostDeviceId && ($0.type == "desktop" || $0.type == "headless") }) else {
+            return .init(success: false, result: nil, error: "The selected computer is unavailable.")
+        }
+        guard let data = try? JSONEncoder().encode(VoiceRelayRequest(scope: scope, tool: toolName, arguments: argsJson)),
+              let json = String(data: data, encoding: .utf8) else {
+            return .init(success: false, result: nil, error: "Could not encode voice request.")
+        }
+        return await voiceTools.call(toolName: "nimbalyst_live_v1", argsJson: json, projectId: scope.projectId, scope: scope)
+    }
+
     private func handleVoiceToolResponse(_ data: Data) {
         guard let requestId = voiceTools.receive(data) else { return }
         requests.resolve(requestId: requestId)
@@ -1284,7 +1295,8 @@ public final class SyncManager: ObservableObject {
 
     /// Send a prompt to the current session via the queued prompts system.
     /// Desktop picks up prompts from index_update broadcasts (not session room messages).
-    public func sendPrompt(sessionId: String, text: String, attachments: [PendingAttachment] = []) async throws {
+    @discardableResult
+    public func sendPrompt(sessionId: String, text: String, attachments: [PendingAttachment] = [], promptId: String = UUID().uuidString) async throws -> String {
         logger.info("[SendPrompt] Starting: sessionId=\(sessionId), textLength=\(text.count), attachments=\(attachments.count), wsConnected=\(self.indexClient.isConnected), roomOrgId=\(self.orgId ?? "nil")")
         guard indexClient.isConnected else {
             logger.error("[SendPrompt] WebSocket not connected - cannot send prompt")
@@ -1296,8 +1308,6 @@ public final class SyncManager: ObservableObject {
         }
 
         let now = Int(Date().timeIntervalSince1970 * 1000)
-        let promptId = UUID().uuidString
-
         // Encrypt the prompt text
         let encryptedPrompt = try crypto.encrypt(plaintext: text)
 
@@ -1331,33 +1341,12 @@ public final class SyncManager: ObservableObject {
         )
         queuedPrompt.encryptedAttachments = encryptedAttachments
 
-        // Build the encrypted project ID for the index entry
-        let encryptedProjectId = try crypto.encryptProjectId(session.projectId)
-
         // Send index_update with queued prompt via the index room
-        let indexEntry = IndexUpdateEntry(
-            sessionId: sessionId,
-            encryptedProjectId: encryptedProjectId,
-            projectIdIv: CryptoManager.projectIdIvBase64,
-            encryptedTitle: session.titleEncrypted,
-            titleIv: session.titleIv,
-            provider: session.provider ?? "claude-code",
-            model: session.model,
-            mode: session.mode,
+        let json = try SessionIndexUpdates.prompt(
+            session: session, prompt: queuedPrompt,
             messageCount: (try? database.messages(forSession: sessionId).count) ?? 0,
-            lastMessageAt: now,
-            createdAt: session.createdAt,
-            updatedAt: now,
-            isExecuting: session.isExecuting,
-            queuedPromptCount: 1,
-            encryptedQueuedPrompts: [queuedPrompt]
+            crypto: crypto
         )
-
-        let indexMessage = IndexUpdateMessage(session: indexEntry)
-        let data = try JSONEncoder().encode(indexMessage)
-        guard let json = String(data: data, encoding: .utf8) else {
-            throw PromptSendError.encodingFailed
-        }
 
         // Send via WebSocket with completion handler to detect failures
         let sendResult = await withCheckedContinuation { continuation in
@@ -1383,6 +1372,7 @@ public final class SyncManager: ObservableObject {
             createdAt: now
         )
         try database.appendMessage(localMessage)
+        return promptId
     }
 
     // MARK: - Interactive Prompt Responses
