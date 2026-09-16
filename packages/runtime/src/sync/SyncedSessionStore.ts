@@ -138,6 +138,7 @@ export function createSyncedSessionStore(
 
   return {
     findByProviderSessionId: baseStore.findByProviderSessionId?.bind(baseStore),
+    getMany: baseStore.getMany?.bind(baseStore),
 
     async ensureReady(): Promise<void> {
       return baseStore.ensureReady();
