@@ -67,6 +67,7 @@ struct VoiceOverlay: View {
 
             // Pause/Resume + Cancel controls, shown while voice mode is active
             if showAuxControls {
+                VoiceAudioStatus(routes: voiceAgent.audioRoutes)
                 auxControls
                     .padding(.bottom, 14)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -91,16 +92,29 @@ struct VoiceOverlay: View {
     }
 
     private var auxControls: some View {
-        HStack(spacing: 12) {
-            pauseControl
-            auxButton(
-                title: "Cancel",
-                systemImage: "xmark",
-                tint: NimbalystColors.error
-            ) {
-                impact(.rigid)
-                voiceAgent.deactivate()
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                pauseControl
+                audioControl
+                cancelControl
             }
+            VStack(spacing: 10) {
+                HStack(spacing: 12) { pauseControl; cancelControl }
+                audioControl
+            }
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private var audioControl: some View {
+        VoiceAudioControl(routes: voiceAgent.audioRoutes)
+            .disabled(voiceAgent.state == .connecting)
+    }
+
+    private var cancelControl: some View {
+        auxButton(title: "Cancel", systemImage: "xmark", tint: NimbalystColors.error) {
+            impact(.rigid)
+            voiceAgent.deactivate()
         }
     }
 

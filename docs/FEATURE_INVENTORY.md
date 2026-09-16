@@ -257,6 +257,7 @@ Twelve built-in provider lanes, plus any agent an extension contributes. Every l
 - Create and follow Meta Agent sessions with children grouped under their parent when the desktop-synced Meta Agent alpha feature is enabled
 - Multiple signed-in accounts with an active account for personal sync
 - Mobile voice mode (soft chime + haptic cue when the session connects and it's your turn to talk)
+- Mobile voice audio selection: view the active microphone and speaker, choose supported routes through native pickers (iOS 26 microphone picker with an older-iOS fallback), and switch to the phone speaker. Headphone disconnection pauses voice until explicit Resume.
 - Mobile voice: asking the voice agent to start a new session opens it automatically on the device that asked
 - Mobile voice: the floating mic shows a tool-call indicator (animated ring + tool-icon badge) while the agent runs a tool
 - Mobile voice can manage sessions and surface their pending prompts; start from a session list and pause or stop through the floating mic. GPT Live uses existing UI cards for question, permission, and commit answers.

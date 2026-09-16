@@ -46,7 +46,7 @@ extension VoiceAgent {
     private struct ClaimEnvelope: Decodable { let event: VoiceSourceEvent; let token: String; let ttlMs: Int }
 
     func pollVoiceEvents() async {
-        guard UIApplication.shared.applicationState == .active else { return }
+        guard !audioRoutes.blocksAudio, UIApplication.shared.applicationState == .active else { return }
         if let announcement = announcement {
             let requestedAt = Date()
             let outcome = await eventRequest(tool: "voice_event_claim", sessionId: announcement.event.sessionId, arguments: eventArguments(announcement.event))
@@ -71,7 +71,7 @@ extension VoiceAgent {
     }
 
     func presentNextVoiceEvent() async {
-        guard announcement == nil, !claimingAnnouncement, let event = eventQueue.events.first,
+        guard !audioRoutes.blocksAudio, announcement == nil, !claimingAnnouncement, let event = eventQueue.events.first,
               state == .idle || state == .listening, UIApplication.shared.applicationState == .active else { return }
         guard event.hostDeviceId == selectedHostDeviceId, event.projectId == resolveProjectId() else { eventQueue.discard(event.id); return }
         claimingAnnouncement = true
@@ -79,7 +79,7 @@ extension VoiceAgent {
         let owner = usageConversation
         let requestedAt = Date()
         let outcome = await eventRequest(tool: "voice_event_claim", sessionId: event.sessionId, arguments: eventArguments(event))
-        guard owner == usageConversation, state != .disconnected, event.hostDeviceId == selectedHostDeviceId, event.projectId == resolveProjectId() else { return }
+        guard !audioRoutes.blocksAudio, owner == usageConversation, state != .disconnected, event.hostDeviceId == selectedHostDeviceId, event.projectId == resolveProjectId() else { return }
         guard outcome.success, let text = outcome.result, let data = text.data(using: .utf8),
               let claimed = try? JSONDecoder().decode(ClaimEnvelope.self, from: data), claimed.event == event else {
             // Reconstruct pending questions on the next poll. The authority decides if
@@ -94,7 +94,7 @@ extension VoiceAgent {
     }
 
     func deliverClaimedVoiceEvent() {
-        guard var announcement, !announcement.sent, announcement.deadline > Date(), state == .listening,
+        guard !audioRoutes.blocksAudio, var announcement, !announcement.sent, announcement.deadline > Date(), state == .listening,
               UIApplication.shared.applicationState == .active else { return }
         announcement.sent = true
         self.announcement = announcement
