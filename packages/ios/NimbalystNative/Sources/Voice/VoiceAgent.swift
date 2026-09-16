@@ -233,7 +233,7 @@ public final class VoiceAgent: ObservableObject {
         let epoch = connectionGeneration.replace()
         let usageOwner = usageConversation
 
-        Task {
+        Task { [self] in
             // Request microphone permission
             let granted = await audioPipeline.requestMicrophonePermission()
             guard connectionGeneration.accepts(epoch), state == .connecting else { return }
@@ -590,7 +590,7 @@ public final class VoiceAgent: ObservableObject {
             self.state = .processing
         }
 
-        client.onFunctionCall = { [weak self] name, arguments, callId in
+        client.onFunctionCall = { [weak self, weak client] name, arguments, callId in
             guard let self, self.connectionGeneration.accepts(epoch) else { return }
             // Light up the floating-mic tool indicator for the duration of the call.
             let dispatchId = self.toolResults.register { [weak self, weak client] output in

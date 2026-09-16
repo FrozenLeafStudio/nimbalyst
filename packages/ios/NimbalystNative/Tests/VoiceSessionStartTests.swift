@@ -2,6 +2,22 @@ import XCTest
 @testable import NimbalystNative
 
 final class VoiceSessionStartTests: XCTestCase {
+    #if os(iOS)
+    @MainActor
+    func testClientCallbacksDoNotRetainDisconnectedClient() {
+        let agent = VoiceAgent()
+        var client: RealtimeClient? = RealtimeClient(apiKey: "test-unused")
+        let releasedClient = { [weak client] in client }
+
+        agent.setupClientCallbacks(client!, epoch: agent.connectionGeneration.value)
+        client = nil
+
+        withExtendedLifetime(agent) {
+            XCTAssertNil(releasedClient())
+        }
+    }
+    #endif
+
     func testProjectStartClearsStaleSessionFocus() {
         let focusedSessionId = VoiceSessionFocusReducer.reduce(
             current: "stale-session",

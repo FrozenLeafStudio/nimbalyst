@@ -191,7 +191,7 @@ extension VoiceAgent {
         // Falls back to the local recency list when there's no query, no desktop
         // connection, or the desktop doesn't respond (so it still works offline).
         if let query, !query.isEmpty,
-           let syncManager, let projectId = resolveProjectId() {
+           syncManager != nil, let projectId = resolveProjectId() {
             let argsJson = Self.encodeArgs(["query": query])
             Task { @MainActor in
                 let outcome = await self.callDesktopTool(
@@ -304,7 +304,7 @@ extension VoiceAgent {
         // GRDB rows can't represent those, so a local-only summary would hide the
         // very thing the user started the voice agent to handle. Fall back to the
         // local DB summary when the desktop is unreachable (offline-capable).
-        if let syncManager, let projectId = resolveProjectId() {
+        if syncManager != nil, let projectId = resolveProjectId() {
             let argsJson = Self.encodeArgs(["session_id": sessionId])
             Task { @MainActor in
                 let outcome = await self.callDesktopTool(
@@ -407,7 +407,7 @@ extension VoiceAgent {
             )
             return
         }
-        guard let syncManager, let projectId = resolveProjectId() else {
+        guard syncManager != nil, let projectId = resolveProjectId() else {
             sendToolResult(
                 callId: callId,
                 output: "{\"success\":false,\"error\":\"The desktop must be connected to answer a question\"}"
@@ -481,7 +481,7 @@ extension VoiceAgent {
     /// channel and return its result to the realtime agent. The raw arguments
     /// JSON is forwarded verbatim so the desktop tool sees the exact schema.
     func handleMemoryTool(name: String, argumentsJson: String, callId: String) {
-        guard let syncManager, let projectId else {
+        guard syncManager != nil, let projectId else {
             sendToolResult(
                 callId: callId,
                 output: "{\"success\":false,\"error\":\"Project memory is unavailable right now.\"}"
