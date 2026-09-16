@@ -68,6 +68,7 @@ final class AudioPipeline: @unchecked Sendable {
 
     /// Set by markEndOfPlayback(), signals no more audio chunks coming
     private var endOfPlaybackMarked = false
+    private var drainCheckScheduled = false
 
     // MARK: - Callbacks
 
@@ -420,7 +421,10 @@ final class AudioPipeline: @unchecked Sendable {
             endOfPlaybackMarked = false
             onPlaybackFinished?()
         } else {
+            guard !drainCheckScheduled else { return }
+            drainCheckScheduled = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.drainCheckScheduled = false
                 self?.checkPlaybackDrained()
             }
         }

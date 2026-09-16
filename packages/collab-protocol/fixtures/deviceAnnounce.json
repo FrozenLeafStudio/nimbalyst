@@ -11,6 +11,7 @@
     "isFocused": true,
     "status": "active",
     "isOnline": true,
-    "lastSeenAt": 1789232413000
+    "lastSeenAt": 1789232413000,
+    "inventoryHidden": false
   }
 }

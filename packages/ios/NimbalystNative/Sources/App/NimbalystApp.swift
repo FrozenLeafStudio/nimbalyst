@@ -342,7 +342,7 @@ public struct MainNavigationView: View {
         }
         #if os(iOS)
         .overlay(alignment: .bottom) {
-            if let voice = appState.voiceAgent, voice.state != .disconnected {
+            if let voice = appState.voiceAgent, (voice.state != .disconnected || voice.connectionError != nil) {
                 VoiceOverlay(voiceAgent: voice)
                     .padding(.bottom, 8)
             }
@@ -355,6 +355,16 @@ public struct MainNavigationView: View {
         }
         #if os(iOS)
         // Newly created sessions use the same route as notification taps.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            appState.voiceAgent?.suspendLiveForBackground()
+        }
+        .onChange(of: navigation.hostDeviceId) { _, host in
+            appState.voiceAgent?.selectHost(host)
+        }
+        .onChange(of: appState.voiceAgent.map(ObjectIdentifier.init)) { _, _ in
+            bindVoiceNavigation()
+        }
+        .onAppear { bindVoiceNavigation() }
         .onChange(of: appState.voiceNavigationRequest) { _, newValue in
             guard let sessionId = newValue else { return }
             navigateToSession(sessionId)
@@ -462,6 +472,18 @@ public struct MainNavigationView: View {
     #endif
 
     /// Preserve notification/voice intent even when the session has not synced yet.
+    #if os(iOS)
+    private func bindVoiceNavigation() {
+        appState.voiceAgent?.selectHost(navigation.hostDeviceId)
+        appState.voiceAgent?.onOpenSession = { navigateToSession($0) }
+        appState.voiceAgent?.onOpenDocument = { projectId, documentId in
+            guard let project = try? appState.databaseManager?.allProjects().first(where: { $0.id == projectId }) else { return }
+            if navigation.project?.id != projectId { navigation.chooseProject(project) }
+            navigation.select(.document(documentId))
+        }
+    }
+    #endif
+
     private func navigateToSession(_ sessionId: String) {
         navigation.openSession(sessionId, database: appState.databaseManager)
     }

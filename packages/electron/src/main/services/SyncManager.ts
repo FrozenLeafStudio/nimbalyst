@@ -1,3 +1,4 @@
+import { directoryDeviceId } from './sync/directoryDeviceIdentity';
 import { isRetainedSession } from '@nimbalyst/collab-protocol';
 import { remoteSessions } from './ai/remoteSessions';
 import Store from '../utils/privateSettingsStore';
@@ -173,9 +174,6 @@ function updateSyncStatus(update: Partial<{ connected: boolean; syncing: boolean
   }
 }
 
-// Cache the device ID so it's stable across sync reinitializations
-let cachedDeviceId: string | null = null;
-
 // ============================================================================
 // Desktop Presence Tracking
 // ============================================================================
@@ -274,28 +272,6 @@ export function deriveDeviceStatus(): 'active' | 'idle' | 'away' {
 }
 
 /**
- * Get or generate a stable device ID.
- * Uses the user ID + a hash of machine identifiers for stability.
- */
-function getDeviceId(personalMemberId: PersonalMemberId): string {
-  if (cachedDeviceId) {
-    return cachedDeviceId;
-  }
-
-  // Use hostname + platform as a simple machine identifier
-  // This isn't perfect but gives reasonable stability
-  const machineId = `${os.hostname()}-${process.platform}`;
-  const crypto = require('crypto');
-  const hash = crypto.createHash('sha256')
-    .update(`${personalMemberId}:${machineId}`)
-    .digest('hex')
-    .substring(0, 16);
-
-  cachedDeviceId = hash;
-  return hash;
-}
-
-/**
  * Get device info for sync presence awareness.
  * Returns current presence state (focus, activity, status).
  */
@@ -314,7 +290,7 @@ function getDeviceInfo(personalMemberId: PersonalMemberId): DeviceInfo {
     .replace(/\b\w/g, c => c.toUpperCase());
 
   return {
-    deviceId: getDeviceId(personalMemberId),
+    deviceId: directoryDeviceId(app.getPath('userData'), personalMemberId),
     name: friendlyName || 'Desktop',
     type: 'desktop',
     platform,
@@ -1235,10 +1211,10 @@ export async function triggerIncrementalSync(): Promise<void> {
 /**
  * Get voice mode settings from the settings store.
  */
-async function getVoiceModeSettings(): Promise<{ voice?: string; submitDelayMs?: number } | undefined> {
+async function getVoiceModeSettings(): Promise<{ voice?: string; submitDelayMs?: number; engine?: string; liveVoice?: string; liveControllerModel?: string } | undefined> {
   try {
     const settingsStore = new Store<Record<string, unknown>>({ name: 'nimbalyst-settings' });
-    const voiceMode = settingsStore.get('voiceMode') as { voice?: string; submitDelayMs?: number } | undefined;
+    const voiceMode = settingsStore.get('voiceMode') as { voice?: string; submitDelayMs?: number; engine?: string; liveVoice?: string; liveControllerModel?: string } | undefined;
     return voiceMode;
   } catch {
     return undefined;
@@ -1336,6 +1312,9 @@ export async function syncSettingsToMobile(_legacyOpenaiApiKey?: string): Promis
       voiceMode: voiceModeSettings ? {
         voice: voiceModeSettings.voice as 'alloy' | 'ash' | 'ballad' | 'coral' | 'echo' | 'sage' | 'shimmer' | 'verse' | 'marin' | 'cedar' | undefined,
         submitDelayMs: voiceModeSettings.submitDelayMs,
+        engine: voiceModeSettings.engine,
+        liveVoice: voiceModeSettings.liveVoice ?? voiceModeSettings.voice,
+        liveControllerModel: voiceModeSettings.liveControllerModel,
       } : undefined,
       availableModels,
       defaultModel,

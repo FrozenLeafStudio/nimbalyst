@@ -22,6 +22,38 @@ struct VoiceOverlay: View {
         VStack(spacing: 0) {
             Spacer()
 
+            if let sessionId = voiceAgent.announcedSessionId {
+                HStack {
+                    Button("Open source session") { voiceAgent.onOpenSession?(sessionId) }
+                    Button("Dismiss announcement") { voiceAgent.acknowledgeVoiceEvent() }
+                }.font(.caption).padding(8)
+            }
+            if let status = voiceAgent.announcementStatus {
+                Text(status).font(.caption).foregroundStyle(.secondary).padding(8)
+            }
+            if let status = voiceAgent.submissionStatus {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+            if let error = voiceAgent.connectionError {
+                Text(error).font(.caption).foregroundStyle(NimbalystColors.error).padding(8)
+            }
+            if voiceAgent.effectiveEngine == .live {
+                Text(voiceAgent.isClosing ? "GPT-Live · Closing" : voiceAgent.isRestoring ? "GPT-Live · Restoring" : "GPT-Live")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let ratio = voiceAgent.liveUsage.contextUsageRatio {
+                    Text("Context \(Int(ratio * 100))%")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if voiceAgent.liveUsage.backendInputTokens + voiceAgent.liveUsage.backendOutputTokens > 0 {
+                    Text("Controller \(voiceAgent.liveUsage.backendInputTokens) in · \(voiceAgent.liveUsage.backendOutputTokens) out tokens")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if let seconds = voiceAgent.liveUsage.seconds {
+                    Text("\(Int(seconds))s\(voiceAgent.liveUsage.finalizationMissing ? " · final usage unavailable" : "")")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+
             // Pending prompt card sits above everything
             if let pending = voiceAgent.pendingPrompt {
                 PendingPromptCard(

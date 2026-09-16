@@ -230,7 +230,7 @@ Twelve built-in provider lanes, plus any agent an extension contributes. Every l
 - Project-knowledge grounding (Nimbalyst Memory extension) — local hybrid search over your design docs, plans, CLAUDE.md, and notes, available to the voice and coding agents
 - Hands-free brainstorm loop — talk an idea through, kick off a plan (`/design`), have the agent read the written plan back to refine it by voice, then `/implement`; ask "is it done yet?" anytime for live task status
 - Voice agent tool calls (memory lookups, coding-agent questions, and more) are recorded in the voice session transcript and render as tool widgets, including a dedicated memory-recall widget showing the query and the returned source documents (title + snippet)
-- Available on both desktop and iOS
+- Available on desktop and iOS; native iOS defaults to Realtime and offers GPT Live as an opt-in preview
 
 ## Mobile (iOS)
 
@@ -239,7 +239,7 @@ Twelve built-in provider lanes, plus any agent an extension contributes. Every l
 - Session transcript viewing (WebView)
 - Rich mobile transcript cards for structured prompts, memory results, and live tracker links; zoomable/copyable images and tappable file links
 - Personal document/file sync and bidirectional draft sync with the desktop
-- Compose bar with slash command typeahead
+- Compose bar with slash command typeahead; delivery warnings track desktop activity and clear when execution or fresh output arrives, while mobile edits preserve desktop-owned running status
 - Project Actions in the composer menu -- prefill a saved desktop action prompt or launch it in a new session
 - Adaptive iPhone/iPad layout with a session sidebar on wide screens; session and draft preserved through rotation
 - Image attachments (camera, photo library, clipboard)
@@ -259,7 +259,9 @@ Twelve built-in provider lanes, plus any agent an extension contributes. Every l
 - Mobile voice mode (soft chime + haptic cue when the session connects and it's your turn to talk)
 - Mobile voice: asking the voice agent to start a new session opens it automatically on the device that asked
 - Mobile voice: the floating mic shows a tool-call indicator (animated ring + tool-icon badge) while the agent runs a tool
-- Mobile voice can manage sessions and surface or answer their pending prompts; start from a session list and pause or stop through the floating mic
+- Mobile voice can manage sessions and surface their pending prompts; start from a session list and pause or stop through the floating mic. GPT Live uses existing UI cards for question, permission, and commit answers.
+- Opt-in GPT Live voice can open existing synced project files and carry the file reference into a coding request; idle closes the paid connection and foreground resume restores bounded conversation context
+- GPT Live can announce source-desktop questions and completions with cross-device presentation ownership; the source workspace must be open in the desktop app, and announcements are explicitly dismissed on the phone
 - Session fleet Live Activity — Lock Screen card and Dynamic Island mirroring the macOS menu bar strip, with the sessions waiting on you ranked by wait time; tap a row to open that session. Server-started, so it appears without opening the app; dims when the Mac stops reporting, ends when the fleet goes quiet. Toggled in Settings
 
 ## Mobile (Android)
@@ -300,6 +302,7 @@ Companion app; pairs with a desktop over encrypted sync. Voice mode is not inclu
 - Pick mobile projects in bulk — the Mobile App screen lists every project as a checkbox with Select all / Deselect all, so many projects (and their document sync) change in one interaction instead of one control at a time
 - Decision-first project sharing — Project Settings → Sharing asks one question (add to an organization you already administer, or create a new one), then confirms in plain words what will happen and who gets access; a missing git remote is explained rather than silently disabling the flow. Projects are always added from the project itself, not by name from the organization window
 - Per-personal-account mobile-sync profiles — project and document selections are retained when switching the active zero-knowledge sync account, independently of team organization selection
+- Paired-computer inventory: the execution picker filters stale offline installations without project history; device settings support reversible Hide/Restore and labels when the sync server advertises inventory support, preserving historical sessions
 - Move a project to another organization — relocates its trackers, documents, history, and schemas into the destination, transfers member access by email (auto-invite for members not yet in the destination, with a per-person opt-out and seat-delta preview), and redirects the old location (server-managed orgs only)
 - Merge one organization into another — consolidates every project, unions the rosters (higher role wins), and optionally deletes the drained org
 - Shared document list

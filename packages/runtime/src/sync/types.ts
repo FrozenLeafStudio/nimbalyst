@@ -89,6 +89,8 @@ export interface SyncConfig {
 export interface DeviceInfo {
   /** Unique device ID (stable across sessions, generated per device) */
   deviceId: string;
+  /** Server-owned inventory visibility; never affects session ownership. */
+  inventoryHidden?: boolean;
   /** Human-readable device name (e.g., "MacBook Pro", "iPhone 15") */
   name: string;
   /** Device type for icon display */
@@ -980,6 +982,9 @@ export interface SessionControlMessage {
  * Voice mode settings synced from desktop.
  */
 export interface SyncedVoiceModeSettings {
+  engine?: string;
+  liveVoice?: string;
+  liveControllerModel?: string;
   /** Which voice to use (OpenAI Realtime API voices) */
   voice?: 'alloy' | 'ash' | 'ballad' | 'coral' | 'echo' | 'sage' | 'shimmer' | 'verse' | 'marin' | 'cedar';
   /** Delay before auto-submitting voice commands (ms) */
