@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Session transcripts avoid duplicate messages and preserve their order after reopening or sending document context.
 - iOS avoids false prompt delivery warnings after the desktop starts or finishes processing.
 - File-session links avoid repeated background lookups that slow down active editing.
 - In-app HTML previews render UTF-8 text correctly even when the document omits a charset declaration.
