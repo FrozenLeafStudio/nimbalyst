@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 <!-- New features go here -->
+- Tab between the AI model, effort, and Actions menus after opening the model picker with Cmd/Ctrl+Shift+M.
 - Optionally follow external Claude Code and Codex CLI sessions live, including their names, from Agent Features settings.
 
 ### Changed

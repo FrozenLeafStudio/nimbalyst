@@ -9,6 +9,8 @@ import {
 } from '../../store/atoms/actionPrompts';
 
 interface ActionPromptsDropdownProps {
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   workspacePath: string;
   /**
    * Called with the action body when the user picks an action whose config is
@@ -31,7 +33,7 @@ function firstLinePreview(body: string, maxLen = 80): string {
   return trimmed.slice(0, maxLen - 1) + '…';
 }
 
-export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSession }: ActionPromptsDropdownProps) {
+export function ActionPromptsDropdown({ open, onOpenChange, workspacePath, onInsert, onLaunchNewSession }: ActionPromptsDropdownProps) {
   const state = useAtomValue(actionPromptsAtomFamily(workspacePath));
   const setState = useSetAtom(actionPromptsAtomFamily(workspacePath));
   const posthog = usePostHog();
@@ -40,6 +42,8 @@ export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSess
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const menu = useFloatingMenu({
+    open,
+    onOpenChange,
     placement: 'top-end',
     offsetPx: 6,
     constrainHeight: false,
@@ -175,6 +179,11 @@ export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSess
     }
   }, [highlightedIndex, menu.isOpen]);
 
+  const setMenuRef = useCallback((node: HTMLDivElement | null) => {
+    menu.refs.setFloating(node);
+    node?.focus();
+  }, [menu.refs.setFloating]);
+
   const buttonLabel = useMemo(() => 'Actions', []);
 
   return (
@@ -200,7 +209,7 @@ export function ActionPromptsDropdown({ workspacePath, onInsert, onLaunchNewSess
       {menu.isOpen && (
         <FloatingPortal>
           <div
-            ref={menu.refs.setFloating as React.RefCallback<HTMLDivElement>}
+            ref={setMenuRef}
             style={menu.floatingStyles}
             {...menu.getFloatingProps()}
             onKeyDown={handleKeyDown}
