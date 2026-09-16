@@ -25,6 +25,26 @@ final class NavigationContinuityTests: XCTestCase {
             waitForExpectations(timeout: 20)
             XCTAssertTrue(app.descendants(matching: .any)["session-compose-input"].firstMatch.isHittable)
             app.navigationBars.buttons.element(boundBy: 0).tap()
+
+            // Row navigation must keep the same observers alive as creation.
+            // In a collapsed split view, NavigationLink also updates its stack.
+            app.staticTexts["Created session \(number)"].firstMatch.tap()
+            XCTAssertTrue(app.navigationBars["Created session \(number)"].waitForExistence(timeout: 10))
+            expectation(for: loaded, evaluatedWith: app)
+            waitForExpectations(timeout: 20)
+            XCTAssertTrue(app.descendants(matching: .any)["session-compose-input"].firstMatch.isHittable)
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+
+            if number == 3 {
+                // The fixture's final session is a meta-agent with a child.
+                let child = app.staticTexts["Child session"].firstMatch
+                XCTAssertTrue(child.waitForExistence(timeout: 5))
+                child.tap()
+                XCTAssertTrue(app.navigationBars["Child session"].waitForExistence(timeout: 10))
+                expectation(for: loaded, evaluatedWith: app)
+                waitForExpectations(timeout: 20)
+                app.navigationBars.buttons.element(boundBy: 0).tap()
+            }
         }
     }
 
@@ -43,10 +63,15 @@ final class NavigationContinuityTests: XCTestCase {
         XCTAssertTrue(filesTab.waitForExistence(timeout: 10))
         filesTab.tap()
         XCTAssertFalse(app.staticTexts["No Documents"].exists)
-        XCTAssertTrue(app.buttons["Retry"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["Document 0000.md"].exists)
-        app.buttons["Retry"].tap()
         let completed = app.staticTexts["2,293 files"]
+        // Transport recovery may finish before XCTest observes the Retry button.
+        let retry = app.buttons["Retry"]
+        expectation(for: NSPredicate { _, _ in retry.exists || completed.exists }, evaluatedWith: app)
+        waitForExpectations(timeout: 15)
+        if retry.exists {
+            XCTAssertTrue(app.staticTexts["Document 0000.md"].exists)
+            retry.tap()
+        }
         XCTAssertTrue(completed.waitForExistence(timeout: 15))
         app.staticTexts["Document 0000.md"].tap()
         XCTAssertTrue(app.webViews.firstMatch.waitForExistence(timeout: 10))

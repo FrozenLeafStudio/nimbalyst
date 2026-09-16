@@ -15,6 +15,7 @@ extension VoiceAgent {
         client.onSessionReady = { [weak self] in
             guard let self, self.connectionGeneration.accepts(epoch) else { return }
             self.audioSessionReady = true
+            self.voiceClient?.updateContext(self.screenContextJSON())
             guard !self.audioRoutes.blocksAudio, self.state != .idle else { return }
             self.logger.info("Session configured, starting capture")
             do {
@@ -48,6 +49,7 @@ extension VoiceAgent {
 
         client.onAudioDelta = { [weak self] base64Audio in
             guard let self, self.connectionGeneration.accepts(epoch), !self.audioRoutes.blocksAudio, self.state != .idle, self.state != .disconnected else { return }
+            guard !self.readingPrompt else { return }
             if self.state != .speaking {
                 self.state = .speaking
                 self.cancelIdleTimer()
@@ -72,12 +74,14 @@ extension VoiceAgent {
 
         audioPipeline.onAudioCaptured = { [weak self] base64Audio in
             guard let self, self.connectionGeneration.accepts(epoch), self.state != .idle, self.state != .disconnected, !self.audioRoutes.blocksAudio else { return }
+            guard !self.readingPrompt else { return }
             self.voiceClient?.sendAudio(base64Audio)
         }
 
         audioPipeline.onPlaybackFinished = { [weak self] in
             guard let self, self.connectionGeneration.accepts(epoch), !self.audioRoutes.blocksAudio, self.state != .idle, self.state != .disconnected else { return }
             guard self.state != .idle, self.state != .disconnected else { return }
+            guard !self.readingPrompt else { return }
             self.bargeInPolicy.notePlaybackStopped()
             self.voiceClient?.playbackChanged(active: false)
             self.state = .listening

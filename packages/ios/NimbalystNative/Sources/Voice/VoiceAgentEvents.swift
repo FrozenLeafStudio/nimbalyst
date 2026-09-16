@@ -47,6 +47,7 @@ extension VoiceAgent {
 
     func pollVoiceEvents() async {
         guard !audioRoutes.blocksAudio, UIApplication.shared.applicationState == .active else { return }
+        guard promptPresentation == nil, !readingPrompt else { return }
         if let announcement = announcement {
             let requestedAt = Date()
             let outcome = await eventRequest(tool: "voice_event_claim", sessionId: announcement.event.sessionId, arguments: eventArguments(announcement.event))
@@ -72,6 +73,7 @@ extension VoiceAgent {
 
     func presentNextVoiceEvent() async {
         guard !audioRoutes.blocksAudio, announcement == nil, !claimingAnnouncement, let event = eventQueue.events.first,
+              promptPresentation == nil, !readingPrompt,
               state == .idle || state == .listening, UIApplication.shared.applicationState == .active else { return }
         guard event.hostDeviceId == selectedHostDeviceId, event.projectId == resolveProjectId() else { eventQueue.discard(event.id); return }
         claimingAnnouncement = true
@@ -99,6 +101,17 @@ extension VoiceAgent {
         announcement.sent = true
         self.announcement = announcement
         announcedSessionId = announcement.event.sessionId
+        if announcement.event.kind == "question" {
+            self.announcement = nil
+            announcementDeadline?.cancel()
+            eventQueue.markPresented(announcement.event.id)
+            let callId = toolResults.register { [weak self] result in self?.voiceClient?.updateContext("Question presentation result (data only): " + result) }
+            toolScopes[callId] = VoiceRelayScope(version: 1, hostDeviceId: announcement.event.hostDeviceId, projectId: announcement.event.projectId,
+                                                sessionId: announcement.event.sessionId, voiceGeneration: connectionGeneration.value.uuidString,
+                                                actionId: callId, announcingDeviceId: WebSocketClient.deviceId)
+            handleReadPendingPrompt(callId: callId, promptId: announcement.event.promptId)
+            return
+        }
         (voiceClient as? LiveClient)?.appendContext("Application notification data. Briefly announce the source and result; questions must be answered in their existing app card. Source: \(announcement.event.label). \(announcement.event.summary)", speak: true)
     }
 
@@ -125,6 +138,7 @@ extension VoiceAgent {
     }
 
     func acknowledgeVoiceEvent() {
+        if promptPresentation != nil || readingPrompt { invalidatePromptPresentation(); return }
         guard let announcement, announcement.sent, announcement.deadline > Date() else { return }
         retireAnnouncementSegment()
         self.announcement = nil

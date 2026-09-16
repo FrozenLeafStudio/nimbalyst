@@ -1,3 +1,4 @@
+import { reservePromptAnswer } from './PromptAnswerReservation';
 import { warnIfUnpublished } from '@nimbalyst/runtime/sync/pushOutcome';
 import { sessionInbox } from './sessionInboxService';
 import { resolveProviderApiKey } from './resolveProviderApiKey';
@@ -542,6 +543,11 @@ export class AIService {
     const session = await AISessionsRepository.get(sessionId);
     if (!session) {
       return { success: false, error: 'Session not found' };
+    }
+
+    if (promptType === 'permission_request' || promptType === 'ask_user_question_request') {
+      const answer = promptType === 'permission_request' ? response : { answers: response.answers ?? response, cancelled: response.cancelled === true };
+      if (!reservePromptAnswer(sessionId, promptType === 'permission_request' ? 'permission' : 'question', promptId, answer)) return { success: false, error: 'This prompt was already answered or delivery is unknown.' };
     }
 
     let responseContent: Record<string, unknown>;

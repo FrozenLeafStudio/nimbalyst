@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 <!-- New features go here -->
-- Try GPT Live voice on iOS with session controls, microphone and speaker selection, synced-file navigation, and desktop announcements.
+- Try GPT Live voice on iOS with on-screen session context, spoken answers to presented questions and approvals, audio selection, synced-file navigation, and desktop announcements.
 - Keep the computer picker focused and hide, restore, or rename paired computers with a compatible sync server.
 - Tab between the AI model, effort, and Actions menus after opening the model picker with Cmd/Ctrl+Shift+M.
 - Optionally follow external Claude Code and Codex CLI sessions live, including their names, from Agent Features settings.
@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 <!-- Bug fixes go here -->
 - The session sidebar stays visible when rotating iPhone to landscape.
-- Newly created iOS sessions finish loading without having to reopen them.
+- New and existing iOS sessions finish loading when opened repeatedly from the session list.
 - Session transcripts avoid duplicate messages and preserve their order after reopening or sending document context.
 - iOS avoids false prompt delivery warnings after the desktop starts or finishes processing.
 - File-session links avoid repeated background lookups that slow down active editing.

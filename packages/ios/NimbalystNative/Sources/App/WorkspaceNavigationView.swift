@@ -158,8 +158,9 @@ struct WorkspaceNavigationView: View {
             .navigationSplitViewColumnWidth(min: 240, ideal: 300, max: 360)
         } detail: {
             // Keep the detail host stable across repeated programmatic selections.
-            // The implicit split-view stack can disappear during the next push,
-            // canceling the visible transcript's observers before its first load.
+            // Sidebar rows use List tags, not NavigationLinks: links also push
+            // an implicit destination and can disappear the visible detail,
+            // canceling its observers and session connection during navigation.
             NavigationStack {
                 detail
             }

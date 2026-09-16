@@ -24,6 +24,7 @@ protocol VoiceEngine: AnyObject {
     func disconnect()
     func sendAudio(_ audio: String)
     func sendUserMessage(text: String)
+    func updateContext(_ text: String)
     func sendFunctionCallResult(callId: String, output: String)
     func interruptPlayback(audioEndMs: Int?)
     func playbackChanged(active: Bool)

@@ -1,4 +1,5 @@
 import { handleMobileVoiceEvent } from './mobileVoiceEvents';
+import { handleMobileVoicePrompt } from './mobileVoicePromptAnswers';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import Store from '../../utils/privateSettingsStore';
 import { isSessionInWorkspace } from './voiceIpcAuthorization';
@@ -28,10 +29,11 @@ export async function handleMobileLiveTool(request: MobileLiveRequest): Promise<
     }
   }
   if (['voice_events', 'voice_event_claim', 'voice_event_presented'].includes(tool)) return handleMobileVoiceEvent(request);
-  if (tool === 'capabilities') return { success: true, result: JSON.stringify({ version: 1, targetedTools: true, voiceApprovals: false }) };
-  // The phone has no equivalent of desktop's verified announced-and-presented approval gate.
+  if (tool === 'capabilities') return { success: true, result: JSON.stringify({ version: 1, targetedTools: true, voiceApprovals: true, promptAnswersVersion: 1 }) };
+  if (['voice_prompt_prepare', 'voice_prompt_presented', 'voice_prompt_answer', 'voice_prompt_status'].includes(tool)) return handleMobileVoicePrompt(request);
+  // Ungated legacy answers are never an alternative to the versioned prompt contract.
   if (tool === 'answer_prompt') return { success: false, error: 'Use the question or approval card in the app.' };
-  const run = () => handleMobileVoiceToolCall(tool, request.arguments, scope.projectId);
+  const run = () => handleMobileVoiceToolCall(tool, request.arguments, scope.projectId, scope.sessionId ?? undefined);
   if (['list_sessions', 'get_session_summary', 'search_project_knowledge', 'recall'].includes(tool)) return run();
   return actions.run(request, run);
 }

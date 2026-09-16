@@ -695,8 +695,8 @@ public final class SyncManager: ObservableObject {
             handleIndexPageResponse(response, decoded: decoded)
         case .changesAvailable(let revision):
             handleIndexChangesAvailable(revision: revision)
-        case .undecodable(let type):
-            logger.warning("Could not decode index message\(type.map { " of type \($0)" } ?? "")")
+        case .undecodable(let type, let detail):
+            logger.warning("Could not decode index message\(type.map { " of type \($0)" } ?? ""): \(detail, privacy: .public)")
             if type == "indexSyncResponse" || type == "indexPageResponse" {
                 indexLoadState = .failed
             }

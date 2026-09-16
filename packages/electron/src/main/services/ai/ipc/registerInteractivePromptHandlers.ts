@@ -1,3 +1,4 @@
+import { reservePromptAnswer } from '../PromptAnswerReservation';
 import { warnIfUnpublished } from '@nimbalyst/runtime/sync/pushOutcome';
 import { registerAskUserQuestionAnswerHandler } from './registerAskUserQuestionAnswerHandler';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
@@ -119,6 +120,8 @@ export function registerInteractivePromptHandlers(ctx: AIServiceContext): void {
       return deliverCodexQuestionAnswer(resolvedSessionId, questionId, { answers: {}, cancelled: true, respondedBy: 'desktop' });
     }
 
+    if (!reservePromptAnswer(resolvedSessionId, 'question', questionId, { answers: {}, cancelled: true })) return { success: false, error: 'Question already answered.' };
+
     // Missing provider is non-fatal here too (claude-code-cli has no in-process
     // instance) — fall through to the MCP/IPC cancel emit + DB fallback. NIM-806.
     const provider = ProviderFactory.getProvider(session.provider as AIProviderType, resolvedSessionId);
@@ -238,6 +241,8 @@ export function registerInteractivePromptHandlers(ctx: AIServiceContext): void {
       return { success: false, error: 'Session not found' };
     }
 
+    if (!reservePromptAnswer(sessionId, 'permission', requestId, response)) return { success: false, error: 'Permission already answered or delivery is unknown.' };
+
     // SDK path (ClaudeCodeProvider) resolves via the in-process provider.
     const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
     if (provider && typeof (provider as any).resolveToolPermission === 'function') {
@@ -305,6 +310,8 @@ export function registerInteractivePromptHandlers(ctx: AIServiceContext): void {
       logger.main.warn(`[AIService] Session not found for tool permission cancel: ${sessionId}`);
       return { success: false, error: 'Session not found' };
     }
+
+    if (!reservePromptAnswer(sessionId, 'permission', requestId, { decision: 'deny', scope: 'once' })) return { success: false, error: 'Permission already answered.' };
 
     // SDK path: reject via the in-process provider and abort the turn.
     const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);

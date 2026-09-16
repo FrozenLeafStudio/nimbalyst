@@ -44,11 +44,20 @@ private final class SessionCreationTestTransport {
         count += 1
         let sessionId = "created-session-\(count)"
         let title = "Created session \(count)"
+        let number = count
         Task { @MainActor in
             // Deliver after the button has registered its request, as the network does.
             try? await Task.sleep(for: .milliseconds(100))
             try! database.upsertSession(Session(id: sessionId, projectId: projectId, titleDecrypted: title,
-                                               provider: "claude-code", mode: "agent", hostDeviceId: "fixture-desktop"))
+                                               provider: "claude-code", mode: "agent",
+                                               agentRole: number == 3 ? "meta-agent" : nil,
+                                               worktreeId: number == 2 ? "fixture-worktree" : nil,
+                                               hostDeviceId: "fixture-desktop"))
+            if number == 3 {
+                try! database.upsertSession(Session(id: "child-session", projectId: projectId, titleDecrypted: "Child session",
+                                                   parentSessionId: sessionId, createdBySessionId: sessionId,
+                                                   hostDeviceId: "fixture-desktop"))
+            }
             let response = CreateSessionResponseBroadcast(type: "createSessionResponseBroadcast",
                 response: CreateSessionResponse(requestId: request.request.requestId, success: true, sessionId: sessionId, error: nil),
                 fromConnectionId: "fixture-desktop")

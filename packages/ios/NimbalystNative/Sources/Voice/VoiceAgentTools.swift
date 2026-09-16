@@ -4,7 +4,15 @@ import os
 
 @MainActor
 extension VoiceAgent {
-    func sendToolResult(callId: String, output: String) { toolScopes.removeValue(forKey: callId); toolResults.finish(callId, output: output) }
+    func sendToolResult(callId: String, output: String) {
+        if promptReadoutCallId == callId {
+            promptReadoutCallId = nil
+            readingPrompt = false
+            if let error = parseArguments(output)["error"] as? String { announcementStatus = error }
+        }
+        toolScopes.removeValue(forKey: callId)
+        toolResults.finish(callId, output: output)
+    }
 
     // MARK: - Tool Handling
 
@@ -18,6 +26,12 @@ extension VoiceAgent {
         }
 
         switch name {
+        case "get_current_context":
+            sendToolResult(callId: callId, output: screenContextJSON())
+        case "read_pending_prompt":
+            handleReadPendingPrompt(callId: callId)
+        case "get_prompt_answer_status":
+            handlePromptAnswerStatus(callId: callId)
         // The advertised tool name is "submit_agent_prompt" (see
         // buildCoreToolDefinitions); the bare "submit_prompt" alias is kept
         // defensively. Matching only "submit_prompt" silently dropped every
@@ -278,6 +292,7 @@ extension VoiceAgent {
             current: activeSessionId,
             event: .switchSession(sessionId)
         )
+        onOpenSession?(sessionId)
         let title = sessionTitle(for: sessionId) ?? "Unknown"
 
         sendToolResult(
@@ -315,7 +330,7 @@ extension VoiceAgent {
                 )
                 guard self.toolResults.contains(callId) else { return }
                 if outcome.success, let result = outcome.result, !result.isEmpty {
-                    let payload: [String: Any] = ["success": true, "summary": result]
+                    let payload: [String: Any] = ["success": true, "source": "desktop", "session_id": sessionId, "summary": result, "pending_prompt_available": true]
                     self.sendToolResult(callId: callId, output: Self.encodeArgs(payload))
                     return
                 }
@@ -360,6 +375,11 @@ extension VoiceAgent {
 
             var summary: [String: Any] = [
                 "success": true,
+                "source": "local_cache",
+                "session_id": sessionId,
+                "updated_at": session.updatedAt,
+                "pending_prompt_available": false,
+                "limitation": "Offline cached summary; pending questions and approvals are unknown. Do not infer that no question is waiting.",
                 "title": session.titleDecrypted ?? "Untitled",
                 "provider": session.provider ?? "unknown",
                 "model": session.model ?? "unknown",
@@ -387,7 +407,7 @@ extension VoiceAgent {
     /// knows which prompt is pending and how to map the spoken answer onto it.
     func handleAnswerPrompt(args: [String: Any], callId: String) {
         if effectiveEngine == .live {
-            sendToolResult(callId: callId, output: Self.encodeArgs(["success": false, "error": "Answer this question or approval using its prompt card in the app. Voice approval is unavailable without verified presentation."]))
+            handleLiveAnswerPrompt(callId: callId)
             return
         }
         let sessionId = (args["session_id"] as? String) ?? activeSessionId

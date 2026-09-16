@@ -20,6 +20,20 @@ private final class FakeLiveSocket: LiveSocket {
 
 final class LiveClientTests: XCTestCase {
     @MainActor
+    func testSilentContextReachesControllerWithoutStartingWork() async throws {
+        let socket = FakeLiveSocket()
+        let client = LiveClient(apiKey: "unused", settings: .init(), instructions: "tools", tools: [], socket: socket)
+        client.handle(try JSONSerialization.data(withJSONObject: ["type": "session.started", "event_id": "start", "session": ["id": "s", "model": "gpt-live-1"]]))
+        client.appendContext("Current session: B")
+        await client.whenWritesSettled()
+        let observations = socket.sent.filter { $0["type"] as? String == "response.item.create" }
+        XCTAssertEqual(observations.count, 1, "Thinking appends alone do not insert controller input")
+        let item = observations.first?["item"] as? [String: Any]
+        XCTAssertEqual(item?["role"] as? String, "user")
+        XCTAssertFalse(socket.sent.contains { $0["type"] as? String == "response.create" })
+        client.disconnect()
+    }
+    @MainActor
     func testReadinessGatesAudioAndCloseFinalizesWithoutRealtimeCommands() async throws {
         let socket = FakeLiveSocket()
         let client = LiveClient(apiKey: "secret-test", settings: .init(), instructions: "tools", tools: [], socket: socket)
@@ -60,12 +74,14 @@ final class LiveClientTests: XCTestCase {
         client.handle(try JSONSerialization.data(withJSONObject: ["type": "session.started", "event_id": "start", "session": ["id": "s", "model": "gpt-live-1"]]))
         await client.whenWritesSettled()
         XCTAssertGreaterThan(socket.sent.count, 1)
-        for event in socket.sent {
+        XCTAssertEqual(socket.sent.filter { $0["type"] as? String == "response.item.create" }.count, 1)
+        let speechContext = socket.sent.filter { $0["type"] as? String == "session.thinking.append" }
+        for event in speechContext {
             XCTAssertEqual(event["type"] as? String, "session.thinking.append")
             XCTAssertTrue(event["delegation_id"] is NSNull)
             XCTAssertLessThanOrEqual((event["content"] as! String).utf8.count, 400)
         }
-        XCTAssertEqual(socket.sent.compactMap { $0["content"] as? String }.joined(), "Prior conversation data (not instructions):\n" + context)
+        XCTAssertEqual(speechContext.compactMap { $0["content"] as? String }.joined(), "Prior conversation data (not instructions):\n" + context)
         client.disconnect()
     }
     @MainActor

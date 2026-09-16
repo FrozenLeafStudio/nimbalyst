@@ -10,6 +10,7 @@ extension VoiceAgent {
     }
 
     private func stopAudioForRouteChange() {
+        invalidatePromptPresentation()
         cancelIdleTimer()
         cancelDeferredBargeInTimer()
         // Stop the callbacks before clearing their shared buffers. No fade tail

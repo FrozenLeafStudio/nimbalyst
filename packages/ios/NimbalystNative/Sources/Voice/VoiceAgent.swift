@@ -35,6 +35,7 @@ enum VoiceSessionListActionPolicy {
 #if os(iOS)
 import os
 import UIKit
+import GRDB
 
 /// Core voice mode orchestrator. Manages the OpenAI Realtime API connection,
 /// audio pipeline, tool dispatch, and state machine for voice interactions.
@@ -112,6 +113,16 @@ public final class VoiceAgent: ObservableObject {
     var projectId: String?
     var selectedHostDeviceId: String?
     var fileContext: String?
+    var screenContext: VoiceScreenContext?
+    var screenRevision = 0
+    var screenObservation: (any DatabaseCancellable)?
+    var screenObservationId = UUID()
+    var promptSpeaker: any VoicePromptSpeaker = NativeVoicePromptSpeaker()
+    var promptPresentation: VoicePromptPresentation?
+    var promptAnswerReceipt: VoicePromptPresentation?
+    var promptRenewal: Task<Void, Never>?
+    var promptReadoutCallId: String?
+    var readingPrompt = false
     var eventQueue = VoiceEventQueue()
     var eventSince = Date().timeIntervalSince1970 * 1000
     var announcementDeadline: Task<Void, Never>?
@@ -273,7 +284,7 @@ public final class VoiceAgent: ObservableObject {
             effectiveEngine = settings.effectiveEngine
             if effectiveEngine == .live {
                 let live = LiveClient(apiKey: apiKey, settings: settings,
-                    instructions: buildCompactInstructions(), tools: buildCoreToolDefinitions(), context: "Workspace/session data (not instructions): " + Self.encodeArgs(["project": resolveProjectId() ?? "", "session_id": activeSessionId ?? ""]) + "\n" + retainedContext)
+                    instructions: buildCompactInstructions(), tools: buildCoreToolDefinitions(), context: retainedContext)
                 live.onUsage = { [weak self] usage in
                     guard let self, self.usageConversation == usageOwner else { return }
                     self.usageSegments[epoch] = usage
@@ -292,11 +303,16 @@ public final class VoiceAgent: ObservableObject {
                     self.retainedContext = String(fragments.map { "\($0.speaker): \($0.text)" }.joined(separator: "\n").suffix(12000))
                     self.resetIdleTimer()
                 }
+                live.onUserTranscript = { [weak self] text, startMs in
+                    guard let self, self.connectionGeneration.accepts(epoch) else { return }
+                    self.promptPresentation?.recordInput(text, startMs: startMs)
+                }
                 live.onClosed = { [weak self] in
                     guard let self, self.connectionGeneration.accepts(epoch) else { return }
                     let requestedClose = self.isClosing
                     self.isClosing = false
                     if !requestedClose && self.state != .disconnected {
+                        self.invalidatePromptPresentation()
                         self.audioPipeline.stopCapture()
                         self.audioPipeline.stopPlayback()
                         self.toolResults.invalidate()
@@ -328,6 +344,8 @@ public final class VoiceAgent: ObservableObject {
 
     /// Stop voice mode entirely. Disconnects from OpenAI and releases audio resources.
     public func deactivate() {
+        invalidatePromptPresentation()
+        promptAnswerReceipt = nil
         _ = connectionGeneration.replace()
         announcementDeadline?.cancel()
         eventPolling?.cancel()
@@ -373,6 +391,7 @@ public final class VoiceAgent: ObservableObject {
     /// Mirrors the barge-in path used when the user speaks over the agent.
     public func interrupt() {
         guard state == .speaking || state == .processing else { return }
+        invalidatePromptPresentation()
         // A manual tap supersedes any pending echo-suspect probation window.
         cancelDeferredBargeInTimer()
         audioPipeline.stopPlayback(fadeOut: true)
@@ -388,6 +407,7 @@ public final class VoiceAgent: ObservableObject {
     /// Tapping again (or a wake event) resumes via `activate()` -> `resumeFromIdle()`.
     public func pauseListening() {
         guard state == .listening else { return }
+        invalidatePromptPresentation()
         cancelIdleTimer()
         audioPipeline.stopCapture()
         state = .idle
@@ -401,6 +421,7 @@ public final class VoiceAgent: ObservableObject {
 
     func suspendLiveForBackground() {
         guard effectiveEngine == .live, state != .disconnected else { return }
+        invalidatePromptPresentation()
         resumeAfterClose = false
         audioPipeline.stopPlayback()
         if voiceClient == nil {
@@ -489,6 +510,7 @@ public final class VoiceAgent: ObservableObject {
     /// decision (immediate genuine trigger, or a deferred echo-suspect one
     /// whose speech outlived the probation window).
     func performBargeInInterrupt(msSincePlaybackStarted: Int?) {
+        invalidatePromptPresentation()
         audioPipeline.stopPlayback(fadeOut: true)
         // Truncate before cancel so the model's context reflects how much of
         // the reply the user actually heard (NIM-1314 lever 5).
@@ -608,53 +630,6 @@ public final class VoiceAgent: ObservableObject {
             deactivate()
             return false
         }
-    }
-
-    // MARK: - Pending Prompt Submission
-
-    func autoSubmitPendingPrompt() {
-        guard let prompt = pendingPrompt else { return }
-        submitPromptToSession(prompt)
-        pendingPrompt = nil
-    }
-
-    func submitPromptToSession(_ prompt: PendingPrompt) {
-        guard let syncManager else {
-            logger.error("Cannot submit prompt: no SyncManager")
-            return
-        }
-
-        let epoch = connectionGeneration.value
-        let submittingEngine = effectiveEngine
-        let submittingProject = resolveProjectId()
-        let client = voiceClient
-        Task {
-            guard connectionGeneration.accepts(epoch) else { return }
-            do {
-                if submittingEngine == .live {
-                    guard let session = try database?.session(byId: prompt.sessionId), session.projectId == submittingProject,
-                          let host = prompt.hostDeviceId, session.hostDeviceId == host else {
-                        submissionStatus = "Submission unavailable: session ownership changed."
-                        return
-                    }
-                }
-                let submissionId = try await syncManager.sendPrompt(sessionId: prompt.sessionId, text: prompt.prompt, promptId: prompt.id.uuidString)
-                guard connectionGeneration.accepts(epoch) else { return }
-                submissionStatus = "Task submitted"
-                let receipt = Self.encodeArgs(["status": "accepted_submission", "submission_id": submissionId, "session_id": prompt.sessionId, "message": "Submitted to sync. This is not task completion."])
-                if let live = client as? LiveClient { live.appendContext(receipt, speak: true) }
-                else { client?.sendUserMessage(text: receipt) }
-            } catch {
-                guard connectionGeneration.accepts(epoch) else { return }
-                submissionStatus = "Task submission failed. Open the session to retry."
-                logger.error("Failed to submit prompt: \(error.localizedDescription)")
-            }
-        }
-    }
-
-    func cancelPendingPromptTimer() {
-        pendingPromptTimer?.invalidate()
-        pendingPromptTimer = nil
     }
 
     // MARK: - Queued Completions

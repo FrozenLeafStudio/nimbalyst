@@ -442,12 +442,11 @@ public struct SessionListView: View {
                 groupContextMenu(for: pageItem)
             }
         case .session(let row):
-            NavigationLink(value: WorkspaceSelection.session(row.id)) {
-                SessionRow(
-                    session: row,
-                    voiceFocusedSessionId: voiceFocusedSessionId
-                )
-            }
+            SessionRow(
+                session: row,
+                voiceFocusedSessionId: voiceFocusedSessionId
+            )
+            .tag(WorkspaceSelection.session(row.id))
             .contextMenu {
                 standaloneContextMenu(for: row)
             }

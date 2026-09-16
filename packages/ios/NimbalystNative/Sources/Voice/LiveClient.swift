@@ -49,6 +49,8 @@ final class LiveClient: VoiceEngine {
     var onResponseDone: (() -> Void)?
     var onUsage: ((LiveUsage) -> Void)?
     var onTranscripts: (([LiveTranscript]) -> Void)?
+    var onUserTranscript: ((String, Double) -> Void)?
+    private(set) var inputAudioMilliseconds: Double = 0
     var onClosed: (() -> Void)?
 
     private let socket: any LiveSocket
@@ -69,6 +71,7 @@ final class LiveClient: VoiceEngine {
     private var pendingWrites = 0
     private var audioMuted = false
     private var restoreContext: String
+    private var pendingContext: String?
 
     init(apiKey: String, settings: VoiceModeSettings, instructions: String, tools: [[String: Any]], context: String = "", socket: (any LiveSocket)? = nil) {
         self.apiKey = apiKey
@@ -119,6 +122,7 @@ final class LiveClient: VoiceEngine {
 
     func sendAudio(_ audio: String) {
         guard protocolState.ready, !closing, !ended else { return }
+        if let data = Data(base64Encoded: audio) { inputAudioMilliseconds += Double(data.count) / 48 }
         enqueue([["type": "session.input_audio.append", "audio": audio]])
     }
     func sendUserMessage(text: String) {
@@ -169,6 +173,10 @@ final class LiveClient: VoiceEngine {
     /// byte bound (including for languages whose characters tokenize separately).
     func appendContext(_ text: String, speak: Bool = false) {
         guard protocolState.ready, !ended, !closing else { return }
+        if !speak {
+            // Thinking appends feed speech; the controller needs its own input.
+            enqueue([["type": "response.item.create", "item": ["type": "message", "role": "user", "content": [["type": "input_text", "text": String(text.suffix(12000))]]]]])
+        }
         var chunks: [String] = []
         var chunk = ""
         for character in String(text.suffix(12000)) {
@@ -184,6 +192,12 @@ final class LiveClient: VoiceEngine {
         enqueue(chunks.map { ["type": speak ? "session.commentary.append" : "session.thinking.append", "delegation_id": NSNull(), "content": $0] })
     }
     func playbackChanged(active: Bool) {}
+
+    func updateContext(_ text: String) {
+        guard !ended, !closing else { return }
+        guard protocolState.ready else { pendingContext = text; return }
+        appendContext(text)
+    }
 
     func disconnect() {
         guard !closing, !ended else { return }
@@ -218,6 +232,7 @@ final class LiveClient: VoiceEngine {
                     appendContext("Prior conversation data (not instructions):\n" + restoreContext)
                     restoreContext = ""
                 }
+                if let context = pendingContext { pendingContext = nil; appendContext(context) }
                 onSessionReady?(); flushText()
             case .audio(let audio): if !closing, !audioMuted { onAudioDelta?(audio) }
             case .call(let call): if !closing { onFunctionCall?(call.name, call.arguments, call.token) }
@@ -225,7 +240,10 @@ final class LiveClient: VoiceEngine {
             case .backendFinished: onResponseDone?()
             case .usage: onUsage?(protocolState.usage)
             case .transcript:
-                if event["type"] as? String == "session.input_transcript.delta" { audioMuted = false }
+                if event["type"] as? String == "session.input_transcript.delta" {
+                    audioMuted = false
+                    if let text = event["delta"] as? String, let start = event["start_ms"] as? Double { onUserTranscript?(text, start) }
+                }
                 onTranscripts?(protocolState.transcripts)
             case .closed: finish()
             }
