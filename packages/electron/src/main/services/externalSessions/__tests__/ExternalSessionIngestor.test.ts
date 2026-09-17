@@ -1257,7 +1257,7 @@ describe("production source -> persistence -> canonical delivery", () => {
       source =
         providerId === "claude-code"
           ? new ClaudeCodeSource({ rootDir: logs })
-          : new CodexSource({ rootDir: logs });
+          : new CodexSource({ rootDir: logs, now: () => new Date("2026-09-14T12:00:00Z") });
       const file =
         providerId === "claude-code"
           ? path.join(logs, encodeWorkspaceDir(cwd), "external.jsonl")
@@ -1288,12 +1288,16 @@ describe("production source -> persistence -> canonical delivery", () => {
           ? JSON.stringify({
               type: "session_meta",
               timestamp: "2026-09-14T12:00:00Z",
-              payload: { id: "external", cwd },
+              payload: { id: "external", cwd, forked_from_id: "parent" },
+            }) + "\n" + JSON.stringify({
+              type: "session_meta",
+              payload: { id: "parent", cwd },
             }) + "\n"
           : "";
       const initial = prefix + JSON.stringify(row("a", "First prompt")) + "\n";
       await fs.writeFile(file, initial);
       const [ref] = await source.discover(cwd);
+      expect(ref).toMatchObject({ providerId, externalId: "external", workspacePath: cwd });
       const refresh = vi.fn();
       let runtime: TranscriptMigrationService;
       const makeIngestor = () => {

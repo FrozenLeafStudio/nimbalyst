@@ -13,6 +13,8 @@ export interface ExternalSessionRef {
   titleKind?: "fallback" | "generated" | "explicit";
   model?: string;
   parentToolUseId?: string;
+  /** A fork's header identifies the copied parent metadata immediately after it. */
+  codexInheritedMeta?: { id: string; byteOffset: number };
 }
 
 export interface ExternalCursor {

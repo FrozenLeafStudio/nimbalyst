@@ -319,6 +319,14 @@ export class CodexSource implements ExternalSessionSource {
       filePath,
       updatedAt: stat.mtimeMs,
       title: rolloutTitle(head.entries.map((e) => e.value)),
+      ...(typeof meta.payload.forked_from_id === "string" && meta.payload.forked_from_id
+        ? {
+            codexInheritedMeta: {
+              id: meta.payload.forked_from_id,
+              byteOffset: head.entries[0].endByteOffset,
+            },
+          }
+        : {}),
       ...(typeof meta.timestamp === "string" &&
       Number.isFinite(Date.parse(meta.timestamp))
         ? { createdAt: Date.parse(meta.timestamp) }
@@ -361,7 +369,15 @@ export class CodexSource implements ExternalSessionSource {
         throw new Error(
           "External Codex session cwd changed outside its workspace"
         );
-      if (entry.type === "session_meta" && payload.id !== ref.externalId)
+      // Forks prepend their own header to copied parent history. Only the
+      // declared parent's adjacent metadata is inherited; later identity
+      // changes still fail, including after a cursor resume or restart.
+      const inheritedMeta = inspected.codexInheritedMeta;
+      if (
+        entry.type === "session_meta" &&
+        payload.id !== ref.externalId &&
+        !(inheritedMeta && payload.id === inheritedMeta.id && record.byteOffset === inheritedMeta.byteOffset)
+      )
         throw new Error("External Codex session identity changed");
       if (entry.type === "turn_context" && typeof payload.model === "string")
         model = payload.model;

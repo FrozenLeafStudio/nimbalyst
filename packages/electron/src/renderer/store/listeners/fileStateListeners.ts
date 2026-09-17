@@ -29,6 +29,7 @@ import { createToolCallMatchesCoalescer } from './toolCallMatchesCoalescer';
 import { createPerKeyDebouncer } from './perKeyDebounce';
 import { loadSessionFilesResult } from '../../services/sessionFilesLoader';
 import { createFileSessionLinksInvalidator, fileSessionLinksRevisionAtom } from '../atoms/fileSessionLinks';
+import { shellTrackingRevisionAtom } from '../atoms/shellTracking';
 
 /**
  * Track which workspace path is currently open.
@@ -327,6 +328,10 @@ export function initFileStateListeners(workspacePath: string): () => void {
         sessionId,
         setTimeout(() => {
           sessionFilesFetchTimers.delete(sessionId);
+          // Invalidate coverage independently of whether the file-list query succeeds.
+          if (Array.from(shellTrackingRevisionAtom.getParams()).includes(sessionId)) {
+            store.set(shellTrackingRevisionAtom(sessionId), revision => revision + 1);
+          }
           void runSessionFilesRefresh(sessionId);
         }, SESSION_FILES_FETCH_DEBOUNCE_MS)
       );

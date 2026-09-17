@@ -1,41 +1,43 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { atom, useAtomValue } from 'jotai';
 import { shellCoverageDetails, type ShellCoverageSummary } from '@nimbalyst/runtime/ai/shellTrackingCoverage';
+import { shellTrackingRevisionAtom } from '../../store/atoms/shellTracking';
 
 /** Requeries on persisted link/coverage updates; old requests cannot replace a new scope. */
 export function ShellTrackingNotice({ sessionIds }: { sessionIds: string[] }) {
   const key = [...new Set(sessionIds)].sort().join(',');
+  const revisionAtom = useMemo(() => atom(get =>
+    (key ? key.split(',') : []).reduce((sum, id) => sum + get(shellTrackingRevisionAtom(id)), 0)
+  ), [key]);
+  const revision = useAtomValue(revisionAtom);
   const [coverage, setCoverage] = useState<ShellCoverageSummary[]>([]);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
+    setCoverage([]);
+    setFailed(false);
+  }, [key]);
+  useEffect(() => {
     const ids = key ? key.split(',') : [];
     let disposed = false;
-    let version = 0;
     const load = async () => {
-      const request = ++version;
       try {
         const result = await window.electronAPI.invoke('session-files:coverage', ids);
-        if (!disposed && request === version) {
+        if (!disposed) {
           setCoverage(result);
           setFailed(false);
         }
       } catch {
-        if (!disposed && request === version) {
+        if (!disposed) {
           setCoverage([]);
           setFailed(true);
         }
       }
     };
-    setCoverage([]);
-    setFailed(false);
     void load();
-    const unsubscribe = window.electronAPI.on('session-files:updated', (id: string) => {
-      if (ids.includes(id)) void load();
-    });
     return () => {
       disposed = true;
-      unsubscribe();
     };
-  }, [key]);
+  }, [key, revision]);
   const details = shellCoverageDetails(coverage);
   if (!failed && !details.length) return null;
   return (

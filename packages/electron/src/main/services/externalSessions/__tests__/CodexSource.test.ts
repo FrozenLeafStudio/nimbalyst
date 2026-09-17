@@ -211,6 +211,39 @@ it("uses native response identities when timestamps change on replay and maps cu
     first.messages.map((m) => m.sourceEntryId)
   );
 });
+it("reads forked rollout history across restart without accepting unrelated identity or workspace changes", async () => {
+  const file = path.join(dir, "2026/09/14/rollout-fork.jsonl");
+  const line = (value: unknown) => JSON.stringify(value) + "\n";
+  const header = line({ type: "session_meta", payload: { id: "child", cwd, forked_from_id: "parent" } });
+  const parent = line({ type: "session_meta", payload: { id: "parent", cwd } });
+  const message = line({ type: "response_item", timestamp, payload: {
+    id: "inherited", type: "message", role: "user", content: [{ type: "input_text", text: "Inherited prompt" }],
+  } });
+  await fs.writeFile(file, header + parent + message);
+  const options = { rootDir: dir, maxReadBytes: 1, now: () => new Date(timestamp) };
+  await source.dispose();
+  source = new CodexSource(options);
+  const [ref] = await source.discover(cwd);
+  expect(ref).toMatchObject({ externalId: "child", workspacePath: cwd });
+  const first = await source.readSince(ref, null);
+  expect(first.messages).toEqual([]);
+  await source.dispose();
+  source = new CodexSource(options);
+  const rest = await drain(source, ref, first.cursor);
+  expect(rest.messages).toHaveLength(1);
+  expect(rest.messages[0].content).toContain("Inherited prompt");
+  const replay = await drain(source, ref);
+  expect(replay.messages.map(m => m.sourceEntryId)).toEqual(rest.messages.map(m => m.sourceEntryId));
+
+  // An appended identity change is not inherited fork metadata.
+  await fs.appendFile(file, parent);
+  await expect(drain(source, ref, rest.cursor)).rejects.toThrow("identity changed");
+  await fs.writeFile(file, header + parent.replace('"parent"', '"unrelated"') + message);
+  await expect(drain(source, ref)).rejects.toThrow("identity changed");
+  await fs.writeFile(file, header + parent.replace(cwd, "/foreign") + message);
+  await expect(drain(source, ref)).rejects.toThrow("cwd changed");
+});
+
 it("eventually visits every eligible file with a one-entry discovery budget", async () => {
   await source.dispose();
   source = new CodexSource({
