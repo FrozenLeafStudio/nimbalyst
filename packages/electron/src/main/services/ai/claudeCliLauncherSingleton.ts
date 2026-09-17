@@ -1,3 +1,4 @@
+import { claimExternalSessionForLocalExecution } from '../externalSessions/ExternalSessionService';
 /**
  * Production wiring for `ClaudeCliSessionLauncher` (NIM-806, Phase 1).
  *
@@ -256,6 +257,7 @@ const cliFileWatcher = new HooklessAgentFileWatcher();
 export async function ensureClaudeCliSession(
   input: EnsureClaudeCliSessionInput
 ): Promise<EnsureClaudeCliSessionResult> {
+  await claimExternalSessionForLocalExecution(input.sessionId);
   const manager = getTerminalSessionManager();
   if (manager.isTerminalActive(input.sessionId)) {
     return { success: true, alreadyActive: true };

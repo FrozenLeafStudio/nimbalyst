@@ -2,9 +2,8 @@ import { previewForLog, summarizeNotificationParams, extractNotificationRouting 
 /**
  * OpenAI Codex app-server Protocol Adapter
  *
- * Drives `codex app-server --listen stdio://` directly via JSON-RPC v2, in
- * contrast to the SDK transport which spawns `codex exec --experimental-json`
- * for every turn.
+ * Drives `codex app-server --listen stdio://` directly via JSON-RPC v2;
+ * the SDK transport instead spawns `codex exec --experimental-json` per turn.
  *
  * Why it exists: the app-server protocol's `item/started` and `item/completed`
  * notifications for `fileChange` items carry the full unified-diff text per
@@ -41,7 +40,7 @@ import {
   ToolResult,
 } from './ProtocolInterface';
 import { JsonRpcClient } from './codexAppServer/jsonRpcClient';
-import { prepareCodexShellTracking, type CodexShellTrackingRegistration } from './codexAppServer/shellTracking';
+import { observeCodexShellTracking, prepareCodexShellTracking, type CodexShellTrackingRegistration } from './codexAppServer/shellTracking';
 import {
   getCodexVendorPathEntries,
   resolveCodexBinaryPath,
@@ -522,6 +521,7 @@ export class CodexAppServerProtocol implements AgentProtocol {
             ...(options.raw?.codexConfigOverrides as Record<string, unknown> ?? {}), ...trust,
           } } };
         } catch (error) {
+          tracking.registration.unavailable?.();
           tracking.registration.dispose();
           console.warn('[CodexShellTracking] Hooks unavailable; shell attribution disabled:', error);
         }
@@ -548,15 +548,9 @@ export class CodexAppServerProtocol implements AgentProtocol {
       cleanupStarted: false,
       shellTracking: tracking?.registration,
     };
-    client.onNotification((method, params) => {
-      if ((method === 'turn/completed' || method === 'turn/failed') &&
-          extractNotificationRouting(params).threadId === raw.threadId) {
-        tracking?.registration.endTurn();
-      }
-    });
+    observeCodexShellTracking(client, raw.shellTracking, () => raw.threadId, () => raw.activeTurnId);
     return raw;
   }
-
   /**
    * Point codex at Nimbalyst's exported skills (#1253).
    *
@@ -931,6 +925,11 @@ export class CodexAppServerProtocol implements AgentProtocol {
       case 'turn/failed':
       case 'error': {
         const n = params as unknown as ErrorNotification;
+        // Codex emits the same notification while it retries a transient
+        // transport failure. `willRetry: true` explicitly means the turn is
+        // still active, so keep the iterator subscribed for the eventual
+        // recovery, terminal error, or turn completion (#1523).
+        if (method === 'error' && n.willRetry === true) return;
         const msg = n?.error?.message ?? 'codex app-server error';
         this.sweepOrphanedMcpCalls(push, undefined, undefined);
         push({ kind: 'fail', error: new Error(msg) });

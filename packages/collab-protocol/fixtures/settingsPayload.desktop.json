@@ -2,7 +2,10 @@
   "openaiApiKey": "",
   "voiceMode": {
     "voice": "marin",
-    "submitDelayMs": 1200
+    "submitDelayMs": 1200,
+    "engine": "live",
+    "liveVoice": "marin",
+    "liveControllerModel": "gpt-5.6-terra"
   },
   "availableModels": [
     {

@@ -1625,11 +1625,11 @@ export function initVoiceModeListeners(): () => void {
           // Run the actual commit, then forward the result so the durable
           // prompt is resolved with the same shape the widget produces.
           window.electronAPI
-            .invoke('git:commit', commitWorkspacePath, commitMessage, filePaths, payload.sessionId)
+            .invoke('git:commit', commitWorkspacePath, commitMessage, filePaths, payload.sessionId, undefined, undefined, payload.promptId)
             .then((result: any) => {
               resolveProposal(
                 {
-                  action: result?.success ? 'committed' : 'cancelled',
+                  action: result?.success ? 'committed' : 'error',
                   commitHash: result?.commitHash,
                   commitDate: result?.commitDate,
                   error: result?.error,
@@ -1640,9 +1640,9 @@ export function initVoiceModeListeners(): () => void {
               );
             })
             .catch((error: unknown) => {
-              // git:commit threw, so nothing was committed.
+              // A failed IPC request does not prove whether Git completed.
               resolveProposal(
-                { action: 'cancelled', error: error instanceof Error ? error.message : String(error) },
+                { action: 'error', error: error instanceof Error ? error.message : String(error) },
                 false,
               );
             });

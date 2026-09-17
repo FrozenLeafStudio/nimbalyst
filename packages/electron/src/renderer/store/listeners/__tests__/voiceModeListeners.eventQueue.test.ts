@@ -785,6 +785,9 @@ describe('voice event queue wiring', () => {
           PROPOSAL.data.commitMessage,
           ['src/delivery.ts'],
           ASKING_SESSION,
+          undefined,
+          undefined,
+          PROPOSAL.promptId,
         ]);
       } finally {
         dispose();

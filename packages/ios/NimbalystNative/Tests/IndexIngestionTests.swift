@@ -12,6 +12,20 @@ final class IndexIngestionTests: XCTestCase {
     private let otherCrypto = CryptoManager(key: SymmetricKey(data: Data(repeating: 8, count: 32)))
     private let projectPath = "/test/ingestion"
 
+    func testMalformedPageReportsFieldWithoutLoggingPayload() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "type": "indexPageResponse", "protocolVersion": 2, "requestId": "request", "mode": "bootstrap", "complete": false,
+            "entries": [["entity": "session", "id": "private-session", "revision": 1, "deleted": false,
+                         "session": ["sessionId": "private-session", "encryptedProjectId": "private-ciphertext", "projectIdIv": "iv",
+                                     "createdAt": "private-invalid-value", "updatedAt": 1]]],
+        ])
+        let message = IndexMessageDecoder.decode(data).message
+        guard case .undecodable = message else { return XCTFail("Malformed pages must remain rejected") }
+        let diagnostic = String(describing: message)
+        XCTAssertTrue(diagnostic.contains("entries.0.session.createdAt"), diagnostic)
+        XCTAssertFalse(diagnostic.contains("private-"), "Diagnostics must not expose record values")
+    }
+
     func testCreatedSessionIsReadyOnlyAfterItsRowArrivesAndOnlyForRequester() async throws {
         let db = try DatabaseManager()
         let sync = manager(db)

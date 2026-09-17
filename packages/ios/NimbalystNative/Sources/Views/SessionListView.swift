@@ -188,7 +188,6 @@ public struct SessionListView: View {
                 if selectedTab == .sessions && model.facets.hasArchived {
                     archiveToggle
                 }
-                connectionIndicator
                 if selectedTab == .sessions {
                     creationMenu
                 }
@@ -419,6 +418,7 @@ public struct SessionListView: View {
             }
         }
         .disabled(isCreatingSession)
+        .accessibilityIdentifier("session-create-menu")
         .onReceive(NotificationCenter.default.publisher(for: .init("MetaAgentEnabledSynced"))) { _ in
             metaAgentEnabled = FeaturePreferences.metaAgentEnabled
         }
@@ -442,12 +442,11 @@ public struct SessionListView: View {
                 groupContextMenu(for: pageItem)
             }
         case .session(let row):
-            NavigationLink(value: WorkspaceSelection.session(row.id)) {
-                SessionRow(
-                    session: row,
-                    voiceFocusedSessionId: voiceFocusedSessionId
-                )
-            }
+            SessionRow(
+                session: row,
+                voiceFocusedSessionId: voiceFocusedSessionId
+            )
+            .tag(WorkspaceSelection.session(row.id))
             .contextMenu {
                 standaloneContextMenu(for: row)
             }
@@ -557,24 +556,6 @@ public struct SessionListView: View {
             deleteSession(item.parent)
         } label: {
             Label("Delete", systemImage: "trash")
-        }
-    }
-
-    // MARK: - Connection Indicator
-
-    private var isDesktopConnected: Bool {
-        if appState.screenshotMode { return true }
-        return appState.syncManager?.connectedDevices.contains(where: { $0.type == "desktop" }) ?? false
-    }
-
-    private var connectionIndicator: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "desktopcomputer")
-                .font(.system(size: 14))
-                .foregroundStyle(appState.isConnected ? .primary : .secondary)
-            Circle()
-                .fill(isDesktopConnected ? Color.green : (appState.isConnected ? Color.orange : Color.gray))
-                .frame(width: 8, height: 8)
         }
     }
 

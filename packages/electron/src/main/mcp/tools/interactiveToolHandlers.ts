@@ -1,10 +1,8 @@
 import Store from '../../utils/privateSettingsStore';
 export { handleAskUserQuestion } from './askUserQuestionHandler';
 import { BrowserWindow, ipcMain } from "electron";
-import {
-  AgentMessagesRepository,
-  AISessionsRepository,
-} from "@nimbalyst/runtime";
+import { AgentMessagesRepository } from "@nimbalyst/runtime/storage/repositories/AgentMessagesRepository";
+import { AISessionsRepository } from "@nimbalyst/runtime/storage/repositories/AISessionsRepository";
 import { STRUCTURED_INPUT_FIELD_TYPES } from "@nimbalyst/collab-protocol";
 import { getSessionStateManager } from "@nimbalyst/runtime/ai/server/SessionStateManager";
 import { notificationService } from "../../services/NotificationService";
@@ -36,7 +34,7 @@ import { broadcastMessageLogged } from "../../services/ai/claudeCliUserPromptLog
 import { ClaudeSettingsManager } from "../../services/ClaudeSettingsManager";
 import { getPermissionService } from "../../services/PermissionService";
 import { SessionCommitService } from "../../services/SessionCommitService";
-import { scopeProposalToRepo } from "../../services/workspaceRepos";
+import { resolveGitCommitProposalTarget } from "../../services/gitCommitProposalTarget";
 import { findFreshInteractiveResponse } from "./interactiveResponsePolling";
 import {
   clearPendingInteractiveWaiter,
@@ -123,6 +121,8 @@ export function getInteractiveToolSchemas(sessionId: string | undefined) {
 
 IMPORTANT: First call get_session_edited_files, cross-reference with git status, and include ALL session-edited files that have uncommitted changes — do not cherry-pick a subset.
 
+Relative paths target the session's checkout (its worktree when linked). workingDirectory is unsupported; use a session in the intended checkout. Absolute paths may also target attached repositories. Files outside these roots are rejected.
+
 ONE REPOSITORY PER CALL. A commit cannot span repositories. If the files you are committing live in more than one repository (a workspace can have attached folders that are their own checkouts), call this tool once per repository — each call with only that repository's files and a commit message describing that repository's change. A call whose files span repositories is rejected.
 
 Commit message: type prefix (feat:/fix:/refactor:/docs:/test:/chore:), title states the user-visible outcome, focus on impact and why (not technique), lines under 72 chars, no emojis, dash bullets only for multiple distinct changes. If the commit resolves an issue or tracker item, include its canonical closing reference (e.g. Fixes #123, Closes ABC-123), or a neutral reference line if the closing syntax is unclear.`,
@@ -140,7 +140,7 @@ Commit message: type prefix (feat:/fix:/refactor:/docs:/test:/chore:), title sta
                     path: {
                       type: "string",
                       description:
-                        "File path, either relative to the workspace root or absolute. Files in an attached folder are supplied to you as absolute paths; pass them back unchanged.",
+                        "File path, either relative to the session checkout (its worktree when linked) or absolute. Files in an attached folder are supplied to you as absolute paths; pass them back unchanged.",
                     },
                     status: {
                       type: "string",
@@ -443,6 +443,7 @@ export async function handleGitCommitProposal(
         filesToStage?: FileToStage[] | string;
         commitMessage?: string;
         reasoning?: string;
+        workingDirectory?: unknown;
       }
     | undefined;
 
@@ -492,33 +493,26 @@ export async function handleGitCommitProposal(
     };
   }
 
-  // One proposal is one commit in one repo. Accepting a list that spans repos
-  // would put N commits behind a single approval, sharing one message, with
-  // only the first hash ever surfaced. Refuse and name the groups so the agent
-  // makes one call per repo -- it corrects within the same turn.
-  const proposalPaths = proposalArgs.filesToStage.map((file) =>
-    typeof file === "string" ? file : file.path
-  );
-  const scope = scopeProposalToRepo(workspacePath, proposalPaths);
-  if (!scope.ok) {
-    const groupList = scope.groups
-      .map((group) => `${group.repoPath}\n${group.files.map((f) => `  - ${f}`).join("\n")}`)
-      .join("\n\n");
+  let target: Awaited<ReturnType<typeof resolveGitCommitProposalTarget>>;
+  try {
+    target = await resolveGitCommitProposalTarget(
+      sessionId,
+      workspacePath,
+      proposalArgs.filesToStage.map(file => typeof file === "string" ? file : file.path),
+      proposalArgs.workingDirectory,
+    );
+    // Persist absolute paths so consumers of the durable proposal do not
+    // reinterpret relative files against the parent MCP configuration root.
+    proposalArgs.filesToStage = proposalArgs.filesToStage.map((file, index) =>
+      typeof file === "string" ? target.files[index] : { ...file, path: target.files[index] }
+    );
+  } catch (error) {
     return {
-      content: [
-        {
-          type: "text",
-          text:
-            `Error: this proposal spans ${scope.groups.length} git repositories. ` +
-            `A commit cannot cross repositories, so call developer_git_commit_proposal ` +
-            `once per repository, each with only that repository's files and a commit ` +
-            `message describing that repository's change.\n\n${groupList}`,
-        },
-      ],
+      content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
       isError: true,
     };
   }
-  const proposalRepoPath = scope.repoPath ?? undefined;
+  const proposalRepoPath = target.repoPath;
 
   // Find the target window (resolves worktree paths to parent project)
   const commitWindowId = await findWindowIdForWorkspacePath(workspacePath);
@@ -618,7 +612,7 @@ export async function handleGitCommitProposal(
         filesToStage: proposalArgs.filesToStage,
         commitMessage: proposalArgs.commitMessage,
         reasoning: proposalArgs.reasoning,
-        workspacePath,
+        workspacePath: target.workspacePath,
         // The repo this proposal commits into, resolved from the files. The
         // widget names it and renders paths relative to it -- an attached
         // folder's absolute path would otherwise render as a tree from `/`.
@@ -637,7 +631,7 @@ export async function handleGitCommitProposal(
         proposalId,
         commitMessage: proposalArgs.commitMessage,
         filesToStage: proposalArgs.filesToStage,
-        workspacePath,
+        workspacePath: target.workspacePath,
       });
     } else {
       console.warn("[MCP Server] No commitWindow found to send IPC event");
@@ -673,10 +667,10 @@ export async function handleGitCommitProposal(
     };
     try {
       commitResult = await executeGitCommitAcrossRepos(
-        workspacePath,
+        target.workspacePath,
         commitMessage,
         filePaths,
-        { logContext: "[git:auto-commit]", env: getGitSubprocessEnv() }
+        { logContext: "[git:auto-commit]", env: getGitSubprocessEnv(), repoPath: target.repoPath }
       );
     } catch (error) {
       console.error("[MCP Server] Auto-commit failed:", error);
@@ -726,7 +720,7 @@ export async function handleGitCommitProposal(
       });
       commitWindow.webContents.send("mcp:gitCommitProposal", {
         proposalId,
-        workspacePath,
+        workspacePath: target.workspacePath,
         sessionId: targetSessionId,
         filesToStage: proposalArgs.filesToStage,
         commitMessage: proposalArgs.commitMessage,
@@ -984,7 +978,7 @@ export async function handleGitCommitProposal(
     // Send the proposal to the renderer
     commitWindow.webContents.send("mcp:gitCommitProposal", {
       proposalId,
-      workspacePath,
+      workspacePath: target.workspacePath,
       sessionId: sessionId || "unknown",
       filesToStage: proposalArgs.filesToStage,
       commitMessage: proposalArgs.commitMessage,

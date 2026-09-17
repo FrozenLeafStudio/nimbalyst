@@ -1,4 +1,4 @@
-import { mergeSessionIndexMetadata, type CachedSessionIndex } from './sessionIndexMetadata';
+import { createSessionQueueReconciler, mergeSessionIndexMetadata, type CachedSessionIndex } from './sessionIndexMetadata';
 import { isRetainedSession, sessionActivityAt, SESSION_TRANSCRIPT_TTL_MS } from '@nimbalyst/collab-protocol';
 /**
  * CollabV3 Sync Provider
@@ -810,6 +810,10 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
   const sessionStatusListeners = new Map<string, Set<(status: SyncStatus) => void>>();
   const sessionChangeListeners = new Map<string, Set<(change: SessionChange) => void>>();
   const sessionIndexCache = new Map<string, CachedSessionIndex>();
+  // Sending a clear does not stop an already-requested server snapshot from
+  // arriving afterward. Remember removed IDs for this provider's lifetime;
+  // durable desktop queue reconciliation handles replays after an app restart.
+  const sessionQueueReconciler = createSessionQueueReconciler();
   /**
    * Connection-scoped record of what the server is believed to hold for each
    * session's patch-projected fields. Suppresses the per-message
@@ -1614,12 +1618,13 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       if (change.entity !== 'session') continue;
       if (change.deleted) {
         sessionIndexCache.delete(change.id);
+        sessionQueueReconciler.delete(change.id);
         indexPublicationGate.invalidate(change.id);
         continue;
       }
       const cacheEntry = cacheEntries.get(`${change.id}:${change.revision}`);
       if (!cacheEntry) continue;
-      sessionIndexCache.set(change.id, cacheEntry);
+      sessionIndexCache.set(change.id, sessionQueueReconciler.merge(cacheEntry));
       indexPublicationGate.recordPublished(change.id, indexPatchSignatureForEntry(cacheEntry));
       if (!options.notifyListeners) continue;
 
@@ -1633,6 +1638,19 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           console.error('[CollabV3] Error in index change listener:', err);
         }
       });
+    }
+  }
+
+  function reconcileFetchedQueues(entries: DecryptedSessionIndexEntry[]): void {
+    // A cold bootstrap is otherwise silent. Replay only nonempty queues after
+    // the write gate opens so the owning desktop can consult its durable rows
+    // and clear prompts that ran before this provider/process started.
+    for (const entry of entries) {
+      if (!entry.queuedPrompts?.length) continue;
+      for (const callback of indexChangeListeners) {
+        try { callback(entry.sessionId, { ...sessionIndexCache.get(entry.sessionId), ...entry }); }
+        catch (error) { console.error('[CollabV3] Error reconciling fetched queue:', error); }
+      }
     }
   }
 
@@ -2403,12 +2421,13 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
                 // hand reconciliation a view the server never held, and
                 // reconciliation republishes whatever it believes is missing.
                 for (const row of snapshot.rows) {
-                  sessionIndexCache.set(row.decrypted.sessionId, row.cacheEntry);
+                  sessionIndexCache.set(row.decrypted.sessionId, sessionQueueReconciler.merge(row.cacheEntry));
                   // The server just told us what it holds; that is the value a
                   // subsequent patch has to differ from to be worth sending.
                   indexPublicationGate.recordPublished(row.decrypted.sessionId, indexPatchSignatureForEntry(row.cacheEntry));
                 }
                 personalSyncWriteGate.markVerified();
+                reconcileFetchedQueues(snapshot.rows.map(row => row.decrypted));
                 pending.resolve({
                   // The legacy response IS the complete snapshot -- that has
                   // always been its meaning, and absence-based reconciliation has
@@ -2454,7 +2473,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             const decryptedEntry = row.cacheEntry;
 
             // Cache the decrypted entry
-            sessionIndexCache.set(entry.sessionId, decryptedEntry);
+            sessionIndexCache.set(entry.sessionId, sessionQueueReconciler.merge(decryptedEntry));
             // Broadcast rows are the server's own view of the row (ours echoed
             // back, or another device's write). Track it so the gate compares
             // against current server state rather than a stale local send.
@@ -2861,6 +2880,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             const cached = sessionIndexCache.get(expired.sessionId);
             if (cached && sessionActivityAt(cached) === expired.activityAt) {
               sessionIndexCache.delete(expired.sessionId);
+              sessionQueueReconciler.delete(expired.sessionId);
               indexPublicationGate.invalidate(expired.sessionId);
             }
             break;
@@ -3598,6 +3618,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       if (change.type === 'session_deleted') {
         // Delete from index and cache
         sessionIndexCache.delete(sessionId);
+        sessionQueueReconciler.delete(sessionId);
         // A delete/recreate is not an ordinary metadata merge -- the recreated
         // row must publish in full, never be suppressed against the deleted
         // row's projection.
@@ -4000,6 +4021,9 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         if (generation !== indexConnectionGeneration) {
           return { published: false, reason: 'index connection changed before publication', retryable: true };
         }
+        if (change.type === 'metadata_updated' && change.metadata.queuedPrompts !== undefined) {
+          sessionQueueReconciler.record(sessionId, sessionIndexCache.get(sessionId)?.queuedPrompts, change.metadata.queuedPrompts);
+        }
         try {
           if (change.type !== 'metadata_updated') return await pushChange(sessionId, change);
           const socketAtStart = indexWs;
@@ -4151,6 +4175,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           const { sessions, projects } = indexMirror.snapshot();
           // Every row in a complete mirror decrypted under this key.
           personalSyncWriteGate.markVerified();
+          reconcileFetchedQueues(sessions);
           return {
             complete: true,
             indexProtocolVersion: 2,

@@ -3,6 +3,10 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('../../externalSessions/ExternalSessionService', () => ({
+  claimExternalSessionForLocalExecution: vi.fn(async () => undefined),
+}));
+
 // Test singleton coordination without initializing the host's file, auth,
 // extension, or auto-naming services through their runtime barrel imports.
 vi.mock('../HooklessAgentFileWatcher', () => ({

@@ -16,6 +16,21 @@ function makeDeps(pending: Array<{ id: string; prompt: string; createdAt: number
 }
 
 describe('publishQueuedPromptsToSync', () => {
+  it('serializes pending reads so an older snapshot cannot follow a claim clear', async () => {
+    const { deps, pushChange } = makeDeps([]);
+    let release!: (rows: Array<{ id: string; prompt: string; createdAt: number }>) => void;
+    deps.listPending.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const beforeClaim = publishQueuedPromptsToSync(deps, 'session-1');
+    await vi.waitFor(() => expect(deps.listPending).toHaveBeenCalledOnce());
+    const afterClaim = publishQueuedPromptsToSync(deps, 'session-1');
+    await Promise.resolve();
+    expect(deps.listPending).toHaveBeenCalledOnce();
+    release([{ id: 'old', prompt: 'claimed during the read', createdAt: 1 }]);
+    await Promise.all([beforeClaim, afterClaim]);
+    expect(pushChange.mock.calls.map(([, change]) => change.metadata.queuedPrompts.map((prompt: { id: string }) => prompt.id)))
+      .toEqual([['old'], []]);
+  });
+
   it('publishes the drained queue so mobile stops re-showing a prompt the desktop already ran', async () => {
     // The regression (NIM-2402): iOS publishes the prompt, desktop claims and runs
     // it, but nothing ever publishes the emptied queue back — so the desktop's

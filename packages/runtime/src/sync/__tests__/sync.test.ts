@@ -40,6 +40,26 @@ describe('SyncedSessionStore', () => {
     };
   });
 
+  it('forwards provider identity lookup with its receiver without connecting or publishing', async () => {
+    const session = { id: 'local', provider: 'claude-code', workspacePath: '/workspace', messages: [] };
+    mockBaseStore.findByProviderSessionId = vi.fn(function (this: SessionStore) {
+      expect(this).toBe(mockBaseStore);
+      return Promise.resolve(session as any);
+    });
+    const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    expect(await store.findByProviderSessionId!('claude-code', 'external', '/workspace')).toBe(session);
+    expect(mockBaseStore.findByProviderSessionId).toHaveBeenCalledWith('claude-code', 'external', '/workspace');
+    expect(mockSyncProvider.connect).not.toHaveBeenCalled();
+    expect(mockSyncProvider.pushChange).not.toHaveBeenCalled();
+    vi.mocked(mockBaseStore.findByProviderSessionId).mockRejectedValueOnce(new Error('Ambiguous identity'));
+    await expect(store.findByProviderSessionId!('claude-code', 'external', '/workspace')).rejects.toThrow('Ambiguous identity');
+  });
+
+  it('preserves an unavailable provider lookup capability on stores without it', () => {
+    const store = createSyncedSessionStore(mockBaseStore, mockSyncProvider);
+    expect(store.findByProviderSessionId).toBeUndefined();
+  });
+
   it('should pass title and provider when creating a session', async () => {
     const syncedStore = createSyncedSessionStore(mockBaseStore, mockSyncProvider, {
       autoConnect: true,

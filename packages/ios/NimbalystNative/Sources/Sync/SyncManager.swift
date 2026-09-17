@@ -343,6 +343,11 @@ public final class SyncManager: ObservableObject {
                 self?.requestIndexSync()
             }
         )
+        replication?.onRequestTimeout = { [weak self] in
+            guard let self else { return }
+            if let recover = self.onReconnectNeeded { recover() }
+            else { self.indexClient.reconnect() }
+        }
     }
 
     // MARK: - Versioned Replication Handling
@@ -408,48 +413,30 @@ public final class SyncManager: ObservableObject {
         indexClient.reportActivity()
     }
 
-    /// Update whether the app is in the foreground.
-    /// Coming to foreground counts as user activity.
-    /// When returning to foreground, reconnects WebSockets if they were dropped while backgrounded.
-    public func setAppInForeground(_ inForeground: Bool) {
+    /// AppState coordinates credentials before recovery. Direct callers retain
+    /// foreground recovery for standalone sync clients and transport tests.
+    public func setAppInForeground(_ inForeground: Bool, recover: Bool = true) {
         indexClient.setAppInForeground(inForeground)
-        // History backfill pauses while backgrounded; navigation lookups and
-        // delta catch-up continue.
+        sessionClient.setAppInForeground(inForeground)
         replication?.setForeground(inForeground)
-        if inForeground {
-            reconnectIfNeeded()
-            // Defense in depth: even if the reconnect's onConnectionStateChanged
-            // callback fires the sync request, also trigger one explicitly
-            // here. Two sync requests are harmless (database appends are
-            // idempotent on message ID), and this guarantees a catch-up
-            // happens even if the reconnect callback chain ever changes.
-            if activeSessionId != nil {
-                requestSessionSync()
-            }
+        if inForeground && recover {
+            indexClient.reconnect()
+            if activeSessionId != nil { sessionClient.reconnect() }
         }
     }
 
-    /// Reconnect the index WebSocket if it was dropped (e.g., by iOS suspending the app).
-    /// Also reconnects the active session room if one was open.
-    ///
-    /// The session client is reconnected unconditionally (not gated on
-    /// `isConnected`) because URLSessionWebSocketTask can hold a backgrounded
-    /// task in `.running` state long after the underlying TCP connection has
-    /// died, so `isConnected` would lie and the user would be left with a
-    /// silently-dead transcript channel until they navigate away and back.
-    /// Forcing a fresh socket here is cheap; missing transcript broadcasts
-    /// is not. The session client also re-issues `requestSessionSync` on
-    /// reconnect (via `onConnectionStateChanged`), so any broadcasts dropped
-    /// while we were backgrounded are caught up via the syncResponse cursor.
-    private func reconnectIfNeeded() {
-        if !indexClient.isConnected {
-            logger.info("[Reconnect] Index client disconnected, reconnecting...")
-            indexClient.reconnect()
-        }
-        if let sessionId = activeSessionId {
-            logger.info("[Reconnect] Forcing session client reconnect for \(sessionId)")
-            sessionClient.reconnect()
-        }
+    /// The app owns index retries so credentials are refreshed before connecting.
+    public var onReconnectNeeded: (@MainActor () -> Void)? {
+        didSet { indexClient.onReconnectNeeded = onReconnectNeeded }
+    }
+
+    func waitForConnection() async -> Bool { await indexClient.waitForReady() }
+
+    /// Retire transport before awaiting auth, so creation cannot use a stale
+    /// connected flag. Keep the selected session, cache and navigation intents.
+    func prepareForRecovery() {
+        indexClient.disconnect()
+        sessionClient.disconnect()
     }
 
     // MARK: - Connection
@@ -467,7 +454,6 @@ public final class SyncManager: ObservableObject {
         // previous one must never reach this account's database.
         if roomId != connectedIndexRoomId {
             connectedIndexRoomId = roomId
-            startIndexIngestionGeneration()
         }
         logger.info("[Connect] IndexRoom roomId=\(roomId), orgId=\(orgId), effectiveUserId=\(self.effectiveUserId), authUserId=\(authUserId ?? "nil"), pairingUserId=\(self.userId)")
         indexClient.connect(serverUrl: serverUrl, roomId: roomId, authToken: authToken)
@@ -560,29 +546,33 @@ public final class SyncManager: ObservableObject {
     // MARK: - Index Client Setup
 
     private func setupIndexClient() {
+        indexClient.onWillConnect = { [weak self] in
+            guard let self else { return }
+            let lookups = self.replication?.pendingNavigationIds ?? []
+            self.startIndexIngestionGeneration()
+            self.replication?.restoreNavigation(lookups)
+        }
         indexClient.onConnectionStateChanged = { [weak self] connected in
-            Task { @MainActor in
-                self?.isConnected = connected
-                if !connected {
-                    self?.sessionCreation.disconnect()
-                    self?.requests.disconnect()
-                    self?.connectedDevices = []
-                }
-                if connected {
-                    // Re-publish the optimistic local writes whose send never
-                    // landed, from the rows as they read now.
-                    self?.requests.reconnect()
-                    // Versioned replication probes first; the probe's
-                    // unknown_message_type answer is what falls back to the
-                    // legacy index request (see IndexReplicationClient).
-                    self?.indexLoadState = .loading
-                    self?.replication?.start()
-                    // ActivityKit hands out a push-to-start token once per
-                    // launch, which is routinely before the socket is up. A
-                    // token that only existed while we were disconnected is a
-                    // card that never appears, with nothing to see in any log.
-                    self?.registerDeviceTokensOnConnect()
-                }
+            self?.isConnected = connected
+            if !connected {
+                self?.sessionCreation.disconnect()
+                self?.requests.disconnect()
+                self?.connectedDevices = []
+            }
+            if connected {
+                // Re-publish the optimistic local writes whose send never
+                // landed, from the rows as they read now.
+                self?.requests.reconnect()
+                // Versioned replication probes first; the probe's
+                // unknown_message_type answer is what falls back to the
+                // legacy index request (see IndexReplicationClient).
+                self?.indexLoadState = .loading
+                self?.replication?.start()
+                // ActivityKit hands out a push-to-start token once per
+                // launch, which is routinely before the socket is up. A
+                // token that only existed while we were disconnected is a
+                // card that never appears, with nothing to see in any log.
+                self?.registerDeviceTokensOnConnect()
             }
         }
 
@@ -705,8 +695,8 @@ public final class SyncManager: ObservableObject {
             handleIndexPageResponse(response, decoded: decoded)
         case .changesAvailable(let revision):
             handleIndexChangesAvailable(revision: revision)
-        case .undecodable(let type):
-            logger.warning("Could not decode index message\(type.map { " of type \($0)" } ?? "")")
+        case .undecodable(let type, let detail):
+            logger.warning("Could not decode index message\(type.map { " of type \($0)" } ?? ""): \(detail, privacy: .public)")
             if type == "indexSyncResponse" || type == "indexPageResponse" {
                 indexLoadState = .failed
             }
@@ -823,6 +813,17 @@ public final class SyncManager: ObservableObject {
         await voiceTools.call(toolName: toolName, argsJson: argsJson, projectId: projectId)
     }
 
+    func callLiveVoiceTool(toolName: String, argsJson: String, scope: VoiceRelayScope) async -> VoiceToolCallResult {
+        guard connectedDevices.contains(where: { $0.deviceId == scope.hostDeviceId && ($0.type == "desktop" || $0.type == "headless") }) else {
+            return .init(success: false, result: nil, error: "The selected computer is unavailable.")
+        }
+        guard let data = try? JSONEncoder().encode(VoiceRelayRequest(scope: scope, tool: toolName, arguments: argsJson)),
+              let json = String(data: data, encoding: .utf8) else {
+            return .init(success: false, result: nil, error: "Could not encode voice request.")
+        }
+        return await voiceTools.call(toolName: "nimbalyst_live_v1", argsJson: json, projectId: scope.projectId, scope: scope)
+    }
+
     private func handleVoiceToolResponse(_ data: Data) {
         guard let requestId = voiceTools.receive(data) else { return }
         requests.resolve(requestId: requestId)
@@ -875,12 +876,10 @@ public final class SyncManager: ObservableObject {
 
     private func setupSessionClient() {
         sessionClient.onConnectionStateChanged = { [weak self] connected in
-            Task { @MainActor in
-                guard let self = self else { return }
-                self.logger.info("sessionClient connection state: \(connected) (activeSessionId=\(self.activeSessionId ?? "nil"))")
-                if connected {
-                    self.requestSessionSync()
-                }
+            guard let self = self else { return }
+            self.logger.info("sessionClient connection state: \(connected) (activeSessionId=\(self.activeSessionId ?? "nil"))")
+            if connected {
+                self.requestSessionSync()
             }
         }
 
@@ -1296,7 +1295,8 @@ public final class SyncManager: ObservableObject {
 
     /// Send a prompt to the current session via the queued prompts system.
     /// Desktop picks up prompts from index_update broadcasts (not session room messages).
-    public func sendPrompt(sessionId: String, text: String, attachments: [PendingAttachment] = []) async throws {
+    @discardableResult
+    public func sendPrompt(sessionId: String, text: String, attachments: [PendingAttachment] = [], promptId: String = UUID().uuidString) async throws -> String {
         logger.info("[SendPrompt] Starting: sessionId=\(sessionId), textLength=\(text.count), attachments=\(attachments.count), wsConnected=\(self.indexClient.isConnected), roomOrgId=\(self.orgId ?? "nil")")
         guard indexClient.isConnected else {
             logger.error("[SendPrompt] WebSocket not connected - cannot send prompt")
@@ -1308,8 +1308,6 @@ public final class SyncManager: ObservableObject {
         }
 
         let now = Int(Date().timeIntervalSince1970 * 1000)
-        let promptId = UUID().uuidString
-
         // Encrypt the prompt text
         let encryptedPrompt = try crypto.encrypt(plaintext: text)
 
@@ -1343,33 +1341,12 @@ public final class SyncManager: ObservableObject {
         )
         queuedPrompt.encryptedAttachments = encryptedAttachments
 
-        // Build the encrypted project ID for the index entry
-        let encryptedProjectId = try crypto.encryptProjectId(session.projectId)
-
         // Send index_update with queued prompt via the index room
-        let indexEntry = IndexUpdateEntry(
-            sessionId: sessionId,
-            encryptedProjectId: encryptedProjectId,
-            projectIdIv: CryptoManager.projectIdIvBase64,
-            encryptedTitle: session.titleEncrypted,
-            titleIv: session.titleIv,
-            provider: session.provider ?? "claude-code",
-            model: session.model,
-            mode: session.mode,
+        let json = try SessionIndexUpdates.prompt(
+            session: session, prompt: queuedPrompt,
             messageCount: (try? database.messages(forSession: sessionId).count) ?? 0,
-            lastMessageAt: now,
-            createdAt: session.createdAt,
-            updatedAt: now,
-            isExecuting: session.isExecuting,
-            queuedPromptCount: 1,
-            encryptedQueuedPrompts: [queuedPrompt]
+            crypto: crypto
         )
-
-        let indexMessage = IndexUpdateMessage(session: indexEntry)
-        let data = try JSONEncoder().encode(indexMessage)
-        guard let json = String(data: data, encoding: .utf8) else {
-            throw PromptSendError.encodingFailed
-        }
 
         // Send via WebSocket with completion handler to detect failures
         let sendResult = await withCheckedContinuation { continuation in
@@ -1395,6 +1372,7 @@ public final class SyncManager: ObservableObject {
             createdAt: now
         )
         try database.appendMessage(localMessage)
+        return promptId
     }
 
     // MARK: - Interactive Prompt Responses
