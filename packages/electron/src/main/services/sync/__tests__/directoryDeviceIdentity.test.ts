@@ -14,6 +14,8 @@ import { join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { directoryDeviceId } from "../directoryDeviceIdentity";
+import { asPersonalMemberId } from "@nimbalyst/runtime/auth/jwtScopes";
+const account = asPersonalMemberId("account");
 const roots: string[] = [];
 afterEach(() =>
   roots
@@ -29,15 +31,15 @@ function root() {
 it("shares identity through symlinks and directory moves, but separates copied profiles", () => {
   const base = root();
   const original = join(base, "original");
-  const first = directoryDeviceId(original, "account");
+  const first = directoryDeviceId(original, account);
   symlinkSync(original, join(base, "alias"), "dir");
-  expect(directoryDeviceId(join(base, "alias"), "account")).toBe(first);
+  expect(directoryDeviceId(join(base, "alias"), account)).toBe(first);
   cpSync(original, join(base, "copy"), { recursive: true });
-  expect(directoryDeviceId(join(base, "copy"), "account")).not.toBe(first);
+  expect(directoryDeviceId(join(base, "copy"), account)).not.toBe(first);
   renameSync(original, join(base, "moved"));
-  expect(directoryDeviceId(join(base, "moved"), "account")).toBe(first);
+  expect(directoryDeviceId(join(base, "moved"), account)).toBe(first);
   writeFileSync(join(base, "moved", "computer-identity"), "broken");
-  expect(() => directoryDeviceId(join(base, "moved"), "account")).toThrow(
+  expect(() => directoryDeviceId(join(base, "moved"), account)).toThrow(
     "restore"
   );
   expect(readFileSync(join(base, "moved", "computer-identity"), "utf8")).toBe(
@@ -67,5 +69,5 @@ it("publishes one complete identity across concurrent fresh processes", async ()
     )
   );
   expect(new Set(runs.map((r) => r.stdout)).size).toBe(1);
-  expect(runs[0].stdout).toBe(directoryDeviceId(dir, "account"));
+  expect(runs[0].stdout).toBe(directoryDeviceId(dir, account));
 });

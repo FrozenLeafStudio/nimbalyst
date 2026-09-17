@@ -12,11 +12,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import type { PersonalMemberId } from "@nimbalyst/runtime/auth/jwtScopes";
 
 /** Directory-owned, account-scoped identity. Never adopts the ambiguous hostname ID. */
 export function directoryDeviceId(
   userData: string,
-  personalMemberId: string
+  personalMemberId: PersonalMemberId
 ): string {
   if (!userData || !personalMemberId)
     throw new Error(
