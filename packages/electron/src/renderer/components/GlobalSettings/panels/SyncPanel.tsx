@@ -1,3 +1,4 @@
+import { DeviceInventoryPanel } from './DeviceInventoryPanel';
 import React, { useState, useEffect } from 'react';
 import { usePostHog } from 'posthog-js/react';
 import { useAtom, useAtomValue } from 'jotai';
@@ -18,32 +19,6 @@ import { AccountOrgList } from './AccountOrgList';
 import { groupOrganizationsByAccount } from './accountOrganizations';
 import { applyProjectSyncChange, persistProjectSyncSelection, selectionState } from './projectSyncSelection';
 
-/** Format a timestamp as relative time (e.g., "5 minutes ago") */
-function formatRelativeTime(timestamp: number): string {
-  const seconds = Math.floor((Date.now() - timestamp) / 1000);
-
-  if (seconds < 60) {
-    return 'just now';
-  }
-
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) {
-    return `${minutes}m ago`;
-  }
-
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) {
-    return `${hours}h ago`;
-  }
-
-  const days = Math.floor(hours / 24);
-  if (days < 7) {
-    return `${days}d ago`;
-  }
-
-  return new Date(timestamp).toLocaleDateString();
-}
-
 // SyncConfig is now exported from appSettings.ts
 // Re-export for backward compatibility
 export type { SyncConfig } from '../../../store/atoms/appSettings';
@@ -51,18 +26,6 @@ export type { SyncConfig } from '../../../store/atoms/appSettings';
 interface Project {
   path: string;
   name: string;
-}
-
-interface DeviceInfo {
-  deviceId: string;
-  name: string;
-  type: 'desktop' | 'mobile' | 'tablet' | 'unknown';
-  platform: string;
-  appVersion?: string;
-  connectedAt: number;
-  lastActiveAt: number;
-  isOnline?: boolean;
-  lastSeenAt?: number;
 }
 
 // NOTE: Props have been removed - SyncPanel now uses Jotai atoms directly.
@@ -93,9 +56,6 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [showQRModal, setShowQRModal] = useState(false);
   const [pairError, setPairError] = useState<string | null>(null);
-  const [connectedDevices, setConnectedDevices] = useState<DeviceInfo[]>([]);
-  const [devicesLoading, setDevicesLoading] = useState(false);
-  const [devicesError, setDevicesError] = useState<string | null>(null);
   const [, setAuthError] = useState<string | null>(null);
   const stytchAuth = useAtomValue(stytchAuthAtom) ?? { isAuthenticated: false, user: null };
 
@@ -181,43 +141,6 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
     }
     loadProjects();
   }, []);
-
-  // Load connected devices when sync is enabled
-  const loadDevices = async () => {
-    if (!config.enabled || !effectiveServerUrl) {
-      setConnectedDevices([]);
-      return;
-    }
-
-    setDevicesLoading(true);
-    setDevicesError(null);
-    try {
-      const result = await window.electronAPI.invoke('sync:get-devices');
-      if (result.success) {
-        setConnectedDevices(result.devices || []);
-      } else {
-        setDevicesError(result.error || 'Failed to load devices');
-        setConnectedDevices([]);
-      }
-    } catch (error) {
-      console.error('Failed to load devices:', error);
-      setDevicesError('Failed to load devices');
-      setConnectedDevices([]);
-    } finally {
-      setDevicesLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (config.enabled && effectiveServerUrl) {
-      loadDevices();
-      const interval = setInterval(loadDevices, 30000);
-      return () => clearInterval(interval);
-    } else {
-      setConnectedDevices([]);
-      return undefined;
-    }
-  }, [config.enabled, effectiveServerUrl]);
 
   // Single write path for the project multi-select: one checkbox and
   // "Select all" go through the same helper and the same one-shot IPC, so a
@@ -889,49 +812,7 @@ export function SyncPanel({ section }: { section: PersonalSyncSection }) {
         </div>
       </div>
 
-      {/* Paired Devices */}
-      <div className={`sync-devices-section provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)] last:border-b-0 last:mb-0 last:pb-0 ${sectionClass('devices')}`}>
-        <h4 className="provider-panel-section-title text-[15px] font-semibold mb-3 text-[var(--nim-text)]">
-          Paired devices
-          <button
-            onClick={loadDevices}
-            disabled={devicesLoading}
-            className={`ml-2 px-1.5 py-0.5 text-[10px] bg-nim-secondary border border-nim rounded text-nim-faint ${
-              devicesLoading ? 'cursor-wait' : 'cursor-pointer hover:bg-nim-hover'
-            }`}
-          >
-            Refresh
-          </button>
-        </h4>
-        <div className="mt-2">
-          {connectedDevices.length === 0 && !devicesLoading && (
-            <div className="text-[12px] text-nim-faint px-2.5 py-2">
-              No paired devices. Use &quot;Pair Device&quot; to connect a mobile device.
-            </div>
-          )}
-          {connectedDevices.map((device) => (
-            <div
-              key={device.deviceId}
-              className="flex items-center gap-2.5 px-2.5 py-2 bg-nim-secondary rounded-md mb-1.5 last:mb-0"
-            >
-              <div className={`w-2 h-2 rounded-full ${device.isOnline ? 'bg-green-500' : 'bg-neutral-500'}`} />
-              <div className="flex-1">
-                <div className="text-[13px] text-nim">
-                  {device.name}
-                </div>
-                <div className="text-[11px] text-nim-faint">
-                  {device.platform}
-                  {device.isOnline
-                    ? ` - connected ${formatRelativeTime(device.connectedAt)}`
-                    : device.lastSeenAt
-                      ? ` - last seen ${formatRelativeTime(device.lastSeenAt)}`
-                      : ''}
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
+      {section === 'devices' && <DeviceInventoryPanel key={`${config.personalOrgId ?? ''}:${stytchAuth.user?.user_id ?? ''}`} enabled={config.enabled && !!effectiveServerUrl} />}
 
       {/* Encryption footer */}
       <div className={`sync-mobile-section provider-panel-section py-4 ${sectionClass('mobile')}`}>

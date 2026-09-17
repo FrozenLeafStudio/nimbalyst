@@ -96,6 +96,7 @@ import {
 import {
   handleToolPermissionFallback as handleToolPermissionFallbackHelper,
   handleToolPermissionWithService as handleToolPermissionWithServiceHelper,
+  type ToolPermissionOptions,
 } from './claudeCode/toolAuthorization';
 import { ClaudeCodeDeps, type HistoryManagerPort } from './claudeCode/dependencyInjection';
 import { resolvePermissionMode, type PromptStreamController } from './claudeCode/sdkOptionsBuilder';
@@ -3275,7 +3276,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     return async (
       toolName: string,
       input: any,
-      options: { signal: AbortSignal; suggestions?: any[]; toolUseID?: string }
+      options: ToolPermissionOptions
     ): Promise<{ behavior: 'allow' | 'deny'; updatedInput?: any; message?: string }> => {
       const callNum = ++canUseToolCallCount;
       const callStart = Date.now();
@@ -3329,7 +3330,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   private async resolveImmediateToolDecision(
     toolName: string,
     input: any,
-    options: { signal: AbortSignal; suggestions?: any[]; toolUseID?: string },
+    options: ToolPermissionOptions,
     sessionId: string | undefined,
     pathForTrust: string | undefined
   ): Promise<{ behavior: 'allow' | 'deny'; updatedInput?: any; message?: string } | null> {
@@ -3360,7 +3361,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   private async handleToolPermissionWithService(
     toolName: string,
     input: any,
-    options: { signal: AbortSignal; suggestions?: any[]; toolUseID?: string },
+    options: ToolPermissionOptions,
     sessionId: string,
     workspacePath: string,
     permissionsPath: string | undefined,
@@ -3388,7 +3389,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   private async handleToolPermissionFallback(
     toolName: string,
     input: any,
-    options: { signal: AbortSignal; suggestions?: any[]; toolUseID?: string },
+    options: ToolPermissionOptions,
     sessionId: string | undefined,
     workspacePath: string | undefined
   ): Promise<{ behavior: 'allow' | 'deny'; updatedInput?: any; message?: string }> {

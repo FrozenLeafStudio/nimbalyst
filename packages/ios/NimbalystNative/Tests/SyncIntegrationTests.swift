@@ -299,6 +299,29 @@ final class SyncIntegrationTests: XCTestCase {
         return try JSONDecoder().decode(ClientMetadata.self, from: Data(plaintext.utf8)).draftInput
     }
 
+    func testMobileEditsDoNotOverwriteDesktopExecutionState() throws {
+        for executing in [false, true] {
+            let session = Session(id: "status-owner", projectId: "/test/project",
+                                  isExecuting: executing, createdAt: 1, updatedAt: 2)
+            let encrypted = try crypto.encrypt(plaintext: "start work")
+            let prompt = EncryptedQueuedPrompt(id: "outgoing", encryptedPrompt: encrypted.encrypted,
+                                              iv: encrypted.iv, timestamp: 3, source: "keyboard")
+            let updates = [
+                try SessionIndexUpdates.prompt(session: session, prompt: prompt, messageCount: 0, crypto: crypto),
+                try SessionIndexUpdates.draft(session: session, draft: "", draftUpdatedAt: 3, messageCount: 0, crypto: crypto),
+                try SessionIndexUpdates.readReceipt(session: session, lastReadAt: 3, crypto: crypto),
+                try SessionIndexUpdates.parent(session: session, parentSessionId: "parent", crypto: crypto),
+            ]
+            for json in updates {
+                let update = try JSONDecoder().decode(IndexUpdateMessage.self, from: Data(json.utf8))
+                XCTAssertNil(update.session.isExecuting, "A stale phone snapshot must not publish desktop-owned status")
+            }
+            let submitted = try JSONDecoder().decode(IndexUpdateMessage.self, from: Data(updates[0].utf8)).session
+            XCTAssertEqual(submitted.encryptedQueuedPrompts?.first?.id, "outgoing")
+            XCTAssertEqual(submitted.queuedPromptCount, 1)
+        }
+    }
+
     /// The draft is committed locally before the send, so a failed send is a
     /// divergence the user has to be told about -- and the replay must publish
     /// what the row says now, not the bytes that failed.

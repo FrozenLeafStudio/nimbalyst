@@ -1,3 +1,5 @@
+import { decodeMobileLiveRequest } from "../voice/mobileLiveRelay";
+import { handleMobileLiveTool } from "../voice/mobileLiveTools";
 import { sessionInbox } from './sessionInboxService';
 import { applyRemoteReadReceipt } from '../../ipc/ReadReceiptHandlers';
 import { applyRemoteTrackerPersonalState } from '../../ipc/TrackerPersonalStateHandlers';
@@ -258,6 +260,9 @@ export class MobileSyncHandler {
       // we run the tool (gated to voiceAgent:true tools) and return the result.
       if (syncProvider.onVoiceToolRequest && syncProvider.sendVoiceToolResponse) {
         syncProvider.onVoiceToolRequest(async (request) => {
+          const live = request.toolName === 'nimbalyst_live_v1'
+            ? decodeMobileLiveRequest(request.argsJson, request.projectId, getLocalHostDeviceId()) : null;
+          if (request.toolName === 'nimbalyst_live_v1' && !live) return;
           // Deduplicate - the same request can be delivered more than once.
           if (this.processingMobileSessionRequests.has(request.requestId)) {
             return;
@@ -270,7 +275,7 @@ export class MobileSyncHandler {
             // register a second handler for '__ELECTRON_LOG__'" crash. See the
             // "No Dynamic Imports in Electron Main Process" rule in CLAUDE.md.
             // request.projectId is the desktop workspace path.
-            const outcome = await handleMobileVoiceToolCall(
+            const outcome = live ? await handleMobileLiveTool(live) : await handleMobileVoiceToolCall(
               request.toolName,
               request.argsJson,
               request.projectId,
@@ -278,7 +283,7 @@ export class MobileSyncHandler {
             await syncProvider.sendVoiceToolResponse!({
               requestId: request.requestId,
               success: outcome.success,
-              resultJson: outcome.result ? JSON.stringify({ result: outcome.result }) : undefined,
+              resultJson: live ? JSON.stringify({ scope: live.scope, ...outcome }) : outcome.result ? JSON.stringify({ result: outcome.result }) : undefined,
               error: outcome.error,
             });
           } catch (error) {
@@ -286,7 +291,8 @@ export class MobileSyncHandler {
             await syncProvider.sendVoiceToolResponse!({
               requestId: request.requestId,
               success: false,
-              error: error instanceof Error ? error.message : String(error),
+              error: live ? undefined : error instanceof Error ? error.message : String(error),
+              resultJson: live ? JSON.stringify({ scope: live.scope, success: false, error: 'The selected computer could not execute the voice action.' }) : undefined,
             });
           } finally {
             this.releaseMobileRequestAfterGrace(request.requestId);

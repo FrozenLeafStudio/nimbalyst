@@ -84,12 +84,58 @@ final class SessionIndexRoundTripTests: XCTestCase {
             XCTFail("Round-trip condition timed out. \(fixtureDiagnostics())", file: file, line: line)
             if let snapshot = try? await control("/state") {
                 print("Fixture server head: \(snapshot["revision"] ?? "missing")")
+                let traffic = snapshot["traffic"] as? [[String: Any]] ?? []
+                print("Fixture traffic: \(traffic.map { "\($0["role"] ?? ""):\($0["direction"] ?? ""):\(($0["message"] as? [String: Any])?["type"] ?? "")" })")
             }
             throw FixtureFailure.timeout
         }
     }
 
     private enum FixtureFailure: Error { case timeout, exited }
+
+    func testForegroundRecoversStaleRunningIndexWithoutAnotherBroadcast() async throws {
+        manager.setAppInForeground(false)
+        let state = try await control("/dormant")
+        let rows = try XCTUnwrap(state["rows"] as? [[String: Any]])
+        XCTAssertTrue(rows.contains { $0["id"] as? String == "dormant-session" }, "Desktop publication must reach the server")
+        XCTAssertNil(try database.session(byId: "dormant-session"))
+        XCTAssertTrue(manager.isConnected, "Reproduce the stale connected flag")
+        manager.setAppInForeground(true)
+        try await eventually { try self.database.session(byId: "dormant-session")?.titleDecrypted == "Created while asleep" }
+        XCTAssertEqual(try database.sessions(forProject: "/roundtrip").filter { $0.id == "dormant-session" }.count, 1)
+    }
+
+    func testCredentialRecoveryClearsReadinessWithoutClearingCachedSessions() async throws {
+        try await control("/revision-seed")
+        try await eventually { try self.database.session(byId: "revision-session") != nil }
+        manager.prepareForRecovery()
+        XCTAssertFalse(manager.isConnected, "Creation must wait while recovery refreshes credentials")
+        XCTAssertEqual(try database.session(byId: "revision-session")?.titleDecrypted, "Older title")
+        connect()
+        try await eventually { self.manager.isConnected && self.manager.indexCoverage.historyComplete }
+        XCTAssertEqual(try database.session(byId: "revision-session")?.titleDecrypted, "Older title")
+    }
+
+    func testSilentHandshakeFailsWithoutFalseReadinessAndNextConnectionRecovers() async throws {
+        try await control("/silent-next")
+        let client = WebSocketClient(readinessTimeout: 0.1)
+        var connections = 0
+        var failures = 0
+        client.onConnectionStateChanged = { if $0 { connections += 1 } }
+        client.onReconnectNeeded = { failures += 1 }
+        defer { client.disconnect() }
+        client.connect(serverUrl: server, roomId: "index", authToken: "phone")
+        XCTAssertFalse(client.isConnected, "Starting a URLSession task is not readiness")
+        try await eventually { failures == 1 }
+        XCTAssertEqual(connections, 0)
+        XCTAssertFalse(client.isConnected)
+        client.reconnect()
+        try await eventually { connections == 1 }
+        // Exercise the old socket's cancellation callback and cancelled deadline.
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertTrue(client.isConnected)
+        XCTAssertEqual(failures, 1)
+    }
 
     func testQueuedPromptClearOverlappingPatchAndOlderReconnectPage() async throws {
         let seeded = try await control("/seed")
@@ -182,6 +228,8 @@ final class SessionIndexRoundTripTests: XCTestCase {
         let publish = try XCTUnwrap(inbound.firstIndex { $0["type"] as? String == "indexBatchUpdate" || $0["type"] as? String == "indexUpdate" })
         let ack = try XCTUnwrap(inbound.firstIndex { $0["type"] as? String == "createSessionResponse" })
         XCTAssertLessThan(publish, ack, "Fixture publish barrier must precede its ack; shipped desktop handler is not covered")
+        manager.setAppInForeground(false)
+        manager.setAppInForeground(true)
         try await control("/release")
         try await eventually { completions == 1 }
         XCTAssertTrue(existedAtCompletion, "Completion must observe the committed GRDB row")
@@ -190,6 +238,11 @@ final class SessionIndexRoundTripTests: XCTestCase {
         try await control("/duplicate-ack")
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(completions, 1)
+        let final = try await control("/state")
+        let finalTraffic = try XCTUnwrap(final["traffic"] as? [[String: Any]])
+        XCTAssertEqual(finalTraffic.filter {
+            $0["direction"] as? String == "in" && ($0["message"] as? [String: Any])?["type"] as? String == "createSessionRequest"
+        }.count, 1, "Recovery must not replay session creation")
     }
 }
 #endif

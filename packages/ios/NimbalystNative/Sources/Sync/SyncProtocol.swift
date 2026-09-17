@@ -285,6 +285,8 @@ struct ProjectBroadcast: Codable {
 
 /// Device info for presence.
 public struct DeviceInfo: Codable {
+    /// Personal inventory visibility; does not affect execution ownership.
+    public var inventoryHidden: Bool?
     public let deviceId: String
     public let name: String
     // Intentionally a String rather than a closed enum so shipped clients keep
@@ -428,6 +430,9 @@ public struct SyncedSettings: Codable {
 
 /// Voice mode settings synced from desktop.
 public struct SyncedVoiceModeSettings: Codable {
+    public var engine: String? = nil
+    public var liveVoice: String? = nil
+    public var liveControllerModel: String? = nil
     public let voice: String?
     public let submitDelayMs: Int?
 }

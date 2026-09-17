@@ -75,6 +75,9 @@ enum SettingsSyncApplier {
         if settings.voiceMode != nil || settings.preferredAgentLanguage != nil {
             var currentSettings = VoiceModeSettings.load()
             if let voiceMode = settings.voiceMode {
+                if let engine = voiceMode.engine { currentSettings.engine = engine }
+                if let voice = voiceMode.liveVoice { currentSettings.liveVoice = voice }
+                if let model = voiceMode.liveControllerModel { currentSettings.liveControllerModel = model }
                 if let voice = voiceMode.voice {
                     currentSettings.voice = voice
                 }

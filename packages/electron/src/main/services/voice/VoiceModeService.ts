@@ -1,3 +1,6 @@
+import { claimDesktopVoiceEvent, type DesktopVoiceClaim } from './mobileVoiceEvents';
+import { voicePresentationAuthority, registerDesktopVoicePresence } from './voicePresentationAuthority';
+import { getLocalHostDeviceId } from '../ai/sessionHostAttribution';
 import { VoiceStartupTiming } from '../../../shared/voiceStartupTiming';
 import { getProviderCredentials } from '../credentials/providerCredentials';
 /**
@@ -64,6 +67,8 @@ type VoiceEngineId = 'realtime' | 'live';
 
 // Store active voice session info
 interface VoiceSession {
+  presentationClaims?: DesktopVoiceClaim[];
+  presentationRenewal?: ReturnType<typeof setInterval>;
   poc: VoiceEngineRegistrar;
   /** Which transport `poc` actually is. Stamped onto every usage report. */
   engineId: VoiceEngineId;
@@ -108,6 +113,7 @@ function sendSessionEndedEvent(reason: string, startTime: number): void {
 }
 
 let activeVoiceSession: VoiceSession | null = null;
+registerDesktopVoicePresence(() => activeVoiceSession?.engineId === 'realtime');
 
 /** Monotonic across activations; never reused, so a stale claim can never match. */
 let voiceConversationGeneration = 0;
@@ -451,13 +457,58 @@ function requestVoicePromptSubmission(
  * Speak an agent's question, restoring the voice session first if it is asleep.
  * The decision lives in ./voiceWakeDelivery.ts; this binds it to the session.
  */
-function deliverInteractivePromptTo(
+async function deliverInteractivePromptTo(
   session: VoiceSession,
-  data: { promptId: string; promptType: string; description: string },
+  data: { promptId: string; promptType: string; description: string; sourceSessionId: string },
 ): Promise<boolean> {
+  if (!await claimDesktopAnnouncement(session, data.sourceSessionId, data.promptId)) return false;
   return deliverInteractivePrompt(session.poc, data, {
     isCurrent: () => activeVoiceSession === session,
   });
+}
+
+function armPresentationDeadline(session: VoiceSession, claim: DesktopVoiceClaim): void {
+  const deadline = claim.expiresAt;
+  setTimeout(() => {
+    if (activeVoiceSession !== session || claim.expiresAt !== deadline) return;
+    // Clear audio already enqueued, independently of whether another delta arrives.
+    session.window.webContents.send('voice-mode:interrupt', { sessionId: session.sessionId });
+    stopVoiceSession();
+  }, Math.max(0, deadline - Date.now() - 1000));
+}
+
+async function claimDesktopAnnouncement(session: VoiceSession, sessionId: string, promptId?: string): Promise<boolean> {
+  if (session.engineId !== 'live') return true;
+  const host = getLocalHostDeviceId();
+  if (!host || !session.workspacePath) return false;
+  try {
+    const claim = await claimDesktopVoiceEvent(host, session.workspacePath, sessionId, promptId);
+    if (activeVoiceSession !== session || claim === null) return false;
+    if (claim) {
+      (session.presentationClaims ??= []).push(claim);
+      armPresentationDeadline(session, claim);
+      if (!session.presentationRenewal) session.presentationRenewal = setInterval(() => {
+        if (activeVoiceSession !== session || !session.presentationClaims?.length) {
+          clearInterval(session.presentationRenewal);
+          session.presentationRenewal = undefined;
+          return;
+        }
+        for (const current of session.presentationClaims) {
+          if (!voicePresentationAuthority.valid(current.key, current.deviceId, current.token)) {
+            session.window?.webContents.send('voice-mode:interrupt', { sessionId: session.sessionId });
+            stopVoiceSession();
+            break;
+          }
+          const renewed = voicePresentationAuthority.claim(current.key, current.deviceId);
+          if (renewed) { current.expiresAt = renewed.expiresAt; armPresentationDeadline(session, current); }
+        }
+      }, 10_000);
+    }
+    return true;
+  } catch {
+    // No authority means no permission to announce on both devices.
+    return false;
+  }
 }
 
 /**
@@ -1301,7 +1352,12 @@ export function initVoiceModeService() {
 
         registerVoiceEngine(engine, {
           events: {
-            audio: (audioBase64) => send('voice-mode:audio-received', { sessionId: currentSessionId(), audioBase64 }),
+            audio: (audioBase64) => {
+              if (!activeVoiceSession || activeVoiceSession.poc !== engine) return;
+              const claims = activeVoiceSession.presentationClaims ?? [];
+              if (claims.some(claim => !voicePresentationAuthority.valid(claim.key, claim.deviceId, claim.token))) return;
+              send('voice-mode:audio-received', { sessionId: currentSessionId(), audioBase64 });
+            },
             assistantText: (text) => {
               // What the assistant just said is what an echo of it will look
               // like; the barge-in decision is a content comparison.
@@ -2020,12 +2076,12 @@ export function initVoiceModeService() {
     );
   });
 
-  function announceAuthorizedCompletion(session: VoiceSession, data: {
+  async function announceAuthorizedCompletion(session: VoiceSession, data: {
     sessionId: string;
     taskId?: string | null;
     summary?: string;
     error?: string;
-  }): void {
+  }): Promise<void> {
     const completion = buildVoiceTaskCompletion(data);
 
     // Realtime can keep the submit_agent_prompt call open; resolving it hands
@@ -2061,6 +2117,8 @@ export function initVoiceModeService() {
       const spoken = completion.deferredResult.success
         ? completion.deferredResult.summary
         : `failed: ${completion.deferredResult.error}`;
+      if (taskId && !await claimDesktopAnnouncement(session, data.sessionId)) return;
+      if (activeVoiceSession !== session) return;
       if (taskId && tasks.announceTaskCompletion(taskId, spoken)) return;
       if (taskId) {
         // Refused: duplicate, unknown, or superseded. Never reworded into a
@@ -2079,6 +2137,7 @@ export function initVoiceModeService() {
       }
     }
 
+    if (!await claimDesktopAnnouncement(session, data.sessionId)) return;
     void deliverVoiceAnnouncement(session.poc, completion.fallbackMessage, {
       isCurrent: () => activeVoiceSession === session,
     }).then(delivered => {
@@ -2101,6 +2160,8 @@ export function initVoiceModeService() {
     generation?: number;
   }) => {
     if (!authorizeVoiceMessage('voice-mode:playback-active', event, data ?? {})) return;
+    // A session-wide drain cannot prove which notification was spoken. Keep
+    // claims renewable; only an explicit source receipt finalizes presentation.
     activeVoiceSession!.poc.setPlaybackActive(data.active);
     // The barge-in coordinator needs the same fact: whether there is currently
     // audio worth flushing is the difference between a real interruption and
@@ -2172,6 +2233,7 @@ export function initVoiceModeService() {
           promptId: data.promptId,
           promptType: data.promptType,
           description: data.description,
+          sourceSessionId: verdict.sessionId!,
         });
       },
     );

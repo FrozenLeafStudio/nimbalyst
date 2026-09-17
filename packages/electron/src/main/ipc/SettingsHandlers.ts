@@ -74,7 +74,7 @@ import {
     switchPersonalSyncProfile,
 } from '../services/PersonalSyncProfiles';
 import { purgeOfflineCollabAccounts } from '../services/CollabOfflineAccountLifecycle';
-import { listPersonalSyncDevices } from '../services/PersonalSyncDevicesService';
+import { listPersonalSyncDevices, updatePersonalSyncDevices } from '../services/PersonalSyncDevicesService';
 import { recordProjectWalkOriginator } from '../services/ProjectWalkClaim';
 
 // Track if we've subscribed to sync status changes
@@ -1043,6 +1043,7 @@ export function registerSettingsHandlers() {
     // URL and personal-org JWT. The stored config intentionally omits serverUrl
     // when production is selected, and a team JWT targets a different member.
     safeHandle('sync:get-devices', listPersonalSyncDevices);
+    safeHandle('sync:update-devices', (_event, update) => updatePersonalSyncDevices(update));
 
     // Get sync status for the navigation gutter button
     safeHandle('sync:get-status', async (_event, workspacePath?: string) => {

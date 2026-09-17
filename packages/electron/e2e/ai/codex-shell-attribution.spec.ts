@@ -6,7 +6,7 @@ import { launchElectronApp, waitForAppReady } from '../helpers';
 import { dismissAPIKeyDialog } from '../utils/testHelpers';
 test.skip(() => !process.env.RUN_REAL_CODEX, 'Requires Codex CLI auth + RUN_REAL_CODEX=1');
 test.setTimeout(240_000);
-test('production Codex shell hooks persist sequential owners in an isolated app', async ({}, testInfo) => {
+test('production Codex shell hooks persist sequential owners after a failed MCP lookup', async ({}, testInfo) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'nim-shell-implementation-')),
     workspace = path.join(root, 'workspace'),
     database = path.join(root, 'database'),
@@ -20,6 +20,7 @@ test('production Codex shell hooks persist sequential owners in an isolated app'
   await fs.chmod(path.join(codexHome, 'auth.json'), 0o600);
   await fs.writeFile(path.join(workspace, 'shared.ts'), '// baseline\n');
   await fs.writeFile(path.join(workspace, 'readonly.ts'), '// unchanged\n');
+  await fs.writeFile(path.join(workspace, 'after-failure.ts'), '// baseline\n');
   let app: Awaited<ReturnType<typeof launchElectronApp>> | undefined;
   const evidence: any = { root, owners: [] };
   try {
@@ -72,7 +73,7 @@ test('production Codex shell hooks persist sequential owners in an isolated app'
         async ({ workspace, id, marker }) =>
           (window as any).electronAPI.invoke(
             'ai:sendMessage',
-            `This is an isolated file tracking acceptance fixture. Use your normal shell tool to execute exactly: printf '// ${marker}\\n' > shared.ts; cat readonly.ts; Do not apply a patch, inspect other files, commit, or change anything else. End with DONE.`,
+            `This is an isolated file tracking acceptance fixture. In strict sequence in this single turn: 1. Use your normal shell tool to execute exactly: printf '// ${marker}\\n' > shared.ts; cat readonly.ts; 2. Call the nimbalyst-trackers tracker_get MCP tool with id "shell-attribution-fixture-missing-item" exactly once. The item does not exist; its error is expected. 3. Continue despite that error and execute: printf '// ${marker}\\n' > after-failure.ts; Do not apply a patch, inspect other files, commit, retry the lookup, or change anything else. End with DONE.`,
             undefined,
             id,
             workspace
@@ -91,6 +92,32 @@ test('production Codex shell hooks persist sequential owners in an isolated app'
       evidence[marker + 'Links'] = links;
       expect(links.map((x: any) => x.id).sort()).toEqual([...evidence.owners].sort());
       expect(links.every((x: any) => x.fileAttribution === 'inferred' && x.lastFileEditAt > 0)).toBe(true);
+      expect(await fs.readFile(path.join(workspace, 'after-failure.ts'), 'utf8')).toBe(`// ${marker}\n`);
+      const afterFailure = await page.evaluate(
+        async ({ workspace, id, filePath }) => {
+          const result = await (window as any).electronAPI.invoke(
+            'test:query-db', 'SELECT content FROM ai_agent_messages WHERE session_id = $1 AND direction = $2', [id, 'output']
+          );
+          const failedLookup = result.rows.some((row: any) => {
+            try {
+              const item = JSON.parse(row.content)?.params?.item;
+              return item?.type === 'mcpToolCall' && item.tool === 'tracker_get' && item.status === 'failed';
+            } catch { return false; }
+          });
+          const links = await (window as any).electronAPI.invoke('sessions:get-by-file', workspace, filePath);
+          return { failedLookup, owners: links.map((x: any) => x.id).sort() };
+        },
+        { workspace, id: session.id, filePath: path.join(workspace, 'after-failure.ts') }
+      );
+      const commitContext = await page.evaluate(async ({ workspace, id }) =>
+        (window as any).electronAPI.invoke('git:get-commit-context', workspace, id), { workspace, id: session.id });
+      expect(commitContext.coverage).toEqual([expect.objectContaining({ sessionId: session.id, state: 'no-detected-fault' })]);
+      const durableCoverage = await page.evaluate(async id =>
+        (window as any).electronAPI.invoke('test:query-db', 'SELECT data FROM shell_tracking_coverage WHERE session_id = $1', [id]), session.id);
+      expect(JSON.parse(durableCoverage.rows[0].data).active).toEqual([]);
+      evidence[marker + 'Coverage'] = commitContext.coverage;
+      evidence[marker + 'AfterFailure'] = afterFailure;
+      expect(afterFailure).toEqual({ failedLookup: true, owners: [...evidence.owners].sort() });
     }
     const readLinks = await page.evaluate(
       async ({ workspace, filePath }) =>

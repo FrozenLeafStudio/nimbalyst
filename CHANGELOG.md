@@ -10,13 +10,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 <!-- New features go here -->
+- Try GPT Live voice on iOS with on-screen session context, spoken answers to presented questions and approvals, audio selection, synced-file navigation, and desktop announcements.
+- Keep the computer picker focused and hide, restore, or rename paired computers with a compatible sync server.
+- Tab between the AI model, effort, and Actions menus after opening the model picker with Cmd/Ctrl+Shift+M.
+- Optionally follow external Claude Code and Codex CLI sessions live, including their names, from Agent Features settings.
 
 ### Changed
 <!-- Changes to existing functionality go here -->
+- Claude sessions gain MCP and resume reliability fixes while honoring enterprise tool restrictions.
+- iOS computer switching opens from the top-right computer status button.
+- Claude approval prompts default to Deny and offer only one-time approval when required.
 
 ### Fixed
 <!-- Bug fixes go here -->
 - On Windows, Gemini connects to the Antigravity editor you already have open instead of quietly starting a second copy of its language server.
+- Consumed prompts stay out of the iOS queue after delayed sync updates or reconnecting.
+- The session sidebar stays visible when rotating iPhone to landscape.
+- New and existing iOS sessions finish loading when opened repeatedly from the session list.
+- Session transcripts avoid duplicate messages and preserve their order after reopening or sending document context.
+- iOS avoids false prompt delivery warnings after the desktop starts or finishes processing.
+- File-session links avoid repeated background lookups that slow down active editing.
+- In-app HTML previews render UTF-8 text correctly even when the document omits a charset declaration.
+- Commit proposals use the session's worktree and reject unsupported checkout overrides instead of committing in the wrong checkout.
+- iOS reconnects after backgrounding or network changes and refreshes missing sessions without restarting.
+- Codex turns remain active through transient reconnect attempts and HTTPS fallback.
+- Codex sessions keep tracking shell edits after tool failures and show when file tracking is incomplete.
+- Shared CSVs preserve all rows while opening and retain concurrent edits during synchronization.
+- Custom editors exit review after Keep, Revert, or Keep All, even when a later history snapshot fails.
 - Antigravity's Gemini picker now offers the current Flash generations instead of retired ones, so new sessions no longer fail with "Gemini 3.5 Flash is no longer available".
 - Prevent unexpected errors during Git history reads and voice cleanup.
 

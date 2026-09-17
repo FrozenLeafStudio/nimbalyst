@@ -141,8 +141,8 @@ describe('CodexAppServerProtocol', () => {
   });
 
   it.each(['start','resume'])('binds host hooks to %s and trusts only the exact session hook hashes',async(kind)=>{
-    const dispose=vi.fn(),endTurn=vi.fn();
-    const host=vi.fn(async()=>({command:'owned-hook',env:{NIMBALYST_SHELL_HOOK_URL:'http://fixture'},dispose,endTurn}));setCodexShellTrackingHost(host);
+    const dispose=vi.fn(),endTurn=vi.fn(),toolCompleted=vi.fn();
+    const host=vi.fn(async()=>({command:'owned-hook',env:{NIMBALYST_SHELL_HOOK_URL:'http://fixture'},dispose,endTurn,toolCompleted}));setCodexShellTrackingHost(host);
     const protocol=new CodexAppServerProtocol();const options={workspacePath:'/tmp/ws',raw:{nimbalystSessionId:'owner'}};
     const promise=kind==='start'?protocol.createSession(options):protocol.resumeSession('thread-hook',options);
     const init=await nextWrittenMatching(child,'initialize');child.emitLine({id:init.id,result:{}});
@@ -155,6 +155,18 @@ describe('CodexAppServerProtocol', () => {
     expect(host).toHaveBeenCalledWith('owner','/tmp/ws');
     expect(spawnMock.mock.calls[0][2].env.NIMBALYST_SHELL_HOOK_URL).toBe('http://fixture');
     child.emitLine({id:request.id,result:{thread:{id:'thread-hook'}}});const session=await promise;
+    // Failed MCP tools omit PostToolUse. Terminal notifications must retire the
+    // window even without an active sendMessage iterator; yielded shells stay open.
+    const completed = (threadId: string, item: Record<string, unknown>) =>
+      child.emitLine({method:'item/completed',params:{threadId,turnId:'t',item}});
+    completed('another-thread',{type:'mcpToolCall',id:'foreign',status:'failed'});
+    completed('thread-hook',{type:'commandExecution',id:'running',status:'completed',exitCode:null});
+    completed('thread-hook',{type:'mcpToolCall',id:'pending',status:'inProgress'});
+    expect(toolCompleted).not.toHaveBeenCalled();
+    completed('thread-hook',{type:'mcpToolCall',id:'failed-lookup',status:'failed'});
+    completed('thread-hook',{type:'fileChange',id:'failed-patch',status:'failed'});
+    completed('thread-hook',{type:'commandExecution',id:'exited-shell',status:'completed',exitCode:0});
+    expect(toolCompleted.mock.calls).toEqual([['failed-lookup'],['failed-patch'],['exited-shell']]);
     child.emitLine({method:'turn/completed',params:{threadId:'thread-hook',turn:{id:'t',status:'completed'}}});expect(endTurn).toHaveBeenCalled();
     protocol.cleanupSession(session);expect(dispose).toHaveBeenCalled();
   });
@@ -614,6 +626,48 @@ describe('CodexAppServerProtocol', () => {
 
     const errorEvent = events.find((e) => e.type === 'error');
     expect(errorEvent?.error).toContain('model unavailable');
+
+    protocol.cleanupSession(session);
+  });
+
+  it('keeps streaming after a retryable error until the turn completes (#1523)', async () => {
+    const protocol = new CodexAppServerProtocol();
+    const sessionPromise = protocol.createSession({ workspacePath: '/tmp/ws' });
+    const initReq = await nextWrittenMatching(child, 'initialize');
+    child.emitLine({ id: initReq.id, result: { codexHome: '/fake', platformFamily: 'unix', platformOs: 'macos', userAgent: 'fake/0' } });
+    const startReq = await nextWrittenMatching(child, 'thread/start');
+    child.emitLine({ id: startReq.id, result: { thread: { id: 't-1' } } });
+    const session = await sessionPromise;
+
+    const events: ProtocolEvent[] = [];
+    const collector = (async () => {
+      for await (const ev of protocol.sendMessage(session, { content: 'recover please' })) {
+        events.push(ev);
+      }
+    })();
+
+    const turnReq = await nextWrittenMatching(child, 'turn/start');
+    child.emitLine({ id: turnReq.id, result: { turn: { id: 'turn-1', items: [], status: 'inProgress' } } });
+    child.emitLine({
+      method: 'error',
+      params: {
+        threadId: 't-1',
+        turnId: 'turn-1',
+        error: { message: 'Reconnecting... 2/5' },
+        willRetry: true,
+      },
+    });
+    child.emitLine({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 't-1', turnId: 'turn-1', itemId: 'msg-1', delta: 'Recovered' },
+    });
+    child.emitLine({ method: 'turn/completed', params: { threadId: 't-1', turn: { id: 'turn-1', status: 'completed' } } });
+
+    await collector;
+
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'text', content: 'Recovered' }));
+    expect(events).toContainEqual(expect.objectContaining({ type: 'complete', content: 'Recovered' }));
 
     protocol.cleanupSession(session);
   });

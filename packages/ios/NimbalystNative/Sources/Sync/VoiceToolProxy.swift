@@ -19,6 +19,7 @@ public final class VoiceToolProxy {
     private let crypto: CryptoManager
     private let decoder = JSONDecoder()
     /// Continuations awaiting a desktop answer, keyed by requestId.
+    private var pendingScopes: [String: VoiceRelayScope] = [:]
     private var pending: [String: CheckedContinuation<Result, Never>] = [:]
 
     /// Hands the encoded request to the registry, which owns send outcome and
@@ -30,7 +31,7 @@ public final class VoiceToolProxy {
         self.send = send
     }
 
-    func call(toolName: String, argsJson: String, projectId: String) async -> Result {
+    func call(toolName: String, argsJson: String, projectId: String, scope: VoiceRelayScope? = nil) async -> Result {
         let encryptedProjectId: String
         let toolNameEnc: (encrypted: String, iv: String)
         let argsEnc: (encrypted: String, iv: String)
@@ -62,6 +63,7 @@ public final class VoiceToolProxy {
         }
 
         return await withCheckedContinuation { continuation in
+            pendingScopes[requestId] = scope
             pending[requestId] = continuation
             send(requestId, json)
         }
@@ -76,13 +78,25 @@ public final class VoiceToolProxy {
             return nil
         }
         let response = broadcast.response
-        guard let continuation = pending.removeValue(forKey: response.requestId) else {
+        guard let continuation = pending[response.requestId] else {
             return response.requestId // already resolved by timeout, or not ours
         }
         var resultText: String?
         if let enc = response.encryptedResult, let iv = response.resultIv {
             resultText = crypto.decryptOrNil(encryptedBase64: enc, ivBase64: iv)
         }
+        if let expected = pendingScopes[response.requestId] {
+            guard let text = resultText, let data = text.data(using: .utf8),
+                  let verified = try? decoder.decode(VoiceRelayResponse.self, from: data), verified.scope == expected else {
+                // Old clients and unrelated hosts cannot settle this request, even with an error.
+                return nil
+            }
+            pendingScopes.removeValue(forKey: response.requestId)
+            pending.removeValue(forKey: response.requestId)
+            continuation.resume(returning: Result(success: verified.success, result: verified.result, error: verified.error))
+            return response.requestId
+        }
+        pending.removeValue(forKey: response.requestId)
         var errorText: String?
         if let enc = response.encryptedError, let iv = response.errorIv {
             errorText = crypto.decryptOrNil(encryptedBase64: enc, ivBase64: iv)
@@ -93,6 +107,7 @@ public final class VoiceToolProxy {
 
     /// Resume a caller the registry gave up on.
     func fail(_ requestId: String, message: String) {
+        pendingScopes.removeValue(forKey: requestId)
         guard let continuation = pending.removeValue(forKey: requestId) else { return }
         continuation.resume(returning: Result(success: false, result: nil, error: message))
     }

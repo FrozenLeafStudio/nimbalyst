@@ -89,9 +89,9 @@ setInterval(() => {
   try { process.kill(parentPid, 0); } catch { process.exit(1); }
 }, 500).unref();
 const rows = new Map(), history = [], traffic = [], heldPages = [];
-let revision = 0, cursorFloor = 0, desktop, provider, oldRow, replay = false, holdPhone = false, lastAck;
+let revision = 0, cursorFloor = 0, desktop, provider, oldRow, replay = false, holdPhone = false, silentNextPhone = false, lastAck;
 const send = (ws, message) => {
-  if (ws.readyState !== WebSocket.OPEN) return;
+  if (ws.readyState !== WebSocket.OPEN || ws.dormant || ws.silent) return;
   traffic.push({ direction: 'out', role: ws.role, message });
   ws.send(JSON.stringify(message));
 };
@@ -259,6 +259,12 @@ async function control(path) {
     await published(provider.pushChange('revision-session', { type: 'metadata_updated', metadata: { title: 'Newer title', updatedAt: oldRow.session.updatedAt } }));
     await waitFor(() => rows.get('revision-session').revision > oldRow.revision);
   } else if (path === '/replay') { replay = true;
+  } else if (path === '/silent-next') { silentNextPhone = true;
+  } else if (path === '/dormant') {
+    // Keep TCP/WebSocket open while dropping application frames in both directions.
+    for (const ws of wss.clients) if (ws.role === 'phone') ws.dormant = true;
+    await published(provider.syncSessionsToIndex([{ ...session('dormant-session'), title: 'Created while asleep' }]));
+    await waitFor(() => rows.has('dormant-session'));
   } else if (path === '/hold') { holdPhone = true;
   } else if (path === '/release') {
     holdPhone = false;
@@ -300,15 +306,21 @@ const server = http.createServer(async (req, res) => {
   try { res.end(JSON.stringify(await control(req.url))); }
   catch (error) { res.statusCode = 500; res.end(JSON.stringify({ error: String(error) })); fatal(error); }
 });
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, autoPong: false });
 wss.on('connection', (ws, req) => {
   ws.role = new URL(req.url, 'http://localhost').searchParams.get('token') === 'phone' ? 'phone' : 'desktop';
   if (ws.role === 'desktop' && !desktop) desktop = ws;
+  if (ws.role === 'phone' && silentNextPhone) { ws.silent = true; silentNextPhone = false; }
+  ws.on('ping', data => {
+    traffic.push({ direction: 'ping', role: ws.role });
+    if (!ws.silent && !ws.dormant) ws.pong(data);
+  });
   ws.device = { deviceId: 'desktop', type: 'desktop', isFocused: true, lastActiveAt: 0 };
   send(ws, { type: devicesShape.type, devices: [{ ...devicesShape.devices[0], deviceId: 'desktop', name: 'Fixture desktop', type: 'desktop', platform: 'macos' }] });
   ws.on('message', raw => { try { receive(ws, JSON.parse(raw)); } catch (error) { fatal(error); } });
 });
 function receive(ws, message, mutationDelivery) {
+    if (ws.dormant || ws.silent) return;
     try {
       traffic.push({ direction: 'in', role: ws.role, message, ...(mutationDelivery ? { mutationDelivery } : {}) });
       switch (message.type) {

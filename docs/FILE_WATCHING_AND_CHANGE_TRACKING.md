@@ -1,7 +1,6 @@
 # File Watching and AI Change Tracking
 
-This document covers the file watching infrastructure, AI change tracking pipeline, and red/green diff display system. It spans the full lifecycle from disk-level file events through to rendered diff UI.
-
+This document covers file watching, AI change tracking, and red/green diffs. See [Codex shell tracking](CODEX_SHELL_TRACKING.md) for native hooks, inferred ownership, and coverage diagnostics.
 ## Architecture Overview
 
 ```mermaid

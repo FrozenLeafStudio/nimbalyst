@@ -64,23 +64,26 @@ xcodebuild -project NimbalystApp.xcodeproj -scheme NimbalystApp \
 
 For the full Files UI test, start `node packages/ios/scripts/document-sync-fixture.cjs --interrupt` from the repository root. It prints an ephemeral port. Pass that port to the test runner using `TEST_RUNNER_NIMBALYST_DOCUMENT_FIXTURE_URL=http://127.0.0.1:<port>` when running `xcodebuild test -only-testing:NimbalystNavigationUITests/NavigationContinuityTests/testFilesDownloadsLargeProjectAndRetriesInterruptedSync` with the scheme and simulator destination below. Stop that fixture process afterward. This one test is skipped when its local server URL is absent; the ordinary navigation tests have no server dependency. The app accepts the fixture only in a debug screenshot launch and uses an in-memory database.
 
-The test opens Files, sees cached rows after an interrupted download, taps Retry, waits for 2,293 files, and opens a downloaded document in the real editor. Simulator acceptance does not establish physical-device peak memory or production rollout acceptance.
+The test opens Files, interrupts a download, allows automatic recovery or taps Retry when offered, waits for 2,293 files, and opens a downloaded document in the real editor. Simulator acceptance does not establish physical-device peak memory or production rollout acceptance.
 
 ## Navigation Continuity
 
-`NimbalystNavigationUITests` exercises the production `MainNavigationView` with an in-memory demo account. It opens a project and session, types an unsent draft, rotates through portrait and both landscape orientations, and verifies the selected session, draft, Back navigation, and that wide screens keep the session list visible beside the transcript. Run it on an iPhone Pro Max (whose horizontal size class changes in landscape) and an iPad:
+`NimbalystNavigationUITests` exercises the production `MainNavigationView` with an in-memory demo account. It opens a project and session, types an unsent draft, rotates through portrait and both landscape orientations, and verifies the selected session, draft, Back navigation, and that wide screens keep the session list visible beside the transcript. The split view uses both columns with at least 700 points of available width, including iPhones whose native horizontal size class stays compact in landscape. Run the rotation test on a regular iPhone Pro, a Pro Max, and an iPad:
 
 ```bash
 cd packages/ios/NimbalystApp
 xcodegen generate
 xcodebuild -project NimbalystApp.xcodeproj -scheme NimbalystApp \
+  -destination 'platform=iOS Simulator,name=iPhone 18 Pro' \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' \
   -destination 'platform=iOS Simulator,name=iPad Pro 11-inch (M5)' \
-  -only-testing:NimbalystNavigationUITests \
+  -only-testing:NimbalystNavigationUITests/NavigationContinuityTests/testSessionDraftAndBackHistorySurviveRotation \
   -parallel-testing-enabled NO -collect-test-diagnostics never test
 ```
 
 The debug launch arguments `--screenshot-mode --screenshot-screen=navigation` use the real navigation shell instead of an isolated screenshot screen. This bypasses pairing and does not connect to sync. The test suppresses the notification prompt through a launch-time UserDefaults override.
+
+`testNewSessionOpensTranscriptWithoutReopening` uses `--session-creation-fixture` with the sessions screen to create three sessions through the real toolbar and creation callbacks. An in-memory account substitutes only the desktop response; it uses the bundled transcript and pooled WKWebView. Creating again after Back and reopening each session from its row must finish loading. The fixture covers standalone sessions, a single-session worktree, a meta-agent header, and its child. This catches premature disappearance of the visible detail, which cancels its observers, timeout, and session connection. The detail uses an explicit navigation stack; sidebar rows use List selection tags so they do not also push an implicit destination. The Files transport UI test exercises the same selection path for documents. It does not verify desktop/server transport or a physical phone.
 
 `testEmptyListsWaitForIndexSync` uses `--loading-fixture` with the projects and sessions screens to hold an empty local database in loading for ten seconds, then complete the index. It verifies that loading appears before the definitive empty state. `SyncIntegrationTests.testIndexLoadCompletesOnlyAfterImportAndRejectsFailedImports` separately feeds encrypted wire responses through the real index handler and verifies that completion follows database writes, failed imports remain failures, and an empty retry completes. These fixtures do not connect to the live sync server.
 
