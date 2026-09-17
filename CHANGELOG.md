@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- On Windows, Gemini connects to the Antigravity editor you already have open instead of quietly starting a second copy of its language server.
 - Consumed prompts stay out of the iOS queue after delayed sync updates or reconnecting.
 - The session sidebar stays visible when rotating iPhone to landscape.
 - New and existing iOS sessions finish loading when opened repeatedly from the session list.
