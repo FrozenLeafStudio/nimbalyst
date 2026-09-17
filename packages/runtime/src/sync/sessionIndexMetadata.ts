@@ -1,5 +1,30 @@
 import type { SyncedQueuedPrompt, SyncedSessionMetadata } from './types';
 
+/** Local queue removals must survive older index pages and broadcasts. */
+export function createSessionQueueReconciler() {
+  const removed = new Map<string, Set<string>>();
+  return {
+    record(sessionId: string, previous: SyncedQueuedPrompt[] | undefined, next: SyncedQueuedPrompt[]) {
+      const ids = removed.get(sessionId) ?? new Set<string>();
+      const pending = new Set(next.map(prompt => prompt.id));
+      for (const prompt of previous ?? []) {
+        if (!pending.has(prompt.id)) ids.add(prompt.id);
+      }
+      // A deliberate rollback to pending is allowed to queue the same ID again.
+      for (const id of pending) ids.delete(id);
+      if (ids.size) removed.set(sessionId, ids);
+      else removed.delete(sessionId);
+    },
+    merge(entry: CachedSessionIndex): CachedSessionIndex {
+      const ids = removed.get(entry.sessionId);
+      if (!ids || !entry.queuedPrompts?.some(prompt => ids.has(prompt.id))) return entry;
+      const queuedPrompts = entry.queuedPrompts.filter(prompt => !ids.has(prompt.id));
+      return { ...entry, queuedPrompts, queuedPromptCount: queuedPrompts.length };
+    },
+    delete(sessionId: string) { removed.delete(sessionId); },
+  };
+}
+
 // Cache of session index entries for partial update merging
 // This cache stores DECRYPTED values locally
 export interface CachedSessionIndex {

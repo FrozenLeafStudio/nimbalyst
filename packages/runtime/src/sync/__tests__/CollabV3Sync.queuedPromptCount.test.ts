@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { asPersonalJwt, asPersonalMemberId } from '../../auth/jwtScopes';
 
 import { createCollabV3Sync } from '../CollabV3Sync';
+import { encrypt } from '../collabV3Crypto';
 
 class FakeWebSocket {
   static readonly OPEN = 1;
@@ -82,7 +83,7 @@ async function createIndexedProvider() {
   }]);
   await vi.waitFor(() => expect(indexUpdates(indexSocket)).toHaveLength(1));
 
-  return { provider, indexSocket };
+  return { provider, indexSocket, encryptionKey };
 }
 
 describe('CollabV3 queued prompt clearing', () => {
@@ -209,6 +210,54 @@ describe('CollabV3 queued prompt clearing', () => {
       encryptSpy.mockRestore();
       provider.disconnectAll();
     }
+  });
+
+  it('does not republish a consumed prompt after an in-flight index page arrives', async () => {
+    const { provider, indexSocket } = await createIndexedProvider();
+    try {
+      await provider.pushChange('session-1', { type: 'metadata_updated', metadata: {
+        queuedPrompts: [{ id: 'mobile-1', prompt: 'already running', timestamp: 1500 }],
+      } });
+      const oldEntry = indexUpdates(indexSocket).at(-1)!.session;
+      const fetching = provider.fetchIndex!();
+      const replayedQueue = vi.fn();
+      provider.onIndexChange?.(replayedQueue);
+      const requests = () => indexSocket.send.mock.calls.map(([p]) => JSON.parse(p as string)).filter(m => m.type === 'indexPageRequest');
+      await vi.waitFor(() => expect(requests()).toHaveLength(2));
+      const request = requests().at(-1)!;
+      await provider.pushChange('session-1', { type: 'metadata_updated', metadata: { queuedPrompts: [] } });
+      expect(provider.getCachedIndexEntry?.('session-1')?.queuedPrompts).toEqual([]);
+      indexSocket.receive({ type: 'indexPageResponse', protocolVersion: 2, requestId: request.requestId,
+        mode: 'delta', entries: [{entity: 'session', id: 'session-1', revision: 1, deleted: false, session: oldEntry}], complete: true, cursor: 1 });
+      await fetching;
+      expect(replayedQueue).toHaveBeenCalledWith('session-1', expect.objectContaining({
+        queuedPrompts: [expect.objectContaining({ id: 'mobile-1' })],
+      }));
+      expect(provider.getCachedIndexEntry?.('session-1')?.queuedPrompts).toEqual([]);
+      await provider.pushChange('session-1', { type: 'metadata_updated', metadata: { isExecuting: true } });
+      expect(indexUpdates(indexSocket).at(-1)!.session.encryptedQueuedPrompts).toEqual([]);
+    } finally { provider.disconnectAll(); }
+  });
+
+  it('keeps new remote prompts through a late broadcast and permits an explicit rollback', async () => {
+    const { provider, indexSocket, encryptionKey } = await createIndexedProvider();
+    const old = { id: 'old', prompt: 'consumed', timestamp: 1500 };
+    const next = { id: 'new', prompt: 'still needed', timestamp: 2000 };
+    try {
+      await provider.pushChange('session-1', { type: 'metadata_updated', metadata: { queuedPrompts: [old] } });
+      const broadcast = indexUpdates(indexSocket).at(-1)!.session;
+      await provider.pushChange('session-1', { type: 'metadata_updated', metadata: { queuedPrompts: [] } });
+      const encrypted = await encrypt(next.prompt, encryptionKey);
+      broadcast.encryptedQueuedPrompts.push({ id: next.id, encryptedPrompt: encrypted.encrypted, iv: encrypted.iv, timestamp: next.timestamp });
+      broadcast.queuedPromptCount = 2;
+      indexSocket.receive({ type: 'indexBroadcast', session: { ...broadcast, isExecuting: true } });
+      await vi.waitFor(() => expect(provider.getCachedIndexEntry?.('session-1')?.isExecuting).toBe(true));
+      expect(provider.getCachedIndexEntry?.('session-1')?.queuedPrompts?.map(prompt => prompt.id)).toEqual(['new']);
+      await provider.pushChange('session-1', { type: 'metadata_updated', metadata: { queuedPrompts: [old, next] } });
+      indexSocket.receive({ type: 'indexBroadcast', session: broadcast });
+      await vi.waitFor(() => expect(provider.getCachedIndexEntry?.('session-1')?.isExecuting).toBeUndefined());
+      expect(provider.getCachedIndexEntry?.('session-1')?.queuedPrompts?.map(prompt => prompt.id)).toEqual(['old', 'new']);
+    } finally { provider.disconnectAll(); }
   });
 
   it('turns an empty session-room queue payload into an explicit clear', async () => {

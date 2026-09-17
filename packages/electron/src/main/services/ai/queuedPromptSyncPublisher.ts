@@ -15,6 +15,11 @@
  */
 
 import type { SyncedQueuedPrompt, SyncProvider } from '@nimbalyst/runtime/sync/types';
+import { createKeyedSerialQueue } from '@nimbalyst/runtime/sync/indexPublication';
+
+// Serialize the database read too: an older pending snapshot must not be sent
+// after a newer claim has published the emptied queue.
+const publicationQueue = createKeyedSerialQueue();
 
 export interface QueuedPromptSyncDeps {
   /** The session's still-pending rows, oldest first. */
@@ -29,6 +34,13 @@ export interface QueuedPromptSyncDeps {
  * break claiming, completing, or cancelling a prompt.
  */
 export async function publishQueuedPromptsToSync(
+  deps: QueuedPromptSyncDeps,
+  sessionId: string,
+): Promise<SyncedQueuedPrompt[] | null> {
+  return publicationQueue.run(sessionId, () => publishQueueSnapshot(deps, sessionId));
+}
+
+async function publishQueueSnapshot(
   deps: QueuedPromptSyncDeps,
   sessionId: string,
 ): Promise<SyncedQueuedPrompt[] | null> {
